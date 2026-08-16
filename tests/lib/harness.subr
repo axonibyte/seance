@@ -32,20 +32,60 @@ export T_ROOT
 T_REGISTRY=$( mktemp "${TMPDIR:-/tmp}/seance-treg.XXXXXX" ) || exit 1
 export T_REGISTRY
 
+# Cleanup commands registered by t_at_exit, for the same reason: a tier-6
+# stage arms its cluster teardown from inside a function, and a variable would
+# not survive the subshell it was set in.
+T_ATEXIT=$( mktemp "${TMPDIR:-/tmp}/seance-tatx.XXXXXX" ) || exit 1
+export T_ATEXIT
+
 t_cleanup()
 {
-    local _d
+    local _d _c
 
-    [ -r "${T_REGISTRY}" ] || return 0
+    # Registered commands first, and in reverse order of registration: a
+    # teardown that needs its working directory must run before the
+    # directories go. The registry is emptied before they run, so a command
+    # that itself exits cannot start the list a second time.
+    if [ -r "${T_ATEXIT}" ]; then
+        _c=$( awk '{ a[NR] = $0 } END { for (i = NR; i >= 1; i--) print a[i] }' \
+            "${T_ATEXIT}" )
+        : > "${T_ATEXIT}"
+        printf '%s\n' "${_c}" | while read -r _d; do
+            [ -n "${_d}" ] || continue
+            eval "${_d}" || t_diag "t_at_exit: command failed: ${_d}"
+        done
+        rm -f "${T_ATEXIT}"
+    fi
 
-    while read -r _d; do
-        case "${_d}" in
-            /*/seance-t.*) rm -rf "${_d}" ;;
-        esac
-    done < "${T_REGISTRY}"
+    if [ -r "${T_REGISTRY}" ]; then
+        while read -r _d; do
+            case "${_d}" in
+                /*/seance-t.*) rm -rf "${_d}" ;;
+            esac
+        done < "${T_REGISTRY}"
 
-    rm -f "${T_REGISTRY}"
+        rm -f "${T_REGISTRY}"
+    fi
+
     return 0
+}
+
+# t_at_exit <command...>
+#
+# Register a shell command to run when this test file exits, however it exits.
+# Commands run in reverse order of registration, before the temporary
+# directories are removed. A failing command is diagnosed but does not by
+# itself fail the file -- the thing it was cleaning up is what the test
+# asserts about, and a teardown that silently changed a verdict would be
+# worse than a loud one that did not.
+t_at_exit()
+{
+    if [ $# -eq 0 ]; then
+        t_diag "t_at_exit: no command given"
+        return 2
+    fi
+
+    printf '%s\n' "$*" >> "${T_ATEXIT}"
 }
 
 trap 't_cleanup' EXIT
