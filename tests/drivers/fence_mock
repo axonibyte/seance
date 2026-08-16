@@ -1,0 +1,117 @@
+#!/bin/sh
+# seance -- a scripted fence driver, for the tier-4 truth table.
+#
+#   fence_mock off    <target>
+#   fence_mock status <target>
+#
+# It fences nothing. What it does is produce, on demand, every answer the fence
+# rung has to have a decision for -- including the three that are not answers
+# at all: a hang, a success with nothing to say, and a success with the wrong
+# thing to say. tests/tier4/ladder.tsv crosses those with --force and asserts
+# the disposition of each.
+#
+# It implements the same contract the shipped drivers do (HANDOFF.md §2.4,
+# decision D-44 item 2):
+#
+#   off     0 verified off, 1 refused / still on, 2 cannot determine
+#   status  0 off, 1 on, 2 unknown
+#
+# and prints one verdict line on stdout, which is what makes the "success with
+# nothing to say" case a contract violation rather than a style question.
+#
+# SCRIPTED BY ITS OWN ENVIRONMENT, never by seance's:
+#
+#   FENCE_MOCK_MODE     off | refused | unknown | garbage | empty0 | hang
+#                       (default: off)
+#   FENCE_MOCK_SLEEP    seconds the 'hang' mode sleeps         (default: 30)
+#   FENCE_MOCK_LOG      a file every invocation is appended to, one record per
+#                       line: "<action> <target> <SEANCE_FENCE_TIMEOUT>
+#                       <SEANCE_FENCE_IPMI_CONF>". It is how the table asserts
+#                       that seance exported the driver environment it promises
+#                       (D-53), which is otherwise invisible from outside.
+#
+# The variables are the DRIVER's, not seance's: seance must not have a code
+# path that only the tests take, so the test scripts the world rather than the
+# ladder (the reasoning D-35 used to reject a test-only environment override).
+#
+# shellcheck disable=SC3043
+#   'local' is not in POSIX sh but is implemented by FreeBSD /bin/sh (sh(1),
+#   "local"); seance targets FreeBSD sh and nothing else (HANDOFF.md §5).
+set -u
+
+PROG=fence_mock
+
+usage()
+{
+    cat <<EOF
+usage: ${PROG} <off|status> <target>
+
+Exit: off -> 0 verified off, 1 refused/still on, 2 cannot determine
+      status -> 0 off, 1 on, 2 unknown
+EOF
+}
+
+ACTION=${1:-}
+TARGET=${2:-}
+
+case "${ACTION}" in
+    -h|--help) usage; exit 0 ;;
+esac
+
+if [ -z "${ACTION}" ] || [ -z "${TARGET}" ]; then
+    usage >&2
+    exit 2
+fi
+
+MODE=${FENCE_MOCK_MODE:-off}
+
+if [ -n "${FENCE_MOCK_LOG:-}" ]; then
+    printf '%s %s %s %s\n' "${ACTION}" "${TARGET}" \
+        "${SEANCE_FENCE_TIMEOUT:--}" "${SEANCE_FENCE_IPMI_CONF:--}" \
+        >> "${FENCE_MOCK_LOG}"
+fi
+
+case "${ACTION}" in
+    off|status) ;;
+    *)
+        echo "${PROG}: no such action: ${ACTION}" >&2
+        usage >&2
+        exit 2
+        ;;
+esac
+
+case "${MODE}" in
+    off)
+        printf '%s: %s off verified\n' "${PROG}" "${TARGET}"
+        exit 0
+        ;;
+    refused)
+        echo "${PROG}: the endpoint refused the command" >&2
+        printf '%s: %s refused power still reads on\n' "${PROG}" "${TARGET}"
+        exit 1
+        ;;
+    unknown)
+        echo "${PROG}: the endpoint did not answer" >&2
+        printf '%s: %s unknown no answer from the endpoint\n' "${PROG}" "${TARGET}"
+        exit 2
+        ;;
+    garbage)
+        printf '<html><head><title>500 Internal Server Error</title></head>\n'
+        exit 0
+        ;;
+    empty0)
+        # Success with nothing to say. The crashed-verifier class, applied to
+        # the one command whose success is a licence to start a guest
+        # somewhere else.
+        exit 0
+        ;;
+    hang)
+        sleep "${FENCE_MOCK_SLEEP:-30}"
+        printf '%s: %s off verified (far too late)\n' "${PROG}" "${TARGET}"
+        exit 0
+        ;;
+    *)
+        echo "${PROG}: no such FENCE_MOCK_MODE: ${MODE}" >&2
+        exit 2
+        ;;
+esac

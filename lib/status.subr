@@ -127,7 +127,7 @@ exit 0"
 status_report()
 {
     local _tsv _home _now _skew _conf _lsha _lkern _tmp
-    local _guest _type _running _held _names _row _peer _peers
+    local _guest _type _running _held _names _row _peer _peers _ghome
     local _rec _ts _tick _rc _age _age_h _verdict _max _fresh _total
     local _psha _pkern _line _guests
 
@@ -194,13 +194,30 @@ status_report()
             *) _held=unknown ;;
         esac
 
+        # A guest's home is where it BELONGS, not where this report is being
+        # written. Until promotion existed the two were always the same and
+        # this node's own key was the right answer; a node that has inherited
+        # somebody's estate would otherwise report every guest as being at
+        # home here, at exactly the moment an operator is reading `status` to
+        # find out what moved. `placement` is the record that knows, and it
+        # names only guests hosted away from home (decision D-83).
+        if ! _ghome=$( placement_home "${_guest}" ); then
+            _ghome=${_home}
+        fi
+
         if [ "${_tsv}" -eq 0 ]; then
-            printf 'guest %-16s type %-6s home %-10s running %-3s held %s\n' \
-                "${_guest}" "${_type:-?}" "${_home}" "${_running}" "${_held}"
+            if [ "${_ghome}" = "${_home}" ]; then
+                printf 'guest %-16s type %-6s home %-10s running %-3s held %s\n' \
+                    "${_guest}" "${_type:-?}" "${_ghome}" "${_running}" "${_held}"
+            else
+                printf 'guest %-16s type %-6s home %-10s running %-3s held %-3s here %s\n' \
+                    "${_guest}" "${_type:-?}" "${_ghome}" "${_running}" "${_held}" \
+                    "${_home}"
+            fi
         else
             printf 'guest%s%s%s%s%s%s%s%s%s%s\n' \
                 "${STATUS_TAB}" "${_guest}" "${STATUS_TAB}" "${_type:-?}" \
-                "${STATUS_TAB}" "${_home}" "${STATUS_TAB}" "${_running}" \
+                "${STATUS_TAB}" "${_ghome}" "${STATUS_TAB}" "${_running}" \
                 "${STATUS_TAB}" "${_held}"
         fi
 

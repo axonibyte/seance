@@ -44,7 +44,7 @@ if [ "$( id -u )" -ne 0 ]; then
     exit 2
 fi
 
-t_plan 75
+t_plan 80
 
 TAB=$( printf '\t.' )
 TAB=${TAB%.}
@@ -294,6 +294,37 @@ LAG=$( cluster_exec alpha cat /var/db/seance/lag/web01.bravo < /dev/null )
 t_is "${LAG% * *}" "${SNAP1#seance-alpha-}" \
     "alpha's lag record for web01@bravo names the snapshot bravo actually has"
 t_is "${LAG##* }" "0" "the lag record's exit status is 0"
+
+# --- the configuration mirror (D-82) ----------------------------------------
+#
+# A jail's registerable configuration lives outside its own dataset on real
+# CBSD, so `repl` carries it in one extra dataset per node and replicates that
+# dataset exactly like a guest. The pseudo-cluster's guests keep their
+# configuration in a child dataset and so never need the mirror -- which is
+# precisely why the DATASET is asserted here rather than its contents: what
+# tier 6 can prove is that the mirror is made, named with the tick's own
+# lineage, sent to the same heirs, and hidden on arrival like every other
+# replica. That a real jail then promotes out of it is a shape-B assertion
+# (tests/tier5/README).
+
+SYS_ON_ALPHA="${ALPHA_DS}/seance-sys"
+SYS_ON_BRAVO=$( replica_root bravo alpha seance-sys )
+
+t_rc 0 "the configuration mirror dataset exists on alpha" \
+    -- nz alpha list -H -o name "${SYS_ON_ALPHA}"
+t_is "$( nz alpha get -H -o value mountpoint "${SYS_ON_ALPHA}" )" \
+    "/var/db/seance/sys" \
+    "and it is mounted inside seance's own state directory, not in CBSD's"
+
+t_is "$( nz alpha list -H -o name -t snapshot "${SYS_ON_ALPHA}" | sed -n '$s/.*@//p' )" \
+    "${SNAP1}" \
+    "it is snapshotted with the TICK's name, so its lineage is the fleet's lineage"
+
+t_rc 0 "and its replica landed under the standby tree on bravo" \
+    -- nz bravo list -H -o name "${SYS_ON_BRAVO}"
+t_is "$( law_violations bravo "${SYS_ON_BRAVO}" )" "" \
+    "the mirror's replica obeys the shadow-mount law like any other replica"
+
 
 # ---------------------------------------------------------------------------
 # Tick two: an increment, not a second copy

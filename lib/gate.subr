@@ -1,0 +1,504 @@
+# seance -- placement records and the resurrection gate (design §8, D-21).
+#
+# Sourced, never executed. Two things live here because they are two halves of
+# one question -- "who is running this guest right now" -- asked from the two
+# ends:
+#
+#   placement   this node's own answer, written by `promote` and cleared by
+#               `failback`: one record per guest this node hosts AWAY FROM
+#               HOME. `seance placement` prints it, and `--remote` gathers the
+#               same records from the living peers.
+#   gate        a returning node's question, asked before anything autostarts:
+#               does any living peer claim a guest of mine? Any claim, or NO
+#               ANSWER AT ALL, and the guest is withheld and somebody is told.
+#
+# THE LEVER IS CBSD SLAVE MODE (decision D-21). M0 proved a master_prestart.d
+# hook cannot veto a start -- external_exec_master_script's result is never
+# tested (subr/jcreate.subr:166-215, called as a bare statement by
+# sudoexec/jstart:665-669) -- so the gate does not try to say "no" at start
+# time. It marks the guest instead: adapter_guest_hold puts it in slave mode,
+# which sudoexec/jstart:367 and sudoexec/bstart:1321 refuse to start and which
+# CBSD's own autostart ordering skips (jailctl/jorder:35, bhyvectl/border:35).
+# It is in the database, so it survives the reboot it was written for.
+#
+# FAIL-SAFE IN EVERY DIRECTION (handoff §2.7). A peer that claims a guest
+# withholds that guest. A mesh where NOT ONE peer answered withholds the WHOLE
+# estate -- because a node that can reach nobody must assume it is the isolated
+# one, and the alternative is a returning node cheerfully starting guests that
+# are already running somewhere else. That is the split brain this product
+# exists to prevent, arriving by way of a well-meaning power button.
+#
+# ASKING THE LIVING IS ALLOWED. The prohibition in the state model (design §5)
+# is on asking the DEAD; the resurrection gate is the case that rule was
+# written to permit.
+#
+# THE REMOTE COMMAND. `seance placement` must be runnable as ssh_user on every
+# peer -- on a CBSD node that means a link to the module's dispatcher somewhere
+# on root's PATH, because CBSD's own PATH (cbsd.conf:119) belongs to cbsdsh and
+# not to an ssh session. It is documented as a mesh prerequisite in README and
+# in docs/RUNBOOK-failback.md rather than guessed at here.
+#
+# shellcheck shell=sh
+# shellcheck disable=SC3043
+#   'local' is not in POSIX sh but is implemented by FreeBSD /bin/sh (sh(1),
+#   "local"); seance targets FreeBSD sh and nothing else (handoff §5).
+
+# How seance is invoked ON A PEER. `seance placement` and
+# `seance failback-assist ...` are the only two things one node ever asks
+# another to run, and both go through this name.
+GATE_REMOTE_PROG="seance"
+GATE_REMOTE_CMD="${GATE_REMOTE_PROG} placement"
+
+GATE_TAB=$( printf '\t.' )
+GATE_TAB=${GATE_TAB%.}
+
+# ---------------------------------------------------------------------------
+# The placement file
+#
+# One record per line, "<guest><TAB><home>", for guests this node hosts away
+# from home. A guest at home is NOT in this file: its absence is the claim that
+# nothing unusual is going on, and a file that listed everything would have to
+# be right about everything.
+# ---------------------------------------------------------------------------
+
+placement_file()
+{
+    local _d
+
+    _d=$( seance_state_dir ) || return 1
+    printf '%s/placement\n' "${_d}"
+}
+
+# placement_local  -- the records, one per line, "<guest><TAB><home>".
+#
+# An absent file is an empty placement, which is the normal state of a healthy
+# node and is rc 0 with no output.
+placement_local()
+{
+    local _f
+
+    _f=$( placement_file ) || return 1
+    [ -r "${_f}" ] || return 0
+
+    awk -F "${GATE_TAB}" 'NF >= 2 { print $1 "\t" $2 }' "${_f}"
+}
+
+# placement_home <guest>  -- the home this node records for a guest it hosts
+# away from home; rc 1 when it does not claim that guest at all.
+placement_home()
+{
+    local _h
+
+    _h=$( placement_local | awk -F "${GATE_TAB}" -v g="${1:?}" \
+        '$1 == g { print $2; exit }' )
+
+    [ -n "${_h}" ] || return 1
+
+    printf '%s\n' "${_h}"
+}
+
+# placement_set <guest> <home>  -- claim a guest, replacing any earlier claim.
+placement_set()
+{
+    local _f _tmp
+
+    _f=$( placement_file ) || return 1
+    mkdir -p "${_f%/*}" || return 1
+    [ -e "${_f}" ] || : > "${_f}"
+
+    _tmp="${_f}.new.$$"
+
+    awk -F "${GATE_TAB}" -v g="${1:?}" '$1 != g' "${_f}" > "${_tmp}" ||
+        { rm -f "${_tmp}"; return 1; }
+    printf '%s\t%s\n' "$1" "${2:?}" >> "${_tmp}" ||
+        { rm -f "${_tmp}"; return 1; }
+
+    mv "${_tmp}" "${_f}"
+}
+
+# placement_clear <guest>  -- stop claiming a guest. Absent is already cleared.
+placement_clear()
+{
+    local _f _tmp
+
+    _f=$( placement_file ) || return 1
+    [ -r "${_f}" ] || return 0
+
+    _tmp="${_f}.new.$$"
+
+    awk -F "${GATE_TAB}" -v g="${1:?}" '$1 != g' "${_f}" > "${_tmp}" ||
+        { rm -f "${_tmp}"; return 1; }
+
+    mv "${_tmp}" "${_f}"
+}
+
+# placement_remote <peerkeys...>
+#
+# Gather the living peers' placements. TWO KINDS OF RECORD, both on stdout,
+# both prefixed so that neither can be mistaken for the other (a node key of
+# `claim` or `peer` is legal, so the prefix cannot be the peer's name):
+#
+#   claim<TAB><peer><TAB><guest><TAB><home>   what a peer says it is hosting
+#   peer<TAB><key><TAB>answered              it answered the question
+#   peer<TAB><key><TAB>failed                IT DID NOT
+#
+# THE SECOND KIND IS THE POINT, and it was missing. A peer that answers an ssh
+# probe but cannot answer `seance placement` -- seance not installed, the verb
+# erroring, a half-written reply -- used to contribute nothing and be mentioned
+# on stderr. Every caller then read the absence of a claim record as the
+# absence of a claim, so a live peer with a broken seance made its guests look
+# unclaimed: the gate released them, the ladder promoted them, and the guest
+# came up in two places. AN UNANSWERED LIVING PEER IS NOT EVIDENCE OF NO CLAIM
+# (design §5), and the only way for a caller to honour that is to be told which
+# peers answered, which is what these records are for.
+#
+# The peer prints its own records as "placement<TAB><guest><TAB><home>" and
+# ends with its own verdict line, which is why THAT prefix exists too: a verb
+# that ends in a verdict line is a verb whose data must be selectable from it.
+placement_remote()
+{
+    local _peers _peer _addr _out
+
+    _peers=$*
+
+    for _peer in ${_peers}; do
+        if ! _addr=$( seance_peer_addr "${_peer}" ); then
+            printf 'placement: %s has no node_%s_mgmt address\n' \
+                "${_peer}" "${_peer}" >&2
+            printf 'peer\t%s\tfailed\n' "${_peer}"
+            continue
+        fi
+
+        if ! _out=$( seance_ssh "${_addr}" "${GATE_REMOTE_CMD}" 2>/dev/null ); then
+            printf 'placement: %s did not answer "%s"\n' \
+                "${_peer}" "${GATE_REMOTE_CMD}" >&2
+            printf 'peer\t%s\tfailed\n' "${_peer}"
+            continue
+        fi
+
+        # An answer that carries no verdict line is a half-written answer, and
+        # a half-written placement is not a placement: the records it did not
+        # get to are exactly the ones a caller would read as "no claim".
+        if ! printf '%s\n' "${_out}" | grep -q '^placement: '; then
+            printf 'placement: %s answered "%s" without a verdict line\n' \
+                "${_peer}" "${GATE_REMOTE_CMD}" >&2
+            printf 'peer\t%s\tfailed\n' "${_peer}"
+            continue
+        fi
+
+        printf 'peer\t%s\tanswered\n' "${_peer}"
+
+        printf '%s\n' "${_out}" |
+            awk -F "${GATE_TAB}" -v p="${_peer}" \
+                '$1 == "placement" && NF >= 3 { print "claim\t" p "\t" $2 "\t" $3 }'
+    done
+}
+
+# placement_claims <records-file> <guest>  -- the peer claiming <guest>, if any.
+placement_claims()
+{
+    awk -F "${GATE_TAB}" -v g="${2:?}" \
+        '$1 == "claim" && $3 == g { print $2; exit }' "${1:?}"
+}
+
+# placement_answered <records-file>  -- how many peers answered.
+placement_answered()
+{
+    awk -F "${GATE_TAB}" '$1 == "peer" && $3 == "answered" { n++ } END { print n + 0 }' \
+        "${1:?}"
+}
+
+# placement_silent <records-file>  -- the living peers that did NOT answer,
+# space separated. These are the ones that make the whole picture untrustworthy.
+placement_silent()
+{
+    awk -F "${GATE_TAB}" '$1 == "peer" && $3 == "failed" { print $2 }' "${1:?}" |
+        tr '\n' ' '
+}
+
+# placement_report <remote 0|1>
+#
+# The `seance placement` verb. Prints records and then one verdict line.
+placement_report()
+{
+    local _remote _tmp _n _peer _addr _live _self _line _silent
+
+    _remote=${1:-0}
+
+    if [ "${_remote}" -eq 0 ]; then
+        _tmp=$( seance_tmpdir ) || return 2
+        placement_local > "${_tmp}/p" || return 1
+
+        while IFS= read -r _line || [ -n "${_line}" ]; do
+            [ -n "${_line}" ] || continue
+            printf 'placement\t%s\n' "${_line}"
+        done < "${_tmp}/p"
+
+        _n=$( awk 'NF > 0 { n++ } END { print n + 0 }' "${_tmp}/p" )
+        printf 'placement: %d guest(s) hosted away from home\n' "${_n}"
+        return 0
+    fi
+
+    _self=$( seance_self_key ) || {
+        printf 'placement: FAIL (this node is not in its own configuration)\n'
+        return 2
+    }
+
+    _live=""
+    for _peer in $( conf_nodes ); do
+        [ "${_peer}" = "${_self}" ] && continue
+        _addr=$( seance_peer_addr "${_peer}" ) || continue
+        seance_ssh_probe "${_addr}" || continue
+        _live="${_live} ${_peer}"
+    done
+    _live=${_live# }
+
+    _tmp=$( seance_tmpdir ) || return 2
+    # shellcheck disable=SC2086
+    #   Deliberate word splitting: ${_live} is a list of node keys.
+    placement_remote ${_live} > "${_tmp}/r"
+
+    # Claims keep the shape a reader and a script both had before: one
+    # prefixed, tab-separated record naming the peer, the guest and its home.
+    awk -F "${GATE_TAB}" '$1 == "claim" { print "placement\t" $2 "\t" $3 "\t" $4 }' \
+        "${_tmp}/r"
+
+    _n=$( awk -F "${GATE_TAB}" '$1 == "claim" { n++ } END { print n + 0 }' "${_tmp}/r" )
+    _silent=$( placement_silent "${_tmp}/r" )
+    _silent=${_silent% }
+
+    # A peer that could not answer is named on the verdict line, not left to be
+    # inferred from a count that does not add up. The whole reason the gate
+    # cares about the difference is that a missing answer is not a missing
+    # claim, and an operator reading this by hand needs the same distinction.
+    if [ -n "${_silent}" ]; then
+        printf 'placement: %d claim(s) from %d peer(s); %s could NOT report -- their claims are unknown\n' \
+            "${_n}" "$( placement_answered "${_tmp}/r" )" "${_silent}"
+        return 1
+    fi
+
+    printf 'placement: %d claim(s) from %d living peer(s)\n' \
+        "${_n}" "$( placement_answered "${_tmp}/r" )"
+
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# The gate
+# ---------------------------------------------------------------------------
+
+# gate_home_guests
+#
+# The guests this node considers ITS OWN: every guest the platform knows about
+# here, minus the ones this node's placement file says it is hosting away from
+# home. A guest we host for somebody else is not ours to gate -- it is ours to
+# keep running until failback.
+gate_home_guests()
+{
+    local _tmp _g _names
+
+    _tmp=$( seance_tmpdir ) || return 1
+
+    adapter_guest_list > "${_tmp}/g" < /dev/null || return 1
+    _names=$( awk -F "${GATE_TAB}" 'NF > 0 { print $1 }' "${_tmp}/g" )
+
+    placement_local > "${_tmp}/p" || return 1
+
+    for _g in ${_names}; do
+        awk -F "${GATE_TAB}" -v g="${_g}" '$1 == g { found = 1 } END { exit !found }' \
+            "${_tmp}/p" && continue
+        printf '%s\n' "${_g}"
+    done
+
+    return 0
+}
+
+# gate_run <mode>
+#
+# mode: check | act | release:<guest>
+#
+# rc 0 nothing is withheld, 1 something is (or a release was refused), 2 a
+# usage or configuration error.
+gate_run()
+{
+    local _mode _self _peer _addr _live _reached _silent _tmp _g _guests
+    local _claim _held _rc _guest _why _shout _subject _body
+
+    _mode=${1:-act}
+
+    _self=$( seance_self_key ) || {
+        seance_log err "gate: this node is not in the configuration"
+        printf 'gate: FAIL (this node is not in its own configuration)\n'
+        return 2
+    }
+
+    _tmp=$( seance_tmpdir ) || return 2
+
+    # --- who is alive, and what do they claim -----------------------------
+    _live=""
+    for _peer in $( conf_nodes ); do
+        [ "${_peer}" = "${_self}" ] && continue
+        _addr=$( seance_peer_addr "${_peer}" ) || continue
+        seance_ssh_probe "${_addr}" || continue
+        _live="${_live} ${_peer}"
+    done
+    _live=${_live# }
+
+    # shellcheck disable=SC2086
+    #   Deliberate word splitting: ${_live} is a list of node keys.
+    placement_remote ${_live} > "${_tmp}/claims"
+
+    # A peer that answered with an EMPTY placement still answered. That is the
+    # difference between "nobody has your guests" and "nobody is there", and
+    # the whole fail-safe hangs on it -- so what is counted is peers that
+    # ANSWERED THE QUESTION, never peers that merely answered an ssh probe and
+    # never records they produced.
+    #
+    # The difference between those first two is where the gap was: a peer that
+    # is up but whose seance cannot answer used to be counted as reached, and
+    # its claims -- which it never got to state -- read as absent. That is a
+    # guest released here while it runs there.
+    _reached=$( placement_answered "${_tmp}/claims" )
+    _silent=$( placement_silent "${_tmp}/claims" )
+    _silent=${_silent% }
+
+    case "${_mode}" in
+        release:*)
+            _guest=${_mode#release:}
+
+            if [ "${_reached}" -eq 0 ]; then
+                printf 'gate: REFUSED %s -- not one peer answered, so nothing could confirm it is not running elsewhere\n' \
+                    "${_guest}"
+                return 1
+            fi
+
+            if [ -n "${_silent}" ]; then
+                printf 'gate: REFUSED %s -- living peer(s) %s could not report their placement,\n' \
+                    "${_guest}" "${_silent}"
+                printf '        so nothing here can say the guest is not running on one of them.\n'
+                printf '        Fix seance on those nodes ("ssh <peer> %s") and try again.\n' \
+                    "${GATE_REMOTE_CMD}"
+                return 1
+            fi
+
+            _claim=$( placement_claims "${_tmp}/claims" "${_guest}" )
+
+            if [ -n "${_claim}" ]; then
+                printf 'gate: REFUSED %s -- %s still claims it\n' \
+                    "${_guest}" "${_claim}"
+                return 1
+            fi
+
+            printf '  undo: seance gate (the boot gate re-holds it if a peer claims it again)\n'
+            if ! adapter_guest_release "${_guest}"; then
+                printf 'gate: FAIL -- %s could not be released\n' "${_guest}"
+                return 1
+            fi
+
+            printf 'gate: released %s (%d peer(s) answered, none claims it)\n' \
+                "${_guest}" "${_reached}"
+            return 0
+            ;;
+    esac
+
+    if ! _guests=$( gate_home_guests ); then
+        seance_log err "gate: this node cannot enumerate its own guests"
+        printf 'gate: FAIL (the estate could not be enumerated; nothing was changed)\n'
+        return 2
+    fi
+
+    if [ -z "${_guests}" ]; then
+        printf 'gate: 0 guests at home here; nothing to withhold\n'
+        return 0
+    fi
+
+    _held=0
+    _rc=0
+
+    # --- the fail-safe: the picture is not complete -----------------------
+    #
+    # TWO WAYS IN, and they are the same finding from different distances:
+    # nobody answered at all, or somebody living could not say what it holds.
+    # Neither is evidence of no claim, and a guest started on either is the
+    # split brain this whole file exists to prevent. So both withhold the WHOLE
+    # estate -- not merely the guests somebody happened to mention.
+    if [ "${_reached}" -eq 0 ] || [ -n "${_silent}" ]; then
+        if [ "${_reached}" -eq 0 ]; then
+            _why="not one peer answered"
+            _shout="NOT ONE PEER ANSWERED"
+            _subject="seance: ${_self} reached no peer on boot; estate withheld"
+            _body="This node reached no peer at all and has withheld its whole estate."
+        else
+            _why="living peer(s) ${_silent} could not report their placement"
+            _shout="LIVING PEER(S) ${_silent} COULD NOT REPORT THEIR PLACEMENT"
+            _subject="seance: ${_self} cannot read the placement of ${_silent}; estate withheld"
+            _body="Living peer(s) ${_silent} answered ssh but could not answer \"${GATE_REMOTE_CMD}\".
+Their claims are unknown, so this node has withheld its whole estate rather
+than assume they hold nothing. Fix seance on those nodes and run
+\"seance gate --release <guest>\" once they can answer."
+        fi
+
+        for _g in ${_guests}; do
+            if [ "${_mode}" = "check" ]; then
+                printf 'gate: WOULD HOLD %s -- %s\n' "${_g}" "${_why}"
+                _held=$(( _held + 1 ))
+                continue
+            fi
+            printf '  undo: seance gate --release %s (after peers confirm no claim)\n' "${_g}"
+            if adapter_guest_hold "${_g}"; then
+                printf 'gate: HELD %s -- %s\n' "${_g}" "${_why}"
+                _held=$(( _held + 1 ))
+            else
+                printf 'gate: FAIL -- %s could not be held\n' "${_g}"
+                _rc=1
+            fi
+        done
+
+        printf '%s\n' "${_body}" |
+            seance_notify crit "${_subject}"
+
+        # The per-guest lines say it plainly; the verdict line SHOUTS it,
+        # because that is the line somebody skims when an estate did not come
+        # up.
+        printf 'gate: %d of %d home guest(s) withheld -- %s\n' \
+            "${_held}" "$( printf '%s' "${_guests}" | wc -w | tr -d ' ' )" "${_shout}"
+        return 1
+    fi
+
+    # --- the ordinary case: somebody answered ------------------------------
+    for _g in ${_guests}; do
+        _claim=$( placement_claims "${_tmp}/claims" "${_g}" )
+
+        if [ -z "${_claim}" ]; then
+            printf 'gate: %s -- no living peer claims it; left as it is\n' "${_g}"
+            continue
+        fi
+
+        if [ "${_mode}" = "check" ]; then
+            printf 'gate: WOULD HOLD %s -- %s claims it\n' "${_g}" "${_claim}"
+            _held=$(( _held + 1 ))
+            continue
+        fi
+
+        printf '  undo: seance gate --release %s (after %s stops claiming it)\n' \
+            "${_g}" "${_claim}"
+        if adapter_guest_hold "${_g}"; then
+            printf 'gate: HELD %s -- %s claims it\n' "${_g}" "${_claim}"
+            _held=$(( _held + 1 ))
+            printf '%s is claimed by %s. It has not been started here.\nRun "seance failback %s" once this node is ready to take it back.\n' \
+                "${_g}" "${_claim}" "${_g}" |
+                seance_notify crit "seance: ${_g} is claimed by ${_claim}; withheld on ${_self}"
+        else
+            printf 'gate: FAIL -- %s could not be held\n' "${_g}"
+            _rc=1
+        fi
+    done
+
+    printf 'gate: %d of %d home guest(s) withheld, %d peer(s) answered\n' \
+        "${_held}" "$( printf '%s' "${_guests}" | wc -w | tr -d ' ' )" "${_reached}"
+
+    [ "${_rc}" -ne 0 ] && return 1
+    [ "${_held}" -gt 0 ] && return 1
+
+    return 0
+}

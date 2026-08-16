@@ -1,0 +1,1722 @@
+# seance -- the promotion ladder (design §7, decision D-44).
+#
+# Sourced, never executed. `seance promote <deadkey>` walks seven rungs. Every
+# rung prints one line
+#
+#     rung <n> <name>: <verdict> — <reason>
+#
+# every rung can stop the whole thing, every mutating step prints its undo, and
+# the verb ends in exactly one verdict line. Exit 0 promoted, 1 stopped
+# (whether by an abort or by a notify), 2 a usage or configuration error.
+#
+#   1 debounce    M2: n/a, because a human is the trigger. The wait exists and
+#                 is tested; M3 hangs the CARP re-check off it.
+#   2 quorum      1 + reachable_others > N/2, or freeze and notify.
+#   3 probes      ping and ssh the "dead" node. ANY answer aborts, and no
+#                 --force can reach this rung.
+#   4 fence       the configured driver, off <target>, bounded. Verified off
+#                 proceeds; cannot-determine notifies; REFUSED aborts and pages
+#                 and is never forceable.
+#   5 lineage     per guest: whose it is, whether anybody else already claims
+#                 it, whether the replica is fresh enough, and -- for jails --
+#                 whether this fleet is kernel-homogeneous.
+#   6 promotion   per guest, alphabetically: mount the replica in place at the
+#                 paths the platform expects, relink, register, start, verify,
+#                 record, report the RPO.
+#   7 post        what the next replication tick will do, stated rather than
+#                 configured.
+#
+# WHAT --force MAY NAME, and what it may never name (D-44 item 1). --force with
+# no value means every forceable rung; --force=<rung>[,<rung>...] names them.
+# The forceable rungs are quorum, fence, lineage and kernel. Naming `probes` is
+# a usage error, not a refusal: there is no circumstance in which a host that
+# answers should be fenced.
+#
+# --force=fence is the subtle one and it does NOT skip the fencing. A
+# configured driver is run every time; what the force overrides is CANNOT
+# DETERMINE -- no driver, no driver installed, an unreachable endpoint, a
+# timeout, a success with nothing to say. A driver that answers REFUSED /
+# STILL ON (rc 1) aborts regardless. A host that answers and a fence that
+# failed are the two situations in which a forced promotion is precisely the
+# split brain this product exists to prevent, and neither is expressible.
+#
+# Everything a force overrides says `forced` on its own rung line, so "force
+# skips exactly the rungs it names" is readable in the log and is asserted row
+# by row in tests/tier4/ladder.tsv.
+#
+# WHAT THIS FILE TOUCHES. Local ZFS only through lib/zfs.subr's wrappers, the
+# platform only through the adapter, peers only through lib/transport.subr, and
+# the clock only through pol_now. That is what lets tests/tier4/t_ladder.sh
+# drive the whole ladder on a workstation with no disk, no peers and no CBSD:
+# it stands in for the wrappers in its own shell rather than for the ladder.
+#
+# THE DEAD NODE IS NEVER ASKED ANYTHING except by the death probes, whose whole
+# purpose is that it does not answer. Everything else comes from local disk,
+# from this node's configuration, or from LIVING peers -- which the state model
+# permits and the resurrection gate depends on (design §5).
+#
+# OPEN PROBLEM, STATED HERE RATHER THAN WORKED AROUND. Rung 6 registers a guest
+# from the configuration that arrived with its datasets:
+# `$( adapter_guest_sysdir <guest> )/rc.conf_<guest>`, read AFTER the mount
+# ceremony so that the path resolves into the replica. On real CBSD that works
+# for a bhyve guest -- ${jailsysdir}/<name> is a symlink to ${workdir}/vm/<name>
+# (sudoexec/bcreate:599), which IS the guest's dataset, so its rc.conf travels
+# with replication. It does NOT work for a jail: ${jailsysdir}/<name> is a plain
+# directory on CBSD's workdir dataset, outside <pool>/<jname>, and
+# `adapter_guest_datasets` -- correctly -- does not replicate it. A jail's
+# configuration therefore does not travel today, and rung 6 fails that guest
+# loudly, naming the missing file, rather than registering something it guessed.
+# Closing it means either replicating jails-system or having `repl` place a
+# copy inside the guest's own dataset; both change the wire, and neither is
+# this milestone's to decide. The pseudo-cluster's adapter puts the guest's
+# configuration in a child dataset (adapter-pseudo.subr) and so does not meet
+# the problem, which is exactly why it is written down here.
+#
+# shellcheck shell=sh
+# shellcheck disable=SC3043
+#   'local' is not in POSIX sh but is implemented by FreeBSD /bin/sh (sh(1),
+#   "local"); seance targets FreeBSD sh and nothing else (handoff §5).
+
+# The rungs a --force may name. `probes` is deliberately absent (D-44 item 1).
+PROMOTE_FORCEABLE="quorum fence lineage kernel"
+
+# The separator in a rung line. Spelled once so that the log's grammar is one
+# constant rather than a habit repeated eleven times.
+PROMOTE_SEP=" — "
+
+PROMOTE_TAB=$( printf '\t.' )
+PROMOTE_TAB=${PROMOTE_TAB%.}
+
+# Set by promote_run and read by it, by the dispatcher and -- in tier 4 -- by
+# the table driver, which is why they are named rather than passed: the ladder
+# is one long decision and its outcome has several parts.
+PROMOTE_DEAD=""             # the node key being succeeded
+PROMOTE_FORCE=""            # the rungs an operator forced, space separated
+PROMOTE_OPERATOR=""         # who said so
+PROMOTE_EVIDENCE=""         # fence:<driver> | force:<operator>
+PROMOTE_DISPOSITION=""      # proceed | abort | notify | force-only | stand-down
+PROMOTE_STOPPED_RUNG=""     # "<n> <name>" when the ladder stopped
+PROMOTE_REACHABLE=""        # living peer keys, space separated
+PROMOTE_UNREPORTED=""       # living peers that could NOT state their placement
+PROMOTE_KERNEL=""           # same | differs | unknown
+PROMOTE_KERNEL_DETAIL=""
+PROMOTE_GUESTS_PROMOTED=0
+PROMOTE_GUESTS_SEEN=0
+PROMOTE_GUEST_DISPOSITIONS=""   # "<guest>=<disposition>" per guest, space sep
+PROMOTE_TMPDIR=""               # scratch for one run
+
+# status_age_human (lib/status.subr) is used to print the RPO. It is a
+# formatting helper rather than a status concept -- an age read at three in the
+# morning by somebody who has just been paged -- and duplicating it here to
+# avoid the dependency would give the two verbs two ways of spelling the same
+# number. bin/seance sources status.subr first.
+
+# M3 sets this from --auto. In M2 nothing does, which is why rung 1 reports
+# n/a: a promotion a human typed has already been debounced by the human.
+PROMOTE_DEBOUNCE_REQUIRED=0
+
+# ---------------------------------------------------------------------------
+# Reporting
+# ---------------------------------------------------------------------------
+
+# promote_rung <n> <name> <verdict> <reason...>
+promote_rung()
+{
+    local _n _name _verdict
+
+    _n=$1
+    _name=$2
+    _verdict=$3
+    shift 3
+
+    printf 'rung %s %s: %s%s%s\n' "${_n}" "${_name}" "${_verdict}" \
+        "${PROMOTE_SEP}" "$*"
+}
+
+# promote_undo <command...>
+#
+# Printed BEFORE the step it undoes runs, so that a step which then wedges the
+# terminal has already told the operator how to get back.
+promote_undo()
+{
+    printf '  undo: %s\n' "$*"
+}
+
+# promote_note <message...>  -- a per-guest line that is not a rung verdict.
+promote_note()
+{
+    printf '  %s\n' "$*"
+}
+
+# promote_forced <rung>  -- rc 0 if the operator forced this rung by name.
+promote_forced()
+{
+    case " ${PROMOTE_FORCE} " in
+        *" $1 "*) return 0 ;;
+    esac
+
+    return 1
+}
+
+# promote_operator  -- who is accountable for a --force.
+#
+# SUDO_USER first, because a promotion run under sudo was authorised by the
+# human sudo names and not by root; then USER; then id -un, which is the only
+# one of the three that cannot be set by whoever is running the command.
+promote_operator()
+{
+    local _o
+
+    _o=${SUDO_USER:-}
+    [ -n "${_o}" ] || _o=${USER:-}
+    [ -n "${_o}" ] || _o=$( id -un 2>/dev/null ) || _o=""
+    [ -n "${_o}" ] || _o="unknown"
+
+    printf '%s\n' "${_o}"
+}
+
+# promote_parse_force <value>
+#
+# Fill PROMOTE_FORCE from a --force value: empty means every forceable rung, a
+# comma-separated list means exactly those. rc 2 -- a usage error, not a
+# refusal -- for a rung that does not exist or that may not be forced.
+promote_parse_force()
+{
+    local _v _r _k _ok
+
+    _v=${1:-}
+
+    if [ -z "${_v}" ]; then
+        PROMOTE_FORCE=${PROMOTE_FORCEABLE}
+        return 0
+    fi
+
+    PROMOTE_FORCE=""
+
+    for _r in $( printf '%s\n' "${_v}" | tr ',' ' ' ); do
+        [ -n "${_r}" ] || continue
+
+        if [ "${_r}" = "probes" ]; then
+            seance_log err "promote: --force may not name \"probes\":" \
+                "a host that answers is never fenced by force (D-44 item 1)"
+            return 2
+        fi
+
+        _ok=0
+        for _k in ${PROMOTE_FORCEABLE}; do
+            [ "${_k}" = "${_r}" ] && _ok=1
+        done
+
+        if [ "${_ok}" -eq 0 ]; then
+            seance_log err "promote: --force: no such forceable rung: \"${_r}\"" \
+                "(known: ${PROMOTE_FORCEABLE})"
+            return 2
+        fi
+
+        PROMOTE_FORCE="${PROMOTE_FORCE} ${_r}"
+    done
+
+    PROMOTE_FORCE=${PROMOTE_FORCE# }
+
+    if [ -z "${PROMOTE_FORCE}" ]; then
+        seance_log err "promote: --force= named no rungs"
+        return 2
+    fi
+
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# Rung 1 -- debounce
+# ---------------------------------------------------------------------------
+
+# promote_debounce_wait <seconds>
+#
+# The wait itself, through an injectable command so that a test can prove the
+# path runs without spending the time. M3 calls this from an --auto invocation
+# and then re-reads CARP; M2 has no CARP and no --auto, so nothing in the
+# shipped code calls it with PROMOTE_DEBOUNCE_REQUIRED unset.
+promote_debounce_wait()
+{
+    local _s _cmd
+
+    _s=${1:-0}
+    _cmd=${SEANCE_DEBOUNCE_SLEEP_CMD:-sleep}
+
+    case "${_s}" in
+        ''|*[!0123456789]*) return 2 ;;
+    esac
+
+    [ "${_s}" -eq 0 ] && return 0
+
+    # shellcheck disable=SC2086
+    #   Deliberate word splitting: SEANCE_DEBOUNCE_SLEEP_CMD is a command and
+    #   its arguments, and the number of seconds is appended to them.
+    ${_cmd} "${_s}"
+}
+
+promote_rung_debounce()
+{
+    local _s
+
+    if [ "${PROMOTE_DEBOUNCE_REQUIRED}" -ne 1 ]; then
+        promote_rung 1 debounce "n/a (manual)" \
+            "a human is the trigger, so there is no CARP transition to re-check;" \
+            "the automatic path is wired to this rung at the CARP milestone"
+        return 0
+    fi
+
+    _s=$( conf_effective debounce ) || _s=45
+
+    if ! promote_debounce_wait "${_s}"; then
+        promote_rung 1 debounce abort \
+            "the debounce wait could not be taken (debounce=${_s})"
+        return 1
+    fi
+
+    promote_rung 1 debounce pass "waited ${_s}s"
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# Rung 2 -- quorum
+# ---------------------------------------------------------------------------
+
+# promote_reachable_peers <selfkey> <deadkey>
+#
+# The configured nodes, other than this one and other than the corpse, that
+# answer ssh. One key per line. Asking the LIVING is permitted and is how the
+# claim check and the kernel check are made (design §5).
+promote_reachable_peers()
+{
+    local _self _dead _n _addr
+
+    _self=$1
+    _dead=$2
+
+    for _n in $( conf_nodes ); do
+        [ "${_n}" = "${_self}" ] && continue
+        [ "${_n}" = "${_dead}" ] && continue
+
+        _addr=$( seance_peer_addr "${_n}" ) || continue
+        seance_ssh_probe "${_addr}" || continue
+
+        printf '%s\n' "${_n}"
+    done
+}
+
+promote_rung_quorum()
+{
+    local _self _n _r _verdict _rc
+
+    _self=$1
+
+    if promote_forced quorum; then
+        PROMOTE_REACHABLE=$( promote_reachable_peers "${_self}" "${PROMOTE_DEAD}" |
+            tr '\n' ' ' )
+        PROMOTE_REACHABLE=${PROMOTE_REACHABLE% }
+        promote_rung 2 quorum forced \
+            "skipped by --force=quorum (operator ${PROMOTE_OPERATOR});" \
+            "reachable peers: ${PROMOTE_REACHABLE:-none}"
+        return 0
+    fi
+
+    PROMOTE_REACHABLE=$( promote_reachable_peers "${_self}" "${PROMOTE_DEAD}" |
+        tr '\n' ' ' )
+    PROMOTE_REACHABLE=${PROMOTE_REACHABLE% }
+
+    _n=$( conf_node_count )
+    _r=$( printf '%s\n' "${PROMOTE_REACHABLE}" | wc -w | tr -d ' ' )
+
+    _verdict=$( pol_quorum "${_n}" "${_r}" )
+    _rc=$?
+
+    if [ "${_rc}" -eq 2 ]; then
+        promote_rung 2 quorum abort \
+            "the configuration cannot form a quorum: N=${_n}, reachable others=${_r}"
+        PROMOTE_DISPOSITION=abort
+        return 2
+    fi
+
+    if [ "${_verdict}" = "act" ]; then
+        promote_rung 2 quorum pass \
+            "1 + ${_r} reachable of N=${_n} is a majority (reachable: ${PROMOTE_REACHABLE:-none})"
+        return 0
+    fi
+
+    promote_rung 2 quorum notify \
+        "FROZEN: 1 + ${_r} reachable of N=${_n} is not a majority." \
+        "Availability is sacrificed here, never consistency." \
+        "A human who has established that ${PROMOTE_DEAD} is really dead runs:" \
+        "seance promote ${PROMOTE_DEAD} --force=quorum"
+
+    printf 'seance promote %s --force=quorum\n' "${PROMOTE_DEAD}" |
+        seance_notify crit "seance: quorum frozen promoting ${PROMOTE_DEAD} on $( adapter_node_self 2>/dev/null || echo this node )"
+
+    PROMOTE_DISPOSITION=notify
+    return 1
+}
+
+# ---------------------------------------------------------------------------
+# Rung 3 -- the death probes
+# ---------------------------------------------------------------------------
+
+# promote_probe_alive <address>  -- rc 0 if anything answers at all.
+#
+# One ping packet with a two-second budget, then ssh. Either is enough: the
+# question is not "is it healthy" but "is it there", and a host that answers
+# either is a host that must not be fenced on a promotion's say-so.
+promote_probe_alive()
+{
+    local _addr
+
+    _addr=$1
+
+    if ping -c 1 -t 2 "${_addr}" > /dev/null 2>&1; then
+        printf 'ping\n'
+        return 0
+    fi
+
+    if seance_ssh_probe "${_addr}"; then
+        printf 'ssh\n'
+        return 0
+    fi
+
+    return 1
+}
+
+promote_rung_probes()
+{
+    local _addr _how
+
+    if ! _addr=$( seance_peer_addr "${PROMOTE_DEAD}" ); then
+        promote_rung 3 probes abort \
+            "node_${PROMOTE_DEAD}_mgmt is not configured: there is no address to probe," \
+            "and a node seance cannot probe is a node it must not fence"
+        PROMOTE_DISPOSITION=abort
+        return 2
+    fi
+
+    if _how=$( promote_probe_alive "${_addr}" ); then
+        promote_rung 3 probes abort \
+            "CARP said dead, host says alive -- ${PROMOTE_DEAD} (${_addr}) answered ${_how}." \
+            "INVESTIGATE; do not promote. This rung is not forceable."
+
+        printf '%s answered %s at %s. Nothing was fenced and nothing was promoted.\n' \
+            "${PROMOTE_DEAD}" "${_how}" "${_addr}" |
+            seance_notify crit "seance: ${PROMOTE_DEAD} is alive; promotion aborted"
+
+        PROMOTE_DISPOSITION=abort
+        return 1
+    fi
+
+    promote_rung 3 probes pass \
+        "${PROMOTE_DEAD} (${_addr}) answered neither ping nor ssh"
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# Rung 4 -- fencing
+# ---------------------------------------------------------------------------
+
+# promote_fence_exe <driver>
+#
+# Where a fence driver lives: the module's own drivers/ directory first, so
+# that a shipped driver cannot be shadowed by something on PATH, then PATH, so
+# that a site's own driver needs no checkout. rc 1 and no output when there is
+# neither.
+promote_fence_exe()
+{
+    local _d _p
+
+    _d=$1
+    _p="${SEANCE_ROOT}/drivers/fence_${_d}"
+
+    if [ -x "${_p}" ]; then
+        printf '%s\n' "${_p}"
+        return 0
+    fi
+
+    _p=$( command -v "fence_${_d}" 2>/dev/null ) || _p=""
+    [ -n "${_p}" ] || return 1
+
+    printf '%s\n' "${_p}"
+}
+
+# promote_fence_env
+#
+# The environment every driver is invoked with. Generic on purpose: a driver
+# that does not need a variable is not harmed by its presence, and the
+# alternative -- seance knowing which driver wants what -- would put the
+# drivers back inside seance.
+#
+#   SEANCE_FENCE_TIMEOUT     the fleet's fence_timeout, so the driver's own
+#                            budget and seance's are the same number.
+#   SEANCE_FENCE_IPMI_CONF   the site's credentials file, at the D-3 path
+#                            ${etcdir}/seance-fence-ipmi.conf. The shipped ipmi
+#                            driver has no compiled-in default and refuses to
+#                            guess one (D-53), because only CBSD knows workdir
+#                            and a driver that asked CBSD would stop being
+#                            standalone. seance knows, so seance tells it.
+promote_fence_env()
+{
+    local _etc
+
+    SEANCE_FENCE_TIMEOUT=$( conf_effective fence_timeout ) || SEANCE_FENCE_TIMEOUT=60
+    export SEANCE_FENCE_TIMEOUT
+
+    if _etc=$( adapter_fact etcdir 2>/dev/null ) && [ -n "${_etc}" ]; then
+        SEANCE_FENCE_IPMI_CONF="${_etc}/seance-fence-ipmi.conf"
+        export SEANCE_FENCE_IPMI_CONF
+    fi
+
+    return 0
+}
+
+# promote_rung_fence
+#
+# WHAT --force=fence MEANS HERE, and it is not what it first looks like: it
+# does NOT skip the fencing. If a driver is configured it is run, every time,
+# force or no force -- and a driver that answers REFUSED / STILL ON (rc 1)
+# aborts the promotion whatever the operator typed (D-44 item 1). What the
+# force overrides is CANNOT DETERMINE: no driver configured, no driver
+# installed, an unreachable endpoint, a timeout, a success with nothing to say.
+# Those are the cases where a human who has looked at the facility knows
+# something this node cannot, and the flag records that they said so.
+#
+# Skipping an available fence on the strength of a flag would be the exact
+# shape of the accident this rung exists to prevent, so the flag cannot ask
+# for it.
+promote_rung_fence()
+{
+    local _driver _target _exe _to _out _rc _errf _outf
+
+    _driver=$( conf_get "node_${PROMOTE_DEAD}_fence_driver" "" )
+    _target=$( conf_get "node_${PROMOTE_DEAD}_fence_target" "" )
+
+    if [ -z "${_driver}" ]; then
+        if promote_forced fence; then
+            PROMOTE_EVIDENCE="force:${PROMOTE_OPERATOR}"
+            promote_rung 4 fence forced \
+                "no node_${PROMOTE_DEAD}_fence_driver is configured, and the operator" \
+                "${PROMOTE_OPERATOR} accepted that with --force=fence;" \
+                "evidence recorded as ${PROMOTE_EVIDENCE}"
+            return 0
+        fi
+
+        promote_rung 4 fence notify \
+            "no node_${PROMOTE_DEAD}_fence_driver is configured, so this node cannot" \
+            "confirm ${PROMOTE_DEAD} is off. Fencing that is missing is fencing that" \
+            "cannot confirm. Run: seance promote ${PROMOTE_DEAD} --force=fence"
+
+        printf 'No fence driver is configured for %s. Nothing was promoted.\n' \
+            "${PROMOTE_DEAD}" |
+            seance_notify crit "seance: no fence driver for ${PROMOTE_DEAD}"
+
+        PROMOTE_DISPOSITION=notify
+        return 1
+    fi
+
+    if [ -z "${_target}" ]; then
+        promote_rung 4 fence abort \
+            "node_${PROMOTE_DEAD}_fence_driver is ${_driver} but node_${PROMOTE_DEAD}_fence_target" \
+            "is unset: there is nothing to name to the driver"
+        PROMOTE_DISPOSITION=abort
+        return 2
+    fi
+
+    if ! _exe=$( promote_fence_exe "${_driver}" ); then
+        if promote_forced fence; then
+            PROMOTE_EVIDENCE="force:${PROMOTE_OPERATOR}"
+            promote_rung 4 fence forced \
+                "THE FENCE DRIVER IS MISSING: no ${SEANCE_ROOT}/drivers/fence_${_driver}" \
+                "and no fence_${_driver} on PATH; the operator ${PROMOTE_OPERATOR}" \
+                "accepted that with --force=fence; evidence ${PROMOTE_EVIDENCE}"
+            return 0
+        fi
+
+        promote_rung 4 fence notify \
+            "THE FENCE DRIVER IS MISSING: no ${SEANCE_ROOT}/drivers/fence_${_driver}" \
+            "and no fence_${_driver} on PATH. ${PROMOTE_DEAD} cannot be confirmed off." \
+            "Install the driver, or run: seance promote ${PROMOTE_DEAD} --force=fence"
+
+        printf 'fence driver fence_%s is not installed on this node.\n' "${_driver}" |
+            seance_notify crit "seance: fence driver fence_${_driver} is missing"
+
+        PROMOTE_DISPOSITION=notify
+        return 1
+    fi
+
+    promote_fence_env
+
+    _to=$( conf_effective fence_timeout ) || _to=60
+    _errf="${PROMOTE_TMPDIR}/fence.err"
+    _outf="${PROMOTE_TMPDIR}/fence.out"
+
+    # Captured to FILES, not through a command substitution. timeout(1) kills
+    # the driver at the deadline, but a grandchild the driver started inherits
+    # the pipe a $( ) capture reads from and can hold it open long after the
+    # driver is dead -- which would make the fence rung wait for exactly the
+    # thing it just stopped waiting for. Same defect class as D-51.
+    # stdin is /dev/null so a driver cannot consume the caller's input either.
+    seance_run_timeout "${_to}" "${_exe}" off "${_target}" \
+        > "${_outf}" 2> "${_errf}" < /dev/null
+    _rc=$?
+
+    _out=$( cat "${_outf}" )
+
+    [ -s "${_errf}" ] && sed -e 's/^/  fence: /' "${_errf}" >&2
+
+    # rc 0 with nothing to say is a contract violation, never a verified off:
+    # the crashed-verifier lesson, applied to the one command whose success is
+    # the licence to start a guest somewhere else (TESTING.md §5).
+    if [ "${_rc}" -eq 0 ] && [ -z "${_out}" ]; then
+        if promote_forced fence; then
+            PROMOTE_EVIDENCE="force:${PROMOTE_OPERATOR}"
+            promote_rung 4 fence forced \
+                "fence_${_driver} exited 0 and printed nothing -- a contract violation," \
+                "read as CANNOT DETERMINE and never as a verified off; the operator" \
+                "${PROMOTE_OPERATOR} accepted that with --force=fence;" \
+                "evidence ${PROMOTE_EVIDENCE}"
+            return 0
+        fi
+
+        promote_rung 4 fence notify \
+            "fence_${_driver} exited 0 and printed nothing. Empty output with a" \
+            "success status is a contract violation, and it is read as CANNOT" \
+            "DETERMINE, never as a verified off." \
+            "Run: seance promote ${PROMOTE_DEAD} --force=fence"
+
+        printf 'fence_%s off %s exited 0 with no output: contract violation.\n' \
+            "${_driver}" "${_target}" |
+            seance_notify crit "seance: fence_${_driver} broke its contract fencing ${PROMOTE_DEAD}"
+
+        PROMOTE_DISPOSITION=notify
+        return 1
+    fi
+
+    case "${_rc}" in
+        0)
+            PROMOTE_EVIDENCE="fence:${_driver}"
+            promote_rung 4 fence pass \
+                "fence_${_driver} off ${_target} verified ${PROMOTE_DEAD} is off:" \
+                "[${_out}]. Split brain is now impossible, not merely unlikely."
+            return 0
+            ;;
+        1)
+            promote_rung 4 fence abort \
+                "FENCE REFUSED: fence_${_driver} off ${_target} reports ${PROMOTE_DEAD}" \
+                "still on, or refused the command: [${_out}]." \
+                "This is a hard abort and is NOT forceable. Something is deeply wrong;" \
+                "find out what before anything starts that guest anywhere."
+
+            printf 'fence_%s off %s exited 1 (refused / still on): %s\nNothing was promoted.\n' \
+                "${_driver}" "${_target}" "${_out}" |
+                seance_notify crit "seance: FENCE REFUSED for ${PROMOTE_DEAD} -- promotion aborted"
+
+            PROMOTE_DISPOSITION=abort
+            return 1
+            ;;
+        *)
+            if promote_forced fence; then
+                PROMOTE_EVIDENCE="force:${PROMOTE_OPERATOR}"
+                promote_rung 4 fence forced \
+                    "cannot determine whether ${PROMOTE_DEAD} is off: fence_${_driver}" \
+                    "off ${_target} exited ${_rc} [${_out}]; the operator" \
+                    "${PROMOTE_OPERATOR} accepted that with --force=fence;" \
+                    "evidence ${PROMOTE_EVIDENCE}"
+                return 0
+            fi
+
+            promote_rung 4 fence notify \
+                "cannot determine whether ${PROMOTE_DEAD} is off: fence_${_driver} off" \
+                "${_target} exited ${_rc} [${_out}]. Consistent with total power loss," \
+                "but that is not proof. Look at the facility, then run:" \
+                "seance promote ${PROMOTE_DEAD} --force=fence"
+
+            printf 'fence_%s off %s exited %s: %s\nNothing was promoted.\n' \
+                "${_driver}" "${_target}" "${_rc}" "${_out}" |
+                seance_notify crit "seance: cannot confirm ${PROMOTE_DEAD} is fenced"
+
+            PROMOTE_DISPOSITION=notify
+            return 1
+            ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
+# Rung 5 -- lineage, per guest
+# ---------------------------------------------------------------------------
+
+# promote_standby_root <selfkey>
+#
+# Where THIS node keeps other nodes' replicas. It is this node's own standby
+# root because this node is the one that received them (D-67, D-59).
+promote_standby_root()
+{
+    local _self _sroot _tmp _root _g _names
+
+    _self=$1
+
+    repl_standby_root "${_self}" && return 0
+
+    # Unset: derive from a guest of this node's own, which is the only layout a
+    # derivation can honestly speak for.
+    _tmp=$( seance_tmpdir ) || return 1
+    adapter_guest_list > "${_tmp}/g" < /dev/null || return 1
+    _names=$( awk -F "${PROMOTE_TAB}" 'NF > 0 { print $1 }' "${_tmp}/g" )
+
+    for _g in ${_names}; do
+        adapter_guest_datasets "${_g}" > "${_tmp}/ds" < /dev/null || continue
+        [ -s "${_tmp}/ds" ] || continue
+        _root=""
+        read -r _root < "${_tmp}/ds"
+        [ -n "${_root}" ] || continue
+        repl_standby_root_derived "${_root}" && return 0
+    done
+
+    return 1
+}
+
+# promote_estate <standby-root> <deadkey>
+#
+# The dead node's estate as this node holds it: one record per guest,
+# "<guest><TAB><replica-root-dataset><TAB><newest replica timestamp>",
+# alphabetically by guest.
+#
+# A guest is in the estate when it has a dataset under <standby_root>/<dead>/
+# AND that dataset tree carries at least one @seance-<dead>-* snapshot
+# (D-44 item 3). Both halves matter: a directory somebody made by hand is not
+# an estate, and a replica with no lineage is not promotable -- the disposition
+# rung would abort on it anyway, and discovering it here keeps that abort
+# attached to a named guest rather than to an empty list.
+promote_estate()
+{
+    local _sroot _dead _base _kids _ds _guest _ts
+
+    _sroot=$1
+    _dead=$2
+    _base="${_sroot}/${_dead}"
+
+    _kids=$( zfs_children "${_base}" ) || return 1
+
+    for _ds in ${_kids}; do
+        _guest=${_ds##*/}
+
+        # The configuration mirror lives beside the guests and is not one
+        # (D-82). It is what rung 6 reads a jail's rc.conf out of; promoting it
+        # would be promoting seance's own bookkeeping.
+        [ "${_guest}" = "${REPL_SYS_GUEST}" ] && continue
+
+        # MEMBERSHIP is "carries at least one @seance-<dead>-* anywhere"
+        # (D-44 item 3). THE PROMOTION POINT is the newest instant every
+        # dataset of the tree shares (D-85), and the two are different
+        # questions: a guest whose tree has lineage but no shared instant is
+        # part of the estate and must be REFUSED BY NAME, not quietly left out
+        # of a listing where an operator would read its absence as "seance
+        # holds nothing for it".
+        lineage_probe "${_dead}" "${_ds}" > /dev/null 2>&1 || continue
+
+        _ts=$( lineage_probe_common "${_dead}" "${_ds}" 2>/dev/null ) || _ts=""
+
+        printf '%s\t%s\t%s\n' "${_guest}" "${_ds}" "${_ts}"
+    done | LC_ALL=C sort
+}
+
+# promote_ahead_of <dataset> <deadkey> <point>
+#
+# The snapshots of <dataset> that a rollback to <point> would destroy: every
+# snapshot after it, whoever wrote it. Printed so that the operator sees what
+# went, not only that something did.
+#
+# Ordering is by our own parser where a name parses, and lexical where it does
+# not -- a foreign name has no timestamp seance can compare, so what is listed
+# for it is simply "it is in the listing after the point", which is what
+# `zfs rollback -r` will act on.
+promote_ahead_of()
+{
+    local _ds _dead _point _out _line _short _parsed _ts
+
+    _ds=$1
+    _dead=$2
+    _point=$3
+
+    _out=$( lineage_listing "${_ds}" 2>/dev/null ) || return 0
+
+    printf '%s\n' "${_out}" |
+    while IFS= read -r _line || [ -n "${_line}" ]; do
+        case "${_line}" in
+            "${_ds}@"*) ;;
+            *) continue ;;
+        esac
+
+        _short=${_line#*@}
+
+        if _parsed=$( pol_snap_parse "${_short}" ); then
+            _ts=${_parsed#*	}
+            if [ "${_parsed%	*}" = "${_dead}" ]; then
+                [ "$( pol_ts_cmp "${_ts}" "${_point}" )" = "1" ] || continue
+            fi
+        fi
+
+        # Anything at or before the point of OUR lineage was skipped above;
+        # everything else here is destroyed by the rollback, foreign names
+        # included, and saying so is the whole reason this function exists.
+        [ "${_short}" = "$( pol_snap_format "${_dead}" "${_point}" 2>/dev/null )" ] &&
+            continue
+
+        printf '%s\n' "${_short}"
+    done
+
+    return 0
+}
+
+# promote_align_tree <guest> <replica-root> <deadkey> <point>
+#
+# Put every dataset of the tree at the promotion point (D-85). A dataset
+# holding snapshots of OUR lineage after the point is rolled back to it; a
+# dataset that only has foreign snapshots after the point is left alone,
+# because its DATA is already at the point -- a replica's data only advances by
+# receive, and a receive lands one of ours.
+#
+# rc 0 when the whole tree sits at the point.
+promote_align_tree()
+{
+    local _guest _root _dead _point _fs _vols _ds _newest _all _rc _short
+
+    _guest=$1
+    _root=$2
+    _dead=$3
+    _point=$4
+
+    _short=$( pol_snap_format "${_dead}" "${_point}" ) || return 1
+
+    _fs=$( zfs_filesystems_r "${_root}" 2>/dev/null ) || _fs=""
+    _vols=$( zfs_volumes_r "${_root}" 2>/dev/null ) || _vols=""
+    _all="${_fs}
+${_vols}"
+
+    _rc=0
+
+    for _ds in ${_all}; do
+        [ -n "${_ds}" ] || continue
+
+        _newest=$( lineage_listing "${_ds}" 2>/dev/null |
+            awk -F '@' -v d="${_ds}" 'NF == 2 && $1 == d { print $2 }' |
+            pol_newest_for_node "${_dead}" ) || continue
+
+        [ -n "${_newest}" ] || continue
+        [ "$( pol_ts_cmp "${_newest}" "${_point}" )" = "1" ] || continue
+
+        promote_note "${_ds} is AHEAD of the promotion point: an interrupted tick" \
+            "left it at ${_newest} while the tree as a whole is only complete at" \
+            "${_point}. Rolling it back. These snapshots are destroyed and there is" \
+            "NO UNDO:"
+        promote_ahead_of "${_ds}" "${_dead}" "${_point}" |
+            while IFS= read -r _newest || [ -n "${_newest}" ]; do
+                [ -n "${_newest}" ] || continue
+                printf '    destroying %s@%s\n' "${_ds}" "${_newest}"
+            done
+
+        promote_undo "none -- zfs rollback -r destroys the snapshots after ${_short}"
+
+        if ! zfs_rollback_r "${_ds}" "${_short}"; then
+            seance_log err "promote ${_guest}: cannot roll ${_ds} back to @${_short}"
+            _rc=1
+        fi
+    done
+
+    return "${_rc}"
+}
+
+# promote_sys_restore <guest> <sys-replica-dataset> <destination-directory>
+#                     <scratch-directory>
+#
+# Put a guest's configuration back where the platform looks for it, out of the
+# replica of the dead node's configuration mirror (D-82).
+#
+# The mirror is mounted READ-ONLY at a scratch path for the length of the copy
+# and then put back to where it was. Read-only because this node is reading
+# another node's record of its own estate: there is nothing here seance should
+# be able to write, and `zfs mount -o ro` is a property that lasts only as long
+# as the mount, so nothing has to be undone afterwards.
+#
+# rc 0 the configuration is in place, 1 it could not be.
+promote_sys_restore()
+{
+    local _guest _sds _dst _scratch _rc
+
+    _guest=$1
+    _sds=$2
+    _dst=$3
+    _scratch="${4:?}/sysmirror"
+
+    if ! zfs_exists "${_sds}"; then
+        seance_log err "promote ${_guest}: no configuration mirror at ${_sds}." \
+            "The guest's data is here and its configuration is not, so nothing" \
+            "here can register it."
+        return 1
+    fi
+
+    mkdir -p "${_scratch}" || return 1
+
+    promote_undo "zfs unmount ${_sds}; zfs inherit mountpoint ${_sds}"
+
+    if ! zfs_set "mountpoint=${_scratch}" "${_sds}"; then
+        seance_log err "promote ${_guest}: cannot point ${_sds} at ${_scratch}"
+        return 1
+    fi
+
+    if ! zfs_mount_ro "${_sds}"; then
+        seance_log err "promote ${_guest}: cannot mount ${_sds} read-only"
+        zfs_inherit mountpoint "${_sds}"
+        return 1
+    fi
+
+    _rc=0
+
+    if [ ! -d "${_scratch}/${_guest}" ]; then
+        seance_log err "promote ${_guest}: the configuration mirror carries no" \
+            "${_guest}/ directory; the dead node never mirrored this guest"
+        _rc=1
+    else
+        promote_undo "rm -rf ${_dst}"
+        if mkdir -p "${_dst}" && cp -a "${_scratch}/${_guest}/." "${_dst}/"; then
+            promote_note "restored ${_guest}'s configuration into ${_dst} from ${_sds}"
+        else
+            seance_log err "promote ${_guest}: could not copy its configuration into ${_dst}"
+            _rc=1
+        fi
+    fi
+
+    zfs_unmount "${_sds}" || _rc=1
+    zfs_inherit mountpoint "${_sds}" || _rc=1
+
+    return "${_rc}"
+}
+
+# promote_kernel_check <selfkey>
+#
+# Is this fleet kernel-homogeneous, as far as the living can say?
+#
+# WHAT THIS CAN AND CANNOT PROVE, stated because the difference is the whole
+# reason the rung is forceable. D-5 asks whether the promoting node's kernel
+# matches the guest's HOME node's. The home node is dead and may not be asked
+# (design §5), and seance keeps no record of its kernel. What can be measured
+# is whether every LIVING node agrees with this one -- and under the fleet
+# doctrine that a jail-hosting cluster is kernel-homogeneous (design §3), a
+# living fleet that agrees is the available evidence that the dead one did too.
+# A living fleet that DISAGREES is proof that the doctrine does not hold here,
+# and a jail must then not be promoted without a human saying so.
+#
+# Sets PROMOTE_KERNEL to same, differs or unknown.
+promote_kernel_check()
+{
+    local _self _local _peer _addr _k _bad
+
+    _self=$1
+
+    _local=$( adapter_kernel_version 2>/dev/null ) || _local=""
+
+    if [ -z "${_local}" ]; then
+        PROMOTE_KERNEL=unknown
+        PROMOTE_KERNEL_DETAIL="this node could not report its own kernel version"
+        return 0
+    fi
+
+    if [ -z "${PROMOTE_REACHABLE}" ]; then
+        PROMOTE_KERNEL=unknown
+        PROMOTE_KERNEL_DETAIL="no living peer answered, so homogeneity cannot be measured"
+        return 0
+    fi
+
+    _bad=""
+    for _peer in ${PROMOTE_REACHABLE}; do
+        _addr=$( seance_peer_addr "${_peer}" ) || continue
+        # shellcheck disable=SC2016
+        #   The single quotes are the point: this is source text for the PEER's
+        #   shell, not an expansion for this one. Expanding it here would ask
+        #   this node for its own kernel three times.
+        _k=$( seance_ssh "${_addr}" \
+            'k=$( freebsd-version -k 2>/dev/null ); [ -n "$k" ] || k=$( uname -r ); printf "%s\n" "$k"' \
+            2>/dev/null ) || _k=""
+
+        if [ -z "${_k}" ]; then
+            _bad="${_bad} ${_peer}=?"
+        elif [ "${_k}" != "${_local}" ]; then
+            _bad="${_bad} ${_peer}=${_k}"
+        fi
+    done
+
+    if [ -z "${_bad}" ]; then
+        PROMOTE_KERNEL=same
+        PROMOTE_KERNEL_DETAIL="every living peer runs ${_local}"
+        return 0
+    fi
+
+    PROMOTE_KERNEL=differs
+    PROMOTE_KERNEL_DETAIL="this node runs ${_local}; the living fleet disagrees:${_bad}"
+    return 0
+}
+
+# promote_claimed <guest>
+#
+# Print the peer that already claims this guest, or nothing. The claim check
+# asks the LIVING, which the state model permits, and it is what makes
+# "exactly one survivor acts" true from the resource rather than from a race
+# (D-44 item 3).
+promote_claimed()
+{
+    local _guest _row
+
+    _guest=$1
+
+    placement_claims "${PROMOTE_TMPDIR}/claims" "${_guest}"
+}
+
+# promote_claims_gather
+#
+# Ask every reachable peer what it is hosting, ONCE per run, into
+# ${PROMOTE_TMPDIR}/claims. Sets PROMOTE_UNREPORTED to the living peers that
+# could not answer.
+#
+# Once rather than per guest because the answer is a property of the fleet at
+# this instant, not of the guest being considered -- and because the list of
+# peers that could NOT answer has to be the same list for every guest, or the
+# ladder would refuse one guest and promote the next on the strength of the
+# same silence.
+promote_claims_gather()
+{
+    : > "${PROMOTE_TMPDIR}/claims"
+
+    # shellcheck disable=SC2086
+    #   Deliberate word splitting: PROMOTE_REACHABLE is a list of node keys.
+    placement_remote ${PROMOTE_REACHABLE} > "${PROMOTE_TMPDIR}/claims"
+
+    PROMOTE_UNREPORTED=$( placement_silent "${PROMOTE_TMPDIR}/claims" )
+    PROMOTE_UNREPORTED=${PROMOTE_UNREPORTED% }
+}
+
+# promote_guest_disposition <guest> <replica-root> <newest-ts> <selfkey> <now>
+#
+# The whole of rung 5 for one guest. Prints its own lines and returns:
+#   0  proceed
+#   1  do not promote this guest (the reason has been printed)
+promote_guest_disposition()
+{
+    local _guest _ds _ts _self _now _peers _h1 _h2 _reach _actor _claim
+    local _max _skew _force _disp _rc _type _arc _order
+
+    _guest=$1
+    _ds=$2
+    _ts=$3
+    _self=$4
+    _now=$5
+
+    # --- whose is it -------------------------------------------------------
+    if ! _peers=$( repl_peers "${_guest}" "${PROMOTE_DEAD}" ); then
+        promote_note "${_guest}: stand-down -- no heir is configured for ${PROMOTE_DEAD}," \
+            "so nothing here may inherit it"
+        PROMOTE_GUEST_DISPOSITIONS="${PROMOTE_GUEST_DISPOSITIONS} ${_guest}=stand-down"
+        return 1
+    fi
+
+    _h1=$( printf '%s\n' "${_peers}" | sed -n '1p' )
+    _h2=$( printf '%s\n' "${_peers}" | sed -n '2p' )
+
+    if [ "${_h1}" = "${_self}" ]; then
+        _reach=1
+    else
+        case " ${PROMOTE_REACHABLE} " in
+            *" ${_h1} "*) _reach=1 ;;
+            *) _reach=0 ;;
+        esac
+    fi
+
+    # pol_am_i_actor's rc IS its answer (0 act, 1 stand-down), so it is read
+    # from stdout; rc 2 is a malformed call and must not be mistaken for a
+    # stand-down, which is why it is separated out rather than swallowed.
+    _actor=$( pol_am_i_actor "${_self}" "${_h1}" "${_h2}" "${_reach}" )
+    _arc=$?
+    _order=$( printf '%s' "${_peers}" | tr '\n' ' ' )
+
+    if [ "${_arc}" -eq 2 ]; then
+        promote_note "${_guest}: abort -- the succession for it could not be evaluated" \
+            "(self=${_self} heir=${_h1} heir2=${_h2} heir1-reachable=${_reach})"
+        PROMOTE_GUEST_DISPOSITIONS="${PROMOTE_GUEST_DISPOSITIONS} ${_guest}=abort"
+        return 1
+    fi
+
+    if [ "${_actor}" != "act" ]; then
+        promote_note "${_guest}: stand-down -- succession is ${_order}," \
+            "and this node is not the actor for it"
+        PROMOTE_GUEST_DISPOSITIONS="${PROMOTE_GUEST_DISPOSITIONS} ${_guest}=stand-down"
+        return 1
+    fi
+
+    # --- does anybody already have it -------------------------------------
+    #
+    # A LIVING PEER THAT COULD NOT ANSWER IS NOT A PEER WITH NO CLAIM. It is up
+    # -- it answered an ssh probe -- and its seance could not say what it is
+    # hosting, so this node cannot establish that the guest is not already
+    # running there. Promoting on that silence is the split brain the claim
+    # check exists to prevent, arriving by way of a broken install rather than
+    # a broken network, and it is not forceable for the same reason a live host
+    # is never fenced by force (D-44 item 1).
+    if [ -n "${PROMOTE_UNREPORTED}" ]; then
+        promote_note "${_guest}: abort -- living peer(s) ${PROMOTE_UNREPORTED} answered" \
+            "ssh but could not state their placement, so nothing here can establish that" \
+            "${_guest} is not already running on one of them." \
+            "Fix seance on those nodes (ssh <peer> ${GATE_REMOTE_CMD}) and run this again."
+        PROMOTE_GUEST_DISPOSITIONS="${PROMOTE_GUEST_DISPOSITIONS} ${_guest}=abort"
+        return 1
+    fi
+
+    _claim=$( promote_claimed "${_guest}" )
+    if [ -n "${_claim}" ]; then
+        promote_note "${_guest}: stand-down -- ${_claim} already claims it in its placement." \
+            "Exactly one survivor acts, and it is not this one."
+        PROMOTE_GUEST_DISPOSITIONS="${PROMOTE_GUEST_DISPOSITIONS} ${_guest}=stand-down"
+        return 1
+    fi
+
+    # --- is there an instant the whole guest exists at (D-85) -------------
+    if [ -z "${_ts}" ]; then
+        promote_note "${_guest}: abort -- no @seance-${PROMOTE_DEAD}-* snapshot is" \
+            "present on EVERY dataset of ${_ds}. A tick died part way and left the" \
+            "tree at different instants; there is no complete copy of this guest to" \
+            "promote, and no --force makes one. Let the dead node come back, or" \
+            "promote from a peer whose copy is coherent."
+        PROMOTE_GUEST_DISPOSITIONS="${PROMOTE_GUEST_DISPOSITIONS} ${_guest}=abort"
+        return 1
+    fi
+
+    # --- is the replica fresh enough --------------------------------------
+    _max=$( conf_effective staleness_max "${_guest}" ) || _max=2700
+    _skew=$( conf_effective skew_tolerance ) || _skew=120
+
+    if promote_forced lineage; then
+        _force=1
+    else
+        _force=0
+    fi
+
+    _disp=$( pol_lineage_disposition "${_ts}" "${_now}" "${_max}" "${_skew}" "${_force}" )
+    _rc=$?
+
+    if [ "${_rc}" -eq 2 ]; then
+        promote_note "${_guest}: abort -- the replica's newest timestamp [${_ts}] cannot be read"
+        PROMOTE_GUEST_DISPOSITIONS="${PROMOTE_GUEST_DISPOSITIONS} ${_guest}=abort"
+        return 1
+    fi
+
+    case "${_disp}" in
+        proceed)
+            promote_note "${_guest}: lineage proceed -- newest replica ${_ts}, inside staleness_max ${_max}s"
+            ;;
+        proceed-forced)
+            promote_note "${_guest}: lineage proceed-forced -- newest replica ${_ts} is stale or skewed," \
+                "forced by --force=lineage (operator ${PROMOTE_OPERATOR})"
+            PROMOTE_EVIDENCE="force:${PROMOTE_OPERATOR}"
+            ;;
+        force-only)
+            promote_note "${_guest}: force-only -- newest replica ${_ts} is stale or skewed past" \
+                "staleness_max ${_max}s / skew_tolerance ${_skew}s." \
+                "Run: seance promote ${PROMOTE_DEAD} --force=lineage --guest ${_guest}"
+            PROMOTE_GUEST_DISPOSITIONS="${PROMOTE_GUEST_DISPOSITIONS} ${_guest}=force-only"
+            return 1
+            ;;
+        *)
+            promote_note "${_guest}: abort -- no @seance-${PROMOTE_DEAD}-* lineage on ${_ds};" \
+                "there is nothing here to promote, and no --force makes a snapshot exist"
+            PROMOTE_GUEST_DISPOSITIONS="${PROMOTE_GUEST_DISPOSITIONS} ${_guest}=abort"
+            return 1
+            ;;
+    esac
+
+    # --- jails run this node's kernel (D-5) --------------------------------
+    #
+    # Only a MEASURED disagreement stops a jail. "unknown" -- nobody living
+    # answered -- is not evidence of a mismatch, and treating it as one would
+    # make every N=2 promotion (where the only peer is the corpse) demand a
+    # second --force for no new information. Homogeneity is watched
+    # continuously and loudly by `status` and `verify`; this rung catches the
+    # case where that watch has already found a divergence.
+    _type=$( promote_guest_type "${_ds}" )
+
+    if [ "${_type}" = "jail" ] && [ "${PROMOTE_KERNEL}" = "unknown" ]; then
+        promote_note "${_guest}: kernel homogeneity could not be measured --" \
+            "${PROMOTE_KERNEL_DETAIL}. It is a jail, so it will run this node's kernel;" \
+            "seance status names any divergence it can see."
+    fi
+
+    if [ "${_type}" = "jail" ] && [ "${PROMOTE_KERNEL}" = "differs" ]; then
+        if promote_forced kernel; then
+            promote_note "${_guest}: kernel forced -- ${PROMOTE_KERNEL_DETAIL};" \
+                "forced by --force=kernel (operator ${PROMOTE_OPERATOR})"
+            PROMOTE_EVIDENCE="force:${PROMOTE_OPERATOR}"
+        else
+            promote_note "${_guest}: force-only -- it is a jail and jails run the host's kernel," \
+                "but ${PROMOTE_KERNEL_DETAIL}." \
+                "Run: seance promote ${PROMOTE_DEAD} --force=kernel --guest ${_guest}"
+            PROMOTE_GUEST_DISPOSITIONS="${PROMOTE_GUEST_DISPOSITIONS} ${_guest}=force-only"
+            return 1
+        fi
+    fi
+
+    PROMOTE_GUEST_DISPOSITIONS="${PROMOTE_GUEST_DISPOSITIONS} ${_guest}=proceed"
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# Rung 6 -- promotion proper, per guest
+# ---------------------------------------------------------------------------
+
+# promote_guest_type <replica-root-dataset>
+#
+# bhyve if the replica tree carries a ZFS volume, jail otherwise.
+#
+# EVIDENCE, and the reason it is read from the datasets rather than from a
+# config file: a bhyve guest's disks ARE zvols under its own dataset
+# (sudoexec/bcreate:573-590, and sudoexec/zfs-recv:82-93 restores their
+# /dev/zvol symlinks after a receive), while a jail's dataset is created as a
+# plain filesystem with no volumes at all (sudoexec/mkdatadir:14-23). The
+# guest's own configuration would be the other answer, but it lives inside the
+# replica and cannot be read until the replica is mounted -- and the mountpoint
+# is exactly what the type decides. The dataset shape is legible without
+# mounting anything, so it is what the ceremony asks.
+#
+# The guess is not left to stand: promote_guest_promote re-asks the platform
+# once the guest is registered, and a disagreement that would have put the
+# guest in the wrong place is fatal.
+promote_guest_type()
+{
+    local _vols
+
+    _vols=$( zfs_volumes_r "$1" 2>/dev/null ) || _vols=""
+
+    if [ -n "${_vols}" ]; then
+        printf 'bhyve\n'
+    else
+        printf 'jail\n'
+    fi
+}
+
+# promote_mount_ceremony <guest> <replica-root> <mountpoint>
+#
+# The replica is promoted IN PLACE (D-44 item 4): it stays under the standby
+# tree and is given the mountpoint CBSD expects, dataset by dataset, with
+# canmount=noauto left alone and every mount made explicitly. The standby
+# PARENTS are not touched and stay mountpoint=none -- they are not this guest's
+# and never mount.
+#
+# rc 0 when every filesystem of the tree is mounted where it belongs.
+promote_mount_ceremony()
+{
+    local _guest _root _mp _fs _ds _tail _target _rc
+
+    _guest=$1
+    _root=$2
+    _mp=$3
+
+    _fs=$( zfs_filesystems_r "${_root}" ) || {
+        seance_log err "promote ${_guest}: cannot list the filesystems of ${_root}"
+        return 1
+    }
+
+    _rc=0
+    for _ds in ${_fs}; do
+        _tail=${_ds#"${_root}"}
+        _target="${_mp}${_tail}"
+
+        promote_undo "zfs unmount ${_ds}; zfs inherit mountpoint ${_ds}"
+
+        if ! zfs_set "mountpoint=${_target}" "${_ds}"; then
+            seance_log err "promote ${_guest}: cannot set mountpoint=${_target} on ${_ds}"
+            _rc=1
+            continue
+        fi
+
+        if zfs_mounted "${_ds}"; then
+            promote_note "${_ds} is already mounted at ${_target}"
+            continue
+        fi
+
+        if ! zfs_mount "${_ds}"; then
+            seance_log err "promote ${_guest}: cannot mount ${_ds} at ${_target}"
+            _rc=1
+            continue
+        fi
+
+        promote_note "mounted ${_ds} at ${_target}"
+    done
+
+    return "${_rc}"
+}
+
+# promote_relink <guest> <replica-root> <type> <mountpoint>
+#
+# The symlinks a replicated guest needs before the platform can find it: the
+# per-disk /dev/zvol links, whose names come from the datasets
+# (sudoexec/zfs-recv:82-93), and whatever the platform itself asks for
+# (adapter_guest_links -- on CBSD, a VM's jails-system and jails-data links,
+# sudoexec/bcreate:598-599).
+promote_relink()
+{
+    local _guest _root _type _mp _vols _v _name _links _line _link _target _rc
+
+    _guest=$1
+    _root=$2
+    _type=$3
+    _mp=$4
+    _rc=0
+
+    _vols=$( zfs_volumes_r "${_root}" 2>/dev/null ) || _vols=""
+    for _v in ${_vols}; do
+        _name=${_v##*/}
+
+        if [ ! -e "/dev/zvol/${_v}" ]; then
+            promote_note "no /dev/zvol/${_v} yet; ${_mp}/${_name} was not linked"
+            continue
+        fi
+
+        promote_undo "rm -f ${_mp}/${_name}"
+        if ln -sf "/dev/zvol/${_v}" "${_mp}/${_name}"; then
+            promote_note "linked ${_mp}/${_name} -> /dev/zvol/${_v}"
+        else
+            seance_log err "promote ${_guest}: cannot link ${_mp}/${_name}"
+            _rc=1
+        fi
+    done
+
+    _links=$( adapter_guest_links "${_guest}" "${_type}" ) || {
+        seance_log err "promote ${_guest}: the adapter could not say which links this platform needs"
+        return 1
+    }
+
+    printf '%s\n' "${_links}" | while IFS= read -r _line || [ -n "${_line}" ]; do
+        [ -n "${_line}" ] || continue
+        _link=${_line%%"${PROMOTE_TAB}"*}
+        _target=${_line#*"${PROMOTE_TAB}"}
+
+        if [ -e "${_link}" ] && [ ! -h "${_link}" ]; then
+            seance_log err "promote ${_guest}: ${_link} exists and is not a symlink;" \
+                "refusing to replace it"
+            exit 1
+        fi
+
+        promote_undo "rm -f ${_link}"
+        ln -sf "${_target}" "${_link}" || exit 1
+        promote_note "linked ${_link} -> ${_target}"
+    done || _rc=1
+
+    return "${_rc}"
+}
+
+# promote_guest_promote <guest> <replica-root> <newest-ts> <selfkey> <now>
+#                       <standby-root>
+#
+# Rung 6 for one guest. rc 0 when the guest is registered, running and
+# recorded here.
+promote_guest_promote()
+{
+    local _guest _root _ts _self _now _sroot _type _mp _sysdir _rcfile
+    local _running _real _age _epoch
+
+    _guest=$1
+    _root=$2
+    _ts=$3
+    _self=$4
+    _now=$5
+    _sroot=$6
+
+    _type=$( promote_guest_type "${_root}" )
+
+    if ! _mp=$( adapter_guest_mountpoint "${_guest}" "${_type}" ); then
+        seance_log err "promote ${_guest}: the adapter cannot say where a ${_type} belongs here"
+        return 1
+    fi
+
+    promote_note "${_guest}: ${_type}, replica ${_root}, promotion point ${_ts}," \
+        "mounting at ${_mp}"
+
+    # Every dataset at the same instant, BEFORE anything is mounted (D-85).
+    # Mounting a tree whose child is ahead of its root would hand the guest a
+    # filesystem that no complete copy of it ever had.
+    promote_align_tree "${_guest}" "${_root}" "${PROMOTE_DEAD}" "${_ts}" || return 1
+
+    promote_mount_ceremony "${_guest}" "${_root}" "${_mp}" || return 1
+    promote_relink "${_guest}" "${_root}" "${_type}" "${_mp}" || return 1
+
+    # The guest's own configuration. TWO PLACES, in this order (D-82):
+    #
+    #   1. where the platform looks. After the ceremony above that path
+    #      resolves into the replica for anything whose configuration travels
+    #      inside its own dataset -- a VM on CBSD, whose ${jailsysdir}/<n> is a
+    #      symlink to the dataset (sudoexec/bcreate:599), and every guest in
+    #      the pseudo-cluster.
+    #   2. otherwise, out of the dead node's configuration mirror, which is
+    #      where `repl` puts a JAIL's ${jailsysdir}/<n>/ precisely because
+    #      nothing else replicates it.
+    _sysdir=""
+    _rcfile=""
+    if _sysdir=$( adapter_guest_sysdir "${_guest}" 2>/dev/null ); then
+        _rcfile="${_sysdir}/rc.conf_${_guest}"
+    fi
+
+    if [ -z "${_rcfile}" ] || [ ! -r "${_rcfile}" ]; then
+        promote_note "${_guest}: its configuration did not travel inside its own" \
+            "datasets; restoring it from ${PROMOTE_DEAD}'s configuration mirror"
+
+        if [ -z "${_sysdir}" ]; then
+            _sysdir="$( adapter_fact jailsysdir )/${_guest}"
+        fi
+
+        if ! promote_sys_restore "${_guest}" "${_sroot}/${PROMOTE_DEAD}/${REPL_SYS_GUEST}" \
+                "${_sysdir}" "${PROMOTE_TMPDIR}"; then
+            seance_log err "promote ${_guest}: its configuration is not here." \
+                "Nothing has been started; the mounts above can be undone with the" \
+                "lines printed beside them."
+            return 1
+        fi
+
+        _sysdir=$( adapter_guest_sysdir "${_guest}" 2>/dev/null ) || {
+            seance_log err "promote ${_guest}: the adapter still cannot say where this" \
+                "guest's configuration directory is"
+            return 1
+        }
+        _rcfile="${_sysdir}/rc.conf_${_guest}"
+    fi
+
+    if [ ! -r "${_rcfile}" ]; then
+        seance_log err "promote ${_guest}: no readable ${_rcfile}." \
+            "The guest's data arrived but its configuration did not, so nothing here" \
+            "can register it. Nothing has been started; the mounts above can be undone" \
+            "with the lines printed beside them."
+        return 1
+    fi
+
+    promote_undo "seance failback-assist ${_guest} unregister"
+    if ! adapter_guest_register "${_guest}" "${_rcfile}"; then
+        seance_log err "promote ${_guest}: registration from ${_rcfile} failed"
+        return 1
+    fi
+    promote_note "registered ${_guest} from ${_rcfile}"
+
+    # The platform's own answer, now that it has one. A ceremony built on the
+    # wrong type put the guest somewhere the platform will not look, and that
+    # must be found here rather than by an operator at 03:00.
+    _real=$( adapter_guest_type "${_guest}" 2>/dev/null ) || _real=""
+    if [ -n "${_real}" ] && [ "${_real}" != "${_type}" ]; then
+        if [ "$( adapter_guest_mountpoint "${_guest}" "${_real}" 2>/dev/null )" != "${_mp}" ]; then
+            seance_log err "promote ${_guest}: the replica's datasets look like a ${_type}" \
+                "but the platform registered a ${_real}, which belongs somewhere else." \
+                "The guest has NOT been started. Undo with the lines printed above."
+            return 1
+        fi
+        promote_note "${_guest}: the platform calls this a ${_real} rather than a ${_type};" \
+            "both live at ${_mp} here, so the ceremony stands"
+    fi
+
+    promote_undo "seance failback-assist ${_guest} stop"
+    if ! adapter_guest_start "${_guest}"; then
+        seance_log err "promote ${_guest}: start failed"
+        return 1
+    fi
+
+    _running=$( adapter_guest_running "${_guest}" ) || _running=""
+    if [ "${_running}" != "1" ]; then
+        seance_log err "promote ${_guest}: started, but the platform does not report it running" \
+            "[${_running}]"
+        return 1
+    fi
+    promote_note "started ${_guest}, and the platform reports it running"
+
+    # --- the records ------------------------------------------------------
+    promote_note "succession.log is append-only and is not undone; failback appends" \
+        "its own record rather than deleting this one"
+    if ! promote_record "${_guest}" "${PROMOTE_DEAD}" "${_self}" "${_now}" \
+            "${PROMOTE_EVIDENCE}"; then
+        seance_log err "promote ${_guest}: could not append the succession record"
+        return 1
+    fi
+
+    promote_undo "seance failback-assist ${_guest} release"
+    if ! placement_set "${_guest}" "${PROMOTE_DEAD}"; then
+        seance_log err "promote ${_guest}: could not record the placement"
+        return 1
+    fi
+
+    # --- what it cost -----------------------------------------------------
+    _epoch=$( pol_ts_to_epoch "${_ts}" ) || _epoch=""
+    if [ -n "${_epoch}" ]; then
+        _age=$(( _now - _epoch ))
+        [ "${_age}" -lt 0 ] && _age=0
+        promote_note "${_guest}: RPO $( status_age_human "${_age}" ) -- everything written" \
+            "after ${_ts} is gone"
+    fi
+
+    return 0
+}
+
+# promote_record <guest> <old_home> <new_home> <now-epoch> <evidence>
+#
+# One append-only TSV record per guest (handoff §2.7, D-44 item 6):
+# guest, old home, new home, UTC timestamp, evidence.
+promote_record()
+{
+    local _dir _f _ts
+
+    _dir=$( seance_state_dir ) || return 1
+    _f="${_dir}/succession.log"
+
+    _ts=$( pol_epoch_to_ts "$4" ) || return 1
+
+    mkdir -p "${_dir}" || return 1
+    printf '%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "${_ts}" "${5:-unknown}" >> "${_f}"
+}
+
+# ---------------------------------------------------------------------------
+# The ladder
+# ---------------------------------------------------------------------------
+
+# promote_run <deadkey> [<guest-filter>]
+#
+# PROMOTE_FORCE must already be set (promote_parse_force). Returns 0 when at
+# least one guest was promoted and nothing was left in a state needing a human,
+# 1 when the ladder stopped, 2 on a usage or configuration error.
+promote_run()
+{
+    local _dead _gf _self _now _rc _sroot _estate _row _guest _ds _ts
+    local _left _peers
+
+    _dead=$1
+    _gf=${2:-}
+
+    PROMOTE_DEAD=${_dead}
+    PROMOTE_OPERATOR=$( promote_operator )
+    PROMOTE_EVIDENCE=""
+    PROMOTE_DISPOSITION=""
+    PROMOTE_STOPPED_RUNG=""
+    PROMOTE_REACHABLE=""
+    PROMOTE_UNREPORTED=""
+    PROMOTE_KERNEL=""
+    PROMOTE_KERNEL_DETAIL=""
+    PROMOTE_GUESTS_PROMOTED=0
+    PROMOTE_GUESTS_SEEN=0
+    PROMOTE_GUEST_DISPOSITIONS=""
+
+    PROMOTE_TMPDIR=$( seance_tmpdir ) || {
+        printf 'promote: FAIL — no temporary directory\n'
+        return 2
+    }
+
+    _self=$( seance_self_key ) || {
+        seance_log err "promote: this node is not in the configuration;" \
+            "no node_*_nodename matches it"
+        printf 'promote: FAIL — this node is not in its own configuration\n'
+        return 2
+    }
+
+    if [ "${_dead}" = "${_self}" ]; then
+        seance_log err "promote: ${_dead} is this node"
+        printf 'promote: FAIL — a node cannot succeed itself\n'
+        return 2
+    fi
+
+    if ! conf_has "node_${_dead}_nodename"; then
+        seance_log err "promote: no node called \"${_dead}\" in the configuration"
+        printf 'promote: FAIL — no such node: %s\n' "${_dead}"
+        return 2
+    fi
+
+    _now=$( pol_now )
+
+    # --- rung 1 -----------------------------------------------------------
+    if ! promote_rung_debounce; then
+        PROMOTE_STOPPED_RUNG="1 debounce"
+        PROMOTE_DISPOSITION=${PROMOTE_DISPOSITION:-abort}
+        printf 'promote: stopped at rung %s%s%s\n' \
+            "${PROMOTE_STOPPED_RUNG}" "${PROMOTE_SEP}" "${PROMOTE_DISPOSITION}"
+        return 1
+    fi
+
+    # --- rung 2 -----------------------------------------------------------
+    promote_rung_quorum "${_self}"
+    _rc=$?
+    if [ "${_rc}" -ne 0 ]; then
+        PROMOTE_STOPPED_RUNG="2 quorum"
+        printf 'promote: stopped at rung %s%s%s\n' \
+            "${PROMOTE_STOPPED_RUNG}" "${PROMOTE_SEP}" "${PROMOTE_DISPOSITION}"
+        [ "${_rc}" -eq 2 ] && return 2
+        return 1
+    fi
+
+    # --- rung 3 -----------------------------------------------------------
+    promote_rung_probes
+    _rc=$?
+    if [ "${_rc}" -ne 0 ]; then
+        PROMOTE_STOPPED_RUNG="3 probes"
+        printf 'promote: stopped at rung %s%s%s\n' \
+            "${PROMOTE_STOPPED_RUNG}" "${PROMOTE_SEP}" "${PROMOTE_DISPOSITION}"
+        [ "${_rc}" -eq 2 ] && return 2
+        return 1
+    fi
+
+    # --- rung 4 -----------------------------------------------------------
+    promote_rung_fence
+    _rc=$?
+    if [ "${_rc}" -ne 0 ]; then
+        PROMOTE_STOPPED_RUNG="4 fence"
+        printf 'promote: stopped at rung %s%s%s\n' \
+            "${PROMOTE_STOPPED_RUNG}" "${PROMOTE_SEP}" "${PROMOTE_DISPOSITION}"
+        [ "${_rc}" -eq 2 ] && return 2
+        return 1
+    fi
+
+    [ -n "${PROMOTE_EVIDENCE}" ] || PROMOTE_EVIDENCE="force:${PROMOTE_OPERATOR}"
+
+    # --- rung 5 -----------------------------------------------------------
+    if ! _sroot=$( promote_standby_root "${_self}" ); then
+        promote_rung 5 lineage abort \
+            "cannot tell where this node keeps replicas: standby_root is unset and" \
+            "no guest of this node's own could be used to derive it"
+        PROMOTE_DISPOSITION=abort
+        PROMOTE_STOPPED_RUNG="5 lineage"
+        printf 'promote: stopped at rung %s%s%s\n' \
+            "${PROMOTE_STOPPED_RUNG}" "${PROMOTE_SEP}" abort
+        return 2
+    fi
+
+    _estate=$( promote_estate "${_sroot}" "${_dead}" ) || _estate=""
+
+    if [ -z "${_estate}" ]; then
+        promote_rung 5 lineage abort \
+            "no guest under ${_sroot}/${_dead} carries a @seance-${_dead}-* snapshot:" \
+            "this node holds no estate for ${_dead}, and empty is never read as ready"
+        PROMOTE_DISPOSITION=abort
+        PROMOTE_STOPPED_RUNG="5 lineage"
+        printf 'promote: stopped at rung %s%s%s\n' \
+            "${PROMOTE_STOPPED_RUNG}" "${PROMOTE_SEP}" abort
+        return 1
+    fi
+
+    promote_claims_gather
+    promote_kernel_check "${_self}"
+
+    promote_rung 5 lineage pass \
+        "estate of ${_dead} under ${_sroot}/${_dead}:" \
+        "$( printf '%s\n' "${_estate}" | cut -f 1 | tr '\n' ' ' )" \
+        "(kernel homogeneity: ${PROMOTE_KERNEL} -- ${PROMOTE_KERNEL_DETAIL};" \
+        "placements read from ${PROMOTE_REACHABLE:-no peer}${PROMOTE_UNREPORTED:+, NOT read from }${PROMOTE_UNREPORTED})"
+
+    _left=""
+    printf '%s\n' "${_estate}" > "${PROMOTE_TMPDIR}/estate"
+
+    while IFS= read -r _row || [ -n "${_row}" ]; do
+        [ -n "${_row}" ] || continue
+
+        _guest=${_row%%"${PROMOTE_TAB}"*}
+        _ds=${_row#*"${PROMOTE_TAB}"}
+        _ts=${_ds#*"${PROMOTE_TAB}"}
+        _ds=${_ds%%"${PROMOTE_TAB}"*}
+
+        [ -n "${_gf}" ] && [ "${_gf}" != "${_guest}" ] && continue
+
+        PROMOTE_GUESTS_SEEN=$(( PROMOTE_GUESTS_SEEN + 1 ))
+
+        if promote_guest_disposition "${_guest}" "${_ds}" "${_ts}" "${_self}" "${_now}"; then
+            _left="${_left} ${_guest}${PROMOTE_TAB}${_ds}${PROMOTE_TAB}${_ts}"
+        fi
+    done < "${PROMOTE_TMPDIR}/estate"
+
+    if [ -n "${_gf}" ] && [ "${PROMOTE_GUESTS_SEEN}" -eq 0 ]; then
+        seance_log err "promote: ${_dead} has no guest called \"${_gf}\" on this node"
+        printf 'promote: FAIL%sno guest called "%s" in the estate of %s held here\n' \
+            "${PROMOTE_SEP}" "${_gf}" "${_dead}"
+        return 2
+    fi
+
+    # --- rung 6 -----------------------------------------------------------
+    if [ -z "${_left}" ]; then
+        promote_rung 6 promotion "n/a" \
+            "no guest of ${_dead}'s estate is this node's to promote right now"
+    else
+        promote_rung 6 promotion pass \
+            "promoting, alphabetically:" \
+            "$( printf '%s' "${_left}" | tr ' ' '\n' | cut -f 1 | tr '\n' ' ' )"
+
+        printf '%s' "${_left}" | tr ' ' '\n' > "${PROMOTE_TMPDIR}/todo"
+
+        while IFS= read -r _row || [ -n "${_row}" ]; do
+            [ -n "${_row}" ] || continue
+
+            _guest=${_row%%"${PROMOTE_TAB}"*}
+            _ds=${_row#*"${PROMOTE_TAB}"}
+            _ts=${_ds#*"${PROMOTE_TAB}"}
+            _ds=${_ds%%"${PROMOTE_TAB}"*}
+
+            if promote_guest_promote "${_guest}" "${_ds}" "${_ts}" "${_self}" \
+                    "${_now}" "${_sroot}"; then
+                PROMOTE_GUESTS_PROMOTED=$(( PROMOTE_GUESTS_PROMOTED + 1 ))
+            else
+                PROMOTE_GUEST_DISPOSITIONS=$( printf '%s' "${PROMOTE_GUEST_DISPOSITIONS}" |
+                    sed -e "s|${_guest}=proceed|${_guest}=abort|" )
+            fi
+        done < "${PROMOTE_TMPDIR}/todo"
+    fi
+
+    # --- rung 7 -----------------------------------------------------------
+    #
+    # Nothing to configure, and that is the assertion: `repl` already
+    # replicates every guest THIS node hosts (adapter_guest_list) to that
+    # guest's heirs, and a guest promoted here is now one of them. The
+    # direction reverses because the home in the snapshot name is the node
+    # taking it, not the node the guest came from.
+    _peers=$( pol_heirs "$( conf_get "node_${_self}_heir" "" )" \
+        "$( conf_get "node_${_self}_heir2" "" )" "" "" 2>/dev/null |
+        tr '\n' ' ' ) || _peers=""
+    promote_rung 7 post "n/a (nothing to configure)" \
+        "the next repl tick on this node snapshots every guest it hosts as" \
+        "@seance-${_self}-* and sends to that guest's heirs (${_peers:-see the succession map});" \
+        "${_dead} is one of them again the moment it returns, and until then that pair" \
+        "is logged as failed, not fatal"
+
+    PROMOTE_DISPOSITION=$( promote_worst_disposition )
+
+    printf 'promote: %d of %d guest(s) promoted from %s%sevidence %s, disposition %s\n' \
+        "${PROMOTE_GUESTS_PROMOTED}" "${PROMOTE_GUESTS_SEEN}" "${_dead}" \
+        "${PROMOTE_SEP}" "${PROMOTE_EVIDENCE}" "${PROMOTE_DISPOSITION}"
+
+    case "${PROMOTE_DISPOSITION}" in
+        proceed|stand-down) return 0 ;;
+    esac
+
+    return 1
+}
+
+# promote_worst_disposition
+#
+# One word for a run that may have decided differently about each guest, worst
+# first: an operator reading the exit code must not have to guess which guest
+# it belongs to, and the per-guest lines above say which is which.
+promote_worst_disposition()
+{
+    local _d _w
+
+    _w=""
+
+    for _d in ${PROMOTE_GUEST_DISPOSITIONS}; do
+        case "${_d#*=}" in
+            abort)      printf 'abort\n'; return 0 ;;
+            notify)     _w=notify ;;
+            force-only) [ "${_w}" = "notify" ] || _w=force-only ;;
+            stand-down) [ -n "${_w}" ] || _w=stand-down ;;
+            proceed)    [ -n "${_w}" ] || _w=proceed ;;
+        esac
+    done
+
+    [ -n "${_w}" ] || _w=abort
+
+    printf '%s\n' "${_w}"
+}

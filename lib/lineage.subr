@@ -33,6 +33,24 @@
 #   'local' is not in POSIX sh but is implemented by FreeBSD /bin/sh (sh(1),
 #   "local"); seance targets FreeBSD sh and nothing else (handoff §5).
 
+# lineage_listing <dataset>
+#
+# The recursive snapshot listing, from the one place that runs it. Both probes
+# read the same text, so neither can be looking at a different tree from the
+# other, and SEANCE_ZFS_LIST_CMD replaces it once rather than twice.
+lineage_listing()
+{
+    if [ -n "${SEANCE_ZFS_LIST_CMD:-}" ]; then
+        # shellcheck disable=SC2086
+        #   Deliberate word splitting: SEANCE_ZFS_LIST_CMD is a command and
+        #   its arguments, and the dataset is appended to them.
+        ${SEANCE_ZFS_LIST_CMD} "${1:?}"
+        return $?
+    fi
+
+    zfs list -H -o name -t snapshot -r "${1:?}"
+}
+
 # lineage_probe <nodekey> <dataset>
 #
 # Print the newest replica timestamp held for <nodekey> under <dataset>.
@@ -53,14 +71,7 @@ lineage_probe()
         return 2
     fi
 
-    if [ -n "${SEANCE_ZFS_LIST_CMD:-}" ]; then
-        # shellcheck disable=SC2086
-        #   Deliberate word splitting: SEANCE_ZFS_LIST_CMD is a command and
-        #   its arguments, and the dataset is appended to them.
-        _out=$( ${SEANCE_ZFS_LIST_CMD} "${_ds}" )
-    else
-        _out=$( zfs list -H -o name -t snapshot -r "${_ds}" )
-    fi
+    _out=$( lineage_listing "${_ds}" )
     _rc=$?
 
     if [ "${_rc}" -eq 2 ]; then
@@ -91,6 +102,76 @@ lineage_probe()
 
     if [ "${_rc}" -ne 0 ] || [ -z "${_ts}" ]; then
         printf 'lineage: %s: no @seance-%s-* snapshot in the listing\n' \
+            "${_ds}" "${_node}" >&2
+        return 1
+    fi
+
+    printf '%s\n' "${_ts}"
+}
+
+# lineage_probe_common <nodekey> <dataset>
+#
+# Print the newest timestamp of <nodekey>'s lineage that EVERY dataset under
+# <dataset> holds -- the newest instant the whole tree exists at, which is the
+# only instant a promotion may use (decision D-85).
+#
+#   rc 0  a timestamp, printed
+#   rc 1  no coherent instant: the listing failed, was empty, held nothing of
+#         that node's, or -- the case this function exists for -- held
+#         something of that node's on some datasets and not on others.
+#         Nothing is printed.
+#   rc 2  a malformed call.
+#
+# lineage_probe answers "how fresh is the freshest thing here", which is the
+# right question for `status`. This one answers "what is the newest complete
+# copy", which is the only right question for a promotion: sends are per
+# dataset (D-64), so an interrupted tick leaves a child ahead of its root, and
+# the child's timestamp names an instant no complete copy of the guest exists
+# at. The two are the same number on a healthy replica and differ exactly when
+# it matters.
+lineage_probe_common()
+{
+    local _node _ds _out _rc _ts
+
+    _node=${1:-}
+    _ds=${2:-}
+
+    if [ -z "${_node}" ] || [ -z "${_ds}" ]; then
+        printf 'lineage: usage: lineage_probe_common <nodekey> <dataset>\n' >&2
+        return 2
+    fi
+
+    _out=$( lineage_listing "${_ds}" )
+    _rc=$?
+
+    if [ "${_rc}" -eq 2 ]; then
+        printf 'lineage: %s: the snapshot listing was invoked wrongly (exit 2)\n' \
+            "${_ds}" >&2
+        return 2
+    fi
+
+    if [ "${_rc}" -ne 0 ]; then
+        printf 'lineage: %s: snapshot listing failed (exit %s)\n' \
+            "${_ds}" "${_rc}" >&2
+        return 1
+    fi
+
+    if [ -z "${_out}" ]; then
+        printf 'lineage: %s: the snapshot listing exited 0 and printed nothing: no replica lineage for %s (empty output is never read as freshness)\n' \
+            "${_ds}" "${_node}" >&2
+        return 1
+    fi
+
+    _ts=$( printf '%s\n' "${_out}" | pol_common_newest_for_node "${_node}" )
+    _rc=$?
+
+    if [ "${_rc}" -eq 2 ]; then
+        printf 'lineage: %s: cannot read the snapshot listing\n' "${_ds}" >&2
+        return 2
+    fi
+
+    if [ "${_rc}" -ne 0 ] || [ -z "${_ts}" ]; then
+        printf 'lineage: %s: no @seance-%s-* snapshot is present on EVERY dataset of the tree; there is no instant the whole guest exists at\n' \
             "${_ds}" "${_node}" >&2
         return 1
     fi

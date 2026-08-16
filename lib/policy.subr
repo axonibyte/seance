@@ -1026,3 +1026,112 @@ pol_newest_for_node()
 
     printf '%s\n' "${_best}"
 }
+
+# pol_common_newest_for_node <nodekey>
+#
+# Read a RECURSIVE snapshot listing on stdin -- "<dataset>@<shortname>" lines,
+# as `zfs list -t snapshot -r` prints them -- and print the newest timestamp of
+# <nodekey>'s lineage that exists on EVERY dataset in the listing.
+#
+#   rc 0  a timestamp, printed: the newest instant the whole tree shares
+#   rc 1  no instant is shared by every dataset: NO OUTPUT
+#   rc 2  no node key was given
+#
+# WHY COMMON AND NOT NEWEST (decision D-85). Replication sends one dataset at a
+# time (D-64), so a tick that died part way leaves a guest's datasets at
+# different snapshots -- observed in tests/tier6/t_interrupt.sh, where a killed
+# root send left the small `sys` child a snapshot ahead. The newest timestamp
+# ANYWHERE in the tree is then an instant that no complete copy of the guest
+# exists at. Crash consistency is a property of an instant, not of a dataset: a
+# guest promoted with its child ahead of its root is not "minutes stale", it is
+# incoherent, and nothing downstream can tell.
+#
+# A dataset that appears in the listing carrying only OTHER tools' snapshots is
+# counted like any other and shares nothing, so the answer is rc 1 -- which is
+# the honest one: seance has no coherent point to promote that tree at.
+#
+# THE LIMIT, stated: a dataset with no snapshots at all is invisible to a
+# snapshot listing and cannot be counted here. On a replica that cannot arise,
+# because a receive always lands a snapshot; on a source it would mean a
+# dataset the tick had never reached, which repl reports separately.
+pol_common_newest_for_node()
+{
+    local _node _line _parsed _ds _short _pnode _ts
+    local _dsets _pairs _cands _cand _ok _oifs
+
+    _node=${1:-}
+    [ -n "${_node}" ] || return 2
+
+    _dsets=""
+    _pairs=""
+
+    while IFS= read -r _line || [ -n "${_line}" ]; do
+        [ -n "${_line}" ] || continue
+
+        _parsed=$( pol_snap_split "${_line}" ) || continue
+        _ds=${_parsed%	*}
+        _short=${_parsed#*	}
+
+        # Every dataset that HAS a snapshot is part of the tree, whoever wrote
+        # that snapshot -- which is what makes a child carrying nothing of ours
+        # an abort rather than something to average away.
+        case "
+${_dsets}
+" in
+            *"
+${_ds}
+"*) ;;
+            *) _dsets="${_dsets}${_ds}
+" ;;
+        esac
+
+        _parsed=$( pol_snap_parse "${_short}" ) || continue
+        _pnode=${_parsed%	*}
+        _ts=${_parsed#*	}
+
+        [ "${_pnode}" = "${_node}" ] || continue
+
+        _pairs="${_pairs}${_ds}	${_ts}
+"
+    done
+
+    [ -n "${_dsets}" ] || return 1
+    [ -n "${_pairs}" ] || return 1
+
+    # Newest first. The format sorts (handoff §2.1) and the sort is LC_ALL=C,
+    # so the order is the wire protocol's rather than a collation table's.
+    _cands=$( printf '%s' "${_pairs}" | cut -f 2 | LC_ALL=C sort -u -r ) || return 1
+
+    _oifs=$IFS
+    IFS='
+'
+    # shellcheck disable=SC2086
+    #   Deliberate word splitting on newline: ${_cands} is a list of
+    #   timestamps, each sixteen characters of [0123456789TZ].
+    for _cand in ${_cands}; do
+        IFS=$_oifs
+
+        _ok=1
+        for _ds in ${_dsets}; do
+            case "
+${_pairs}" in
+                *"
+${_ds}	${_cand}
+"*) ;;
+                *) _ok=0 ;;
+            esac
+            [ "${_ok}" -eq 0 ] && break
+        done
+
+        if [ "${_ok}" -eq 1 ]; then
+            printf '%s\n' "${_cand}"
+            return 0
+        fi
+
+        IFS='
+'
+    done
+    IFS=$_oifs
+
+    return 1
+}

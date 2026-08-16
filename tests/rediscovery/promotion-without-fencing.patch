@@ -1,0 +1,13 @@
+--- a/lib/promote.subr	2026-08-16 11:29:20.146906000 -0400
++++ b/lib/promote.subr	2026-08-16 11:29:20.147078000 -0400
+@@ -1270,8 +1270,8 @@
+     fi
+ 
+     # --- rung 4 -----------------------------------------------------------
+-    promote_rung_fence
+-    _rc=$?
++    promote_rung 4 fence "n/a" "fencing skipped"
++    _rc=0
+     if [ "${_rc}" -ne 0 ]; then
+         PROMOTE_STOPPED_RUNG="4 fence"
+         printf 'promote: stopped at rung %s%s%s\n' \

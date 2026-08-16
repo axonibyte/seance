@@ -1,0 +1,93 @@
+# seance -- the promotion ladder's truth table (TESTING.md §5).
+#
+# Every rung crossed with every outcome the infrastructure can produce, and
+# every crossing with ONE expected disposition. The driver is
+# tests/tier4/t_ladder.sh; nothing here is interpreted anywhere else.
+#
+# Columns, tab separated:
+#
+#   id       a name for the row, used in the assertion text
+#   world    space-separated settings the driver builds a world from:
+#              nodes=<2|3|4>      cluster size in the configuration
+#              reach=<n>          how many living peers answer ssh
+#              dead=<no|ping|ssh> whether the "dead" node answers, and how
+#              fence=<mode>       fence_mock's FENCE_MOCK_MODE, or:
+#                                   none    no fence_driver configured
+#                                   missing a driver name nothing provides
+#              lineage=<fresh|stale|skew|absent|empty0>
+#              claim=<-|charlie>  a living peer that already claims the guest
+#              kernel=<same|differs>
+#              guest=<web01|db01> web01 is a jail, db01 a bhyve VM
+#              notify=<none|ok|missing|crash|hang>
+#   force    the --force value, or '-' for no --force at all; '' (empty) is
+#            not expressible here, so 'all' means a bare --force
+#   disp     expected PROMOTE_DISPOSITION
+#   evidence expected PROMOTE_EVIDENCE, with %OP% standing for the operator
+#   stopped  expected PROMOTE_STOPPED_RUNG, or '-' for "the ladder finished"
+#   exit     expected exit status of promote_run
+#
+id	world	force	disp	evidence	stopped	exit
+# --- the happy path ---------------------------------------------------------
+happy	-	-	proceed	fence:mock	-	0
+happy-vm	guest=db01	-	proceed	fence:mock	-	0
+# --- rung 3: a host that answers is never fenced ----------------------------
+probes-ping	dead=ping	-	abort	-	3 probes	1
+probes-ssh	dead=ssh	-	abort	-	3 probes	1
+probes-forced	dead=ping	all	abort	-	3 probes	1
+probes-forced-fence	dead=ssh	fence	abort	-	3 probes	1
+# --- rung 4: the fence driver's exit-code contract --------------------------
+fence-refused	fence=refused	-	abort	-	4 fence	1
+fence-refused-forced	fence=refused	fence	abort	-	4 fence	1
+fence-refused-forced-all	fence=refused	all	abort	-	4 fence	1
+fence-unknown	fence=unknown	-	notify	-	4 fence	1
+fence-unknown-forced	fence=unknown	fence	proceed	force:%OP%	-	0
+fence-timeout	fence=hang	-	notify	-	4 fence	1
+fence-timeout-forced	fence=hang	fence	proceed	force:%OP%	-	0
+fence-empty0	fence=empty0	-	notify	-	4 fence	1
+fence-empty0-forced	fence=empty0	fence	proceed	force:%OP%	-	0
+fence-garbage	fence=garbage	-	proceed	fence:mock	-	0
+fence-missing	fence=missing	-	notify	-	4 fence	1
+fence-missing-forced	fence=missing	fence	proceed	force:%OP%	-	0
+fence-none	fence=none	-	notify	-	4 fence	1
+fence-none-forced	fence=none	fence	proceed	force:%OP%	-	0
+# --- rung 2: quorum, and the even-N doctrine --------------------------------
+quorum-n2	nodes=2 reach=0	-	notify	-	2 quorum	1
+quorum-n2-forced	nodes=2 reach=0	quorum	proceed	fence:mock	-	0
+quorum-n4-half	nodes=4 reach=1	-	notify	-	2 quorum	1
+quorum-n4-half-forced	nodes=4 reach=1	quorum	proceed	fence:mock	-	0
+quorum-n4-two	nodes=4 reach=2	-	proceed	fence:mock	-	0
+# --- rung 5: lineage, claims and kernel homogeneity -------------------------
+lineage-stale	lineage=stale	-	force-only	fence:mock	-	1
+lineage-stale-forced	lineage=stale	lineage	proceed	force:%OP%	-	0
+lineage-skew	lineage=skew	-	force-only	fence:mock	-	1
+lineage-skew-forced	lineage=skew	lineage	proceed	force:%OP%	-	0
+lineage-absent	lineage=absent	-	abort	fence:mock	5 lineage	1
+lineage-absent-forced	lineage=absent	all	abort	fence:mock	5 lineage	1
+lineage-empty0	lineage=empty0	-	abort	fence:mock	5 lineage	1
+claim-by-peer	claim=charlie	-	stand-down	fence:mock	-	0
+peer-cannot-report	peermute=charlie	-	abort	fence:mock	-	1
+peer-cannot-report-forced	peermute=charlie	all	abort	fence:mock	-	1
+kernel-differs	kernel=differs	-	force-only	fence:mock	-	1
+kernel-differs-forced	kernel=differs	kernel	proceed	force:%OP%	-	0
+kernel-differs-vm	kernel=differs guest=db01	-	proceed	fence:mock	-	0
+# --- --force skips EXACTLY the rungs it names -------------------------------
+force-quorum-only	fence=unknown	quorum	notify	-	4 fence	1
+force-fence-only	nodes=2 reach=0 fence=unknown	fence	notify	-	2 quorum	1
+force-lineage-only	lineage=stale fence=unknown	lineage	notify	-	4 fence	1
+force-kernel-only	kernel=differs fence=unknown	kernel	notify	-	4 fence	1
+# --- the promotion point is the newest instant the WHOLE tree exists at (D-85)
+tree-child-ahead	tree=child-ahead	-	proceed	fence:mock	-	0
+tree-child-foreign	tree=child-foreign	-	abort	fence:mock	-	1
+tree-child-ahead-forced	tree=child-ahead	all	proceed	fence:mock	-	0
+tree-child-foreign-forced	tree=child-foreign	all	abort	fence:mock	-	1
+# --- a jail's configuration, which does not travel with its data (D-82) -----
+sysdir-from-mirror	sysdir=absent	-	proceed	fence:mock	-	0
+sysdir-mirror-absent	sysdir=absent mirror=absent	-	abort	fence:mock	-	1
+sysdir-mirror-empty	sysdir=absent mirror=empty	-	abort	fence:mock	-	1
+# --- the notify contract: never changes a rung's disposition ----------------
+notify-none	fence=unknown notify=none	-	notify	-	4 fence	1
+notify-ok	fence=unknown notify=ok	-	notify	-	4 fence	1
+notify-missing	fence=unknown notify=missing	-	notify	-	4 fence	1
+notify-crash	fence=unknown notify=crash	-	notify	-	4 fence	1
+notify-hang	fence=unknown notify=hang	-	notify	-	4 fence	1
+notify-hang-happy	notify=hang	-	proceed	fence:mock	-	0

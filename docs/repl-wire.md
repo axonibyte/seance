@@ -272,3 +272,51 @@ asking it (design §5).
 
 The file name parses from the right: peer keys are `[a-z0-9]+` and cannot
 contain a dot, so a guest whose own name has one still resolves.
+
+## 12. The configuration mirror (decision D-82)
+
+One dataset per node carries what the guests' own datasets do not.
+
+    <pool-of-jails-data>/seance-sys      mounted at <state-dir>/sys
+
+CBSD keeps a jail's registerable configuration in `${jailsysdir}/<n>/`, a plain
+directory on the workdir dataset — **outside** `<pool>/<jname>`, so nothing
+replicates it. A VM's is inside its dataset by accident of layout:
+`${jailsysdir}/<n>` is a symlink to `${workdir}/vm/<n>`
+(`sudoexec/bcreate:599`, restored after a receive by `sudoexec/zfs-recv:66-69`).
+Without the mirror a survivor holds a jail's data and has no way to register
+it.
+
+Every tick, before anything is snapshotted:
+
+    for each guest this node replicates:
+        repl_sys_travels <guest>        # is its config already inside its own
+                                        #   dataset tree? (resolve the symlink,
+                                        #   compare against the mountpoints)
+        if not:  mirror ${jailsysdir}/<guest>/  ->  <state-dir>/sys/<guest>/
+
+then `seance-sys` is snapshotted **with the tick's own name** and replicated
+like a guest: same grammar, same heirs, same `-p` / `-x mountpoint -x canmount`,
+landing at `<standby_root>/<home>/seance-sys`. It needs no special case on the
+receiving side — the shadow-mount law hides it exactly like a replica, which is
+the point of giving it no wire of its own.
+
+**The mirror is `cp -a` plus a prune, not `rsync -a --delete`.** rsync is
+present on a real CBSD node (it is a CBSD dependency) but not inside a shape-A
+pseudo-cluster node, which nullfs-mounts only the base directories. Two
+implementations of one mirror is a worse answer than one, and what is being
+copied is a few kilobytes, locally: rsync's delta algorithm buys nothing here.
+The prune runs first and deepest-first, so a file the source no longer has
+cannot survive under a directory the copy is about to recreate.
+
+**Promotion** mounts the replica mirror **read-only** at a scratch path,
+copies `<guest>/` into the successor's `${jailsysdir}/<guest>/`, and puts the
+mountpoint back — `zfs mount -o ro` is a property that lasts only as long as the
+mount, so there is nothing to undo. It is skipped when the guest's own datasets
+already carried the configuration. **Failback** runs the same code against the
+interim's mirror, and says which of the two happened rather than doing either
+silently.
+
+`seance-sys` is not a guest: estate discovery walks past it, and `repl` refuses
+to run on a node that has a guest by that name rather than quietly replicating
+one into the other's place.

@@ -1,0 +1,121 @@
+# seance -- the pseudo-cluster's fencing substrate (TESTING.md §1, shape A).
+#
+# Sourced by the tier-6 stages that fence a node. Two pieces:
+#
+#   the HOST-SIDE HELPER, written by fence_install onto the guest host, which
+#   is the only place that can actually stop a node's jail and look afterwards;
+#   the DRIVER, tests/cluster/drivers/fence_jail, copied into every node so
+#   that seance finds it on PATH exactly the way it would find a shipped one.
+#
+# The helper is the substrate's own cluster_stop rather than a bare `jail -r`:
+# a jail whose delegated dataset is still mounted stays `dying` indefinitely
+# and never returns its epair (D-23), and a fence that leaves the corpse dying
+# has not fenced anything -- the node's interface is still held, and
+# cluster_start cannot bring it back for the failback stage.
+#
+# shellcheck shell=sh
+# shellcheck disable=SC3043
+#   'local' is not in POSIX sh but is implemented by FreeBSD /bin/sh (sh(1),
+#   "local"); seance targets FreeBSD sh and nothing else (handoff §5).
+
+# Where the driver looks for the host-side helper. The driver runs inside a
+# node and cannot be told the cluster's paths, so the two ends agree on one
+# fixed path instead. Both spell it once, here and in the driver's own default.
+FENCE_HELPER_PATH="/tmp/seance-fence-jail-host"
+
+# fence_install
+#
+# Write the host-side helper and put the driver on every node's PATH. Call it
+# after cluster_up and before anything asks seance to fence.
+fence_install()
+{
+    local _node _root _src _list
+
+    _src="${T_ROOT}/tests/cluster/drivers/fence_jail"
+
+    if [ ! -r "${_src}" ]; then
+        cluster_fail 1 "no fence driver at ${_src}"
+        return 1
+    fi
+
+    # The helper carries the cluster's own base directory, because it runs on
+    # the host with none of the stage's environment.
+    cat > "${FENCE_HELPER_PATH}" <<EOF
+#!/bin/sh
+# seance -- the host side of the pseudo-cluster's fence driver.
+#
+# Written by tests/cluster/lib/fence.subr. Stops a node's jail properly --
+# unmounting its delegated dataset and waiting for the epair to come back,
+# which is what 'dying' costs (D-23) -- and then LOOKS, with 'jls -d', because
+# a jail that is dying is not a jail that is off.
+#
+# Exit: off -> 0 verified off, 1 still listed, 2 could not tell
+#       status -> 0 off, 1 on, 2 could not tell
+set -u
+
+SEANCE_CLUSTER_BASE='$( cluster_base_dir | sed -e 's|/seance$||' )'
+export SEANCE_CLUSTER_BASE
+T_ROOT='${T_ROOT}'
+
+. "\${T_ROOT}/tests/cluster/lib/cluster.subr"
+
+action=\${1:-}
+node=\${2:-}
+
+[ -n "\${action}" ] && [ -n "\${node}" ] || { echo "usage: \$0 <off|status> <node>" >&2; exit 2; }
+
+j=\$( cluster_jail_name "\${node}" ) || exit 2
+
+listed()
+{
+    jls -d -j "\${j}" jid > /dev/null 2>&1
+}
+
+case "\${action}" in
+    status)
+        if listed; then
+            echo "\${j} is listed by jls -d"
+            exit 1
+        fi
+        echo "\${j} is not listed by jls -d"
+        exit 0
+        ;;
+    off)
+        if listed; then
+            cluster_stop "\${node}" >&2 || true
+        fi
+        if listed; then
+            echo "\${j} is STILL listed by jls -d after the stop"
+            exit 1
+        fi
+        echo "\${j} is gone from jls -d"
+        exit 0
+        ;;
+    *)
+        echo "no such action: \${action}" >&2
+        exit 2
+        ;;
+esac
+EOF
+
+    chmod 0755 "${FENCE_HELPER_PATH}" ||
+        { cluster_fail 1 "chmod ${FENCE_HELPER_PATH}"; return 1; }
+
+    _list=$( cluster_nodes ) || return 1
+    for _node in ${_list}; do
+        _root=$( cluster_root "${_node}" ) || return 1
+        mkdir -p "${_root}/usr/local/bin" || return 1
+        cp "${_src}" "${_root}/usr/local/bin/fence_jail" || return 1
+        chmod 0755 "${_root}/usr/local/bin/fence_jail" || return 1
+    done
+
+    return 0
+}
+
+# fence_uninstall  -- remove the host-side helper. The nodes go with the
+# cluster, so only the host needs cleaning.
+fence_uninstall()
+{
+    rm -f "${FENCE_HELPER_PATH}"
+    return 0
+}

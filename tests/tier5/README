@@ -42,6 +42,34 @@ UNVERIFIED:
     marks it UNVERIFIED live until this tier; M0 had no guest to run it
     against).
 
+M2 NOTE -- adapter_guest_datasets now resolves the MOUNTED PATH first.
+
+A guest promoted in place keeps its dataset under <standby_root>/<dead>/<name>
+and is given the mountpoint CBSD expects (D-44 item 4), so a derivation from
+the pool that carries jails-data can no longer name it. lib/adapter.subr
+therefore asks `zfs list -H -o name <mountpoint>` first and falls back to the
+pool derivation. Two live assertions belong to this tier and are UNVERIFIED
+until it runs:
+
+  * against a real CBSD jail at home, `adapter_guest_datasets <jail>` names the
+    same dataset CBSD created (`<pool>/<jname>`, sudoexec/mkdatadir:20-21), and
+    against a real bhyve guest it names the one mounted at ${workdir}/vm/<name>
+    (sudoexec/bcreate:579) -- resolution 1, on the real thing;
+  * with the guest's dataset UNMOUNTED, the same call falls back rather than
+    resolving to CBSD's whole workdir dataset. `zfs list <path>` answers with
+    the dataset CONTAINING the path (observed on the workstation:
+    `zfs list -H -o name,mountpoint /data/jails` prints the parent and /data),
+    which is why the adapter checks that the answer's own mountpoint is exactly
+    the path asked about. tests/tier4/t_adapter_parse.sh pins this against a
+    scripted zfs; this tier is where it meets a real pool.
+
+Also UNVERIFIED here, and it matters more than it looks: a JAIL's registerable
+configuration lives at ${jailsysdir}/<name>/rc.conf_<name>, which is NOT inside
+the guest's replicated dataset, while a VM's is (jails-system/<name> is a
+symlink to ${workdir}/vm/<name>, sudoexec/bcreate:599). See the open problem
+noted in lib/promote.subr's header: a promoted VM finds its configuration, and
+a promoted jail on real CBSD may not.
+
 Substrate note from M0, binding on this tier: `cbsd initenv` starts cbsdd,
 which holds files open under the reset dataset, so a stage here must stop
 cbsdd (and cbsdrsyncd) before `reaper reset` -- or keep the CBSD workdir out

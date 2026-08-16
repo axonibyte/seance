@@ -1,0 +1,126 @@
+# seance -- notification: one command, the subject as $1, the body on stdin.
+#
+# Sourced, never executed. The whole notification feature at v1 (handoff §2.5,
+# design §16): a site that wants mail, a webhook or a pager writes it as
+# `notify_cmd` in seance.conf, and seance runs that. Anything richer is the
+# tenant's script, not seance's problem.
+#
+# THREE PROPERTIES, and each of them is a decision this file exists to keep:
+#
+#   1. NEVER FATAL. seance_notify always returns 0. A promotion must not die
+#      because mail did -- the guest coming back is the point, and telling
+#      somebody about it is the courtesy. A notify_cmd that is missing, that
+#      crashes, or that hangs past its budget changes nothing about the rung
+#      that called it (TESTING.md §5 names this as a required tier-4 row, and
+#      tests/tier4/t_ladder.sh has one for each of the three).
+#   2. BOUNDED. The command runs under seance_run_timeout with NOTIFY_TIMEOUT
+#      seconds. An unbounded notify is a promotion that stops at the rung which
+#      was trying to tell somebody it had stopped.
+#   3. LOGGED EITHER WAY. With no notify_cmd the message still goes to syslog
+#      -- at daemon.crit for the notify rung, which is the level handoff §2.5
+#      pins, and at the caller's level otherwise -- and to stderr, so that an
+#      operator watching the terminal sees the same words the pager would have.
+#
+# The command is word-split from the configuration value deliberately: it is a
+# command line an administrator wrote, seance appends the subject to it as one
+# further argument, and there is no eval and no `sh -c` anywhere in the path.
+# The body is a file on stdin rather than a pipe, so a command that never reads
+# it cannot leave this function blocked on a write.
+#
+# shellcheck shell=sh
+# shellcheck disable=SC3043
+#   'local' is not in POSIX sh but is implemented by FreeBSD /bin/sh (sh(1),
+#   "local"); seance targets FreeBSD sh and nothing else (handoff §5).
+
+# How long notify_cmd has. Not a configuration key: it is not a site
+# preference but the boundary past which a notification has already failed to
+# be timely, and a site that needs longer needs a notify_cmd that queues.
+# A shell variable rather than an environment override so that no code path
+# exists which only the tests take (the reasoning D-35 rejected an env
+# override for); tests/tier4/t_ladder.sh lowers it in its own shell.
+NOTIFY_TIMEOUT=30
+
+# The syslog levels seance_notify accepts. Anything else is a caller bug and is
+# reported as one rather than silently downgraded -- a notification sent at a
+# level nobody filters for is a notification nobody reads.
+NOTIFY_LEVELS="debug info notice warning err crit alert emerg"
+
+# seance_notify <level> <subject>        [body on stdin]
+#
+# ALWAYS returns 0. The exit status of notify_cmd is logged, never propagated.
+seance_notify()
+{
+    local _level _subject _cmd _body _rc _l _ok
+
+    _level=${1:-crit}
+    _subject=${2:-}
+
+    _ok=0
+    for _l in ${NOTIFY_LEVELS}; do
+        [ "${_l}" = "${_level}" ] && _ok=1
+    done
+    if [ "${_ok}" -eq 0 ]; then
+        seance_log err "notify: not a syslog level: [${_level}]; sending at crit"
+        _level=crit
+    fi
+
+    if [ -z "${_subject}" ]; then
+        seance_log err "notify: no subject given; nothing was sent"
+        return 0
+    fi
+
+    _body=$( mktemp "${TMPDIR:-/tmp}/seance-notify.XXXXXX" ) || {
+        seance_log err "notify: cannot create a temporary file for the body;" \
+            "the subject is: ${_subject}"
+        return 0
+    }
+
+    cat > "${_body}"
+
+    _cmd=""
+    if command -v conf_get > /dev/null 2>&1; then
+        _cmd=$( conf_get notify_cmd "" )
+    fi
+
+    # The message is on stderr whatever else happens, so that an operator
+    # watching the run sees exactly what the pager was told.
+    seance_log "${_level}" "NOTIFY: ${_subject}"
+    while IFS= read -r _l || [ -n "${_l}" ]; do
+        [ -n "${_l}" ] || continue
+        printf 'notify: | %s\n' "${_l}" >&2
+    done < "${_body}"
+
+    if [ -z "${_cmd}" ]; then
+        # No notify_cmd: syslog only, which is the documented default and is
+        # the whole feature until a site configures one.
+        if command -v logger > /dev/null 2>&1; then
+            logger -t seance -p "daemon.${_level}" -- "${_subject}" 2>/dev/null
+            logger -t seance -p "daemon.${_level}" -f "${_body}" 2>/dev/null
+        fi
+        rm -f "${_body}"
+        return 0
+    fi
+
+    # shellcheck disable=SC2086
+    #   Deliberate word splitting: ${_cmd} is a command line written by an
+    #   administrator in seance.conf, and it must reach exec as separate words.
+    #   The subject follows it as one further argument, quoted, so a subject
+    #   containing spaces stays one argument (handoff §2.5).
+    seance_run_timeout "${NOTIFY_TIMEOUT}" ${_cmd} "${_subject}" < "${_body}" \
+        > /dev/null 2>&1
+    _rc=$?
+
+    rm -f "${_body}"
+
+    if [ "${_rc}" -eq 0 ]; then
+        seance_log info "notify: notify_cmd delivered \"${_subject}\""
+    elif [ "${_rc}" -eq "${TRANSPORT_RC_TIMEOUT}" ]; then
+        seance_log err "notify: notify_cmd did not finish within ${NOTIFY_TIMEOUT}s" \
+            "and was killed; the message was logged to syslog instead of being delivered"
+    else
+        seance_log err "notify: notify_cmd exited ${_rc};" \
+            "the message was logged to syslog instead of being delivered"
+    fi
+
+    return 0
+}

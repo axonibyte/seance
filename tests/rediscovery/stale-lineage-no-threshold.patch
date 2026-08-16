@@ -1,0 +1,11 @@
+--- a/lib/policy.subr	2026-08-16 11:29:20.147381000 -0400
++++ b/lib/policy.subr	2026-08-16 11:29:20.147511000 -0400
+@@ -952,7 +952,7 @@
+ 
+     # _rc 0 from pol_age means "not skewed"; rc 0 from pol_is_stale means
+     # "fresh" (it returns the verdict, not the predicate).
+-    if [ "${_rc}" -eq 0 ] && pol_is_stale "${_age}" "${_max}"; then
++    if [ -n "${_age}" ]; then
+         printf 'proceed\n'
+         return 0
+     fi

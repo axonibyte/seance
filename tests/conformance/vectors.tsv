@@ -41,6 +41,17 @@ adapter_guest_sysdir	%BADNAME%	-	2
 adapter_guest_datasets	%JAIL%	^[a-z0-9][a-z0-9._:/-]*$	0
 adapter_guest_datasets	%ABSENT%	-	1
 adapter_guest_datasets	%BADNAME%	-	2
+adapter_guest_mountpoint	%JAIL% jail	^/.+$	0
+adapter_guest_mountpoint	%JAIL% nosuchtype	-	2
+adapter_guest_mountpoint	%BADNAME% jail	-	2
+# adapter_guest_links for a JAIL is empty on every platform -- a jail's dataset
+# is already mounted where CBSD looks. There is deliberately no %VM% row: what
+# a VM needs is precisely the thing that differs between platforms, which is
+# why this function exists at all, so a single expected shape for it would be
+# a fiction. tests/tier4/t_adapter_parse.sh pins the real adapter's answer.
+adapter_guest_links	%JAIL% jail	-	0
+adapter_guest_links	%JAIL% nosuchtype	-	2
+adapter_guest_links	%BADNAME% jail	-	2
 adapter_carp_state	1	^(MASTER|BACKUP|INIT|absent)$	0
 adapter_carp_state	256	-	2
 adapter_carp_state	0	-	2

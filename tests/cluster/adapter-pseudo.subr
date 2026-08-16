@@ -272,23 +272,84 @@ adapter_guest_stop()
     pseudo_set_field "$1" 5 0 || return 1
 }
 
+# contract: adapter_guest_mountpoint(name,type) -> path [promises output]
+#
+# Where this platform expects a guest's root dataset to be mounted. Here that
+# is ${PSEUDO_MOUNT}/<name> whatever the guest's type: a pseudo-node has no
+# jails-data and no vm directory to tell apart, and inventing the distinction
+# would be modelling CBSD's layout rather than this adapter's. rc 2 for a type
+# no adapter supports, so that a typo cannot mount a replica somewhere nobody
+# looks.
+adapter_guest_mountpoint()
+{
+    pseudo_name_ok "${1:-}" || { pseudo_diag "bad guest name: ${1:-}"; return 2; }
+
+    case "${2:-}" in
+        jail|bhyve) ;;
+        *) pseudo_diag "unsupported guest type: ${2:-}"; return 2 ;;
+    esac
+
+    printf '%s/%s\n' "${PSEUDO_MOUNT}" "$1"
+}
+
+# contract: adapter_guest_links(name,type) -> link<TAB>target per line [list: may be empty]
+#
+# None: a pseudo-node keeps every guest's data at one path for both types, so
+# there is nothing for a symlink to reconcile. An empty list is the answer, not
+# a failure -- which is what the contract marker on this function says, and is
+# the same shape a jail produces on real CBSD.
+adapter_guest_links()
+{
+    pseudo_name_ok "${1:-}" || { pseudo_diag "bad guest name: ${1:-}"; return 2; }
+
+    case "${2:-}" in
+        jail|bhyve) ;;
+        *) pseudo_diag "unsupported guest type: ${2:-}"; return 2 ;;
+    esac
+
+    return 0
+}
+
 # contract: adapter_guest_datasets(name) -> dataset per line, root first [promises output]
 #
 # Every ZFS dataset belonging to the guest, THE ROOT FIRST and every other line
 # a descendant of it. rc 0 with output, 1 if the guest has no dataset at all.
+#
+# THE MOUNTED PATH FIRST, exactly as the real adapter does it and for the same
+# reason: after a promotion in place the guest's dataset is a replica under
+# <standby_root>/<deadkey>/<name>, mounted at the path this node expects, and
+# no derivation from this node's own dataset name could ever name it. The
+# answer is accepted only when the dataset's own mountpoint is exactly the path
+# asked about, because `zfs list <path>` otherwise answers with the dataset
+# CONTAINING it (observed: `zfs list -H -o name,mountpoint /data/jails` prints
+# the parent dataset and its mountpoint /data).
 adapter_guest_datasets()
 {
-    local _root _ds
+    local _root _ds _mp _cand
 
     pseudo_name_ok "${1:-}" || { pseudo_diag "bad guest name: ${1:-}"; return 2; }
 
-    _root=$( pseudo_root ) || return 1
-    _ds="${_root}/$1"
+    _ds=""
 
-    zfs list -H -o name "${_ds}" > /dev/null 2>&1 || {
-        pseudo_diag "guest $1 has no dataset at ${_ds}"
-        return 1
-    }
+    _mp=$( adapter_guest_mountpoint "$1" jail ) || _mp=""
+    if [ -n "${_mp}" ]; then
+        _cand=$( zfs list -H -o name "${_mp}" 2>/dev/null ) || _cand=""
+        if [ -n "${_cand}" ] &&
+           [ "$( zfs get -H -o value mountpoint "${_cand}" 2>/dev/null )" = "${_mp}" ]
+        then
+            _ds=${_cand}
+        fi
+    fi
+
+    if [ -z "${_ds}" ]; then
+        _root=$( pseudo_root ) || return 1
+        _ds="${_root}/$1"
+
+        zfs list -H -o name "${_ds}" > /dev/null 2>&1 || {
+            pseudo_diag "guest $1 has no dataset at ${_ds}"
+            return 1
+        }
+    fi
 
     zfs list -H -o name -t filesystem,volume -r "${_ds}"
 }

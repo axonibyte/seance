@@ -1,0 +1,833 @@
+# seance -- failback: bringing a guest home (design §8, decision D-44 item 5).
+#
+# Sourced, never executed. `seance failback <guest>` runs ON THE ORIGIN -- the
+# guest's home node -- after it is back, gated, and not running the guest. It
+# is manual, forever: the dead node's return is a failback event and never an
+# automatic reclaim (design §7 rung 6), because the one thing worse than an
+# outage is two writers.
+#
+# THE SEQUENCE, and every step prints its undo before it acts:
+#
+#   1  stop the guest on the interim host                (failback-assist stop)
+#   2  take a final snapshot there                   (failback-assist snapshot)
+#   3  pull the reverse incremental into the origin's LIVE dataset
+#   4  unregister and unmount it on the interim  (failback-assist unregister)
+#   5  release the guest here and start it
+#   6  clear the interim's claim and close the record (failback-assist release)
+#   7  prune the interim's lineage from the origin's datasets
+#   8  say what the next replication tick will do
+#
+# WHY THE LIVE DATASET, AND WHAT THAT COSTS (D-44 item 5). The reverse stream
+# lands in the guest's real dataset with `zfs recv -F`, which
+# zfs-receive(8) defines as rolling the destination back to the incremental
+# base. Anything written to the origin's copy after that base -- by the crash
+# that killed the node, by a well-meaning administrator, by a half-finished
+# boot -- is destroyed by that rollback. seance therefore MEASURES it first:
+#
+#     zfs get -Hp -o value written@<base> <origin-live-dataset>
+#
+# and refuses, printing the byte count, unless the operator passes
+# --discard-origin-writes. That flag is recorded in the succession record as
+# evidence `discard:<bytes>`, so the decision survives the terminal it was
+# typed in. This is the crash-window loss the design accepts, made explicit
+# instead of silent.
+#
+# THE INTERIM'S HALF is done through `seance failback-assist`, an INTERNAL verb
+# the interim exposes over the mesh. It is internal in the sense that an
+# operator has no reason to type it -- it is documented so that the one who has
+# to, at 03:00, can.
+#
+# shellcheck shell=sh
+# shellcheck disable=SC3043
+#   'local' is not in POSIX sh but is implemented by FreeBSD /bin/sh (sh(1),
+#   "local"); seance targets FreeBSD sh and nothing else (handoff §5).
+
+FAILBACK_TAB=$( printf '\t.' )
+FAILBACK_TAB=${FAILBACK_TAB%.}
+
+# How long one reverse stream may take. The same floor the forward direction
+# uses, because it is the same amount of data going the other way.
+FAILBACK_STREAM_TIMEOUT_MIN=1800
+
+FAILBACK_TMPDIR=""
+
+# ---------------------------------------------------------------------------
+# The interim's half: `seance failback-assist`
+# ---------------------------------------------------------------------------
+
+# failback_assist <guest> <stop|start|snapshot|unregister|release>
+#
+# Records are printed as "assist<TAB>...", and the last line is the verdict, so
+# that the caller can select the data from the verdict without either of them
+# having to be silent.
+failback_assist()
+{
+    local _guest _op _self _now _ts _short _root _tmp _ds _rc _home
+
+    _guest=${1:-}
+    _op=${2:-}
+
+    if [ -z "${_guest}" ] || [ -z "${_op}" ]; then
+        printf 'failback-assist: FAIL (usage: failback-assist <guest> <stop|start|snapshot|unregister|release>)\n'
+        return 2
+    fi
+
+    _self=$( seance_self_key ) || {
+        printf 'failback-assist: FAIL (this node is not in its own configuration)\n'
+        return 2
+    }
+
+    case "${_op}" in
+        stop)
+            if ! adapter_guest_stop "${_guest}"; then
+                printf 'failback-assist: FAIL (%s could not be stopped)\n' "${_guest}"
+                return 1
+            fi
+            printf 'failback-assist: stopped %s\n' "${_guest}"
+            return 0
+            ;;
+
+        start)
+            # The undo of `stop`, and the only reason it exists: a failback
+            # that stops the guest and is then REFUSED by the written@base
+            # guard would otherwise leave an outage behind while the operator
+            # decides what those bytes are. A guard whose refusal costs an
+            # outage is a guard people learn to route around.
+            if ! adapter_guest_start "${_guest}"; then
+                printf 'failback-assist: FAIL (%s could not be started)\n' "${_guest}"
+                return 1
+            fi
+            printf 'failback-assist: started %s\n' "${_guest}"
+            return 0
+            ;;
+
+        snapshot)
+            _now=$( pol_now )
+            _ts=$( pol_epoch_to_ts "${_now}" ) || {
+                printf 'failback-assist: FAIL (cannot render the current time)\n'
+                return 1
+            }
+            _short=$( pol_snap_format "${_self}" "${_ts}" ) || {
+                printf 'failback-assist: FAIL (node key %s cannot appear in a snapshot name)\n' \
+                    "${_self}"
+                return 2
+            }
+
+            _tmp=$( seance_tmpdir ) || return 1
+            adapter_guest_datasets "${_guest}" > "${_tmp}/ds" < /dev/null || {
+                printf 'failback-assist: FAIL (no datasets for %s here)\n' "${_guest}"
+                return 1
+            }
+            [ -s "${_tmp}/ds" ] || {
+                printf 'failback-assist: FAIL (the adapter reported no datasets for %s)\n' \
+                    "${_guest}"
+                return 1
+            }
+            _root=""
+            read -r _root < "${_tmp}/ds"
+
+            if ! zfs_snapshot_r "${_root}" "${_short}"; then
+                printf 'failback-assist: FAIL (cannot snapshot %s@%s)\n' "${_root}" "${_short}"
+                return 1
+            fi
+
+            printf 'assist\tsnapshot\t%s\t%s\n' "${_root}" "${_short}"
+            printf 'failback-assist: snapshotted %s@%s\n' "${_root}" "${_short}"
+            return 0
+            ;;
+
+        unregister)
+            _tmp=$( seance_tmpdir ) || return 1
+            if ! adapter_guest_datasets "${_guest}" > "${_tmp}/ds" < /dev/null; then
+                : > "${_tmp}/ds"
+            fi
+
+            if ! adapter_guest_unregister "${_guest}"; then
+                printf 'failback-assist: FAIL (%s could not be unregistered)\n' "${_guest}"
+                return 1
+            fi
+
+            _rc=0
+            # Deepest first: a parent cannot be unmounted under its children.
+            LC_ALL=C sort -r < "${_tmp}/ds" > "${_tmp}/ds.deepest"
+            while IFS= read -r _ds || [ -n "${_ds}" ]; do
+                [ -n "${_ds}" ] || continue
+                if zfs_mounted "${_ds}"; then
+                    zfs_unmount "${_ds}" || _rc=1
+                fi
+                zfs_inherit mountpoint "${_ds}" || _rc=1
+                printf 'assist\tunmounted\t%s\n' "${_ds}"
+            done < "${_tmp}/ds.deepest"
+
+            if [ "${_rc}" -ne 0 ]; then
+                printf 'failback-assist: FAIL (%s was unregistered but its datasets could not all be put back to mountpoint=none)\n' \
+                    "${_guest}"
+                return 1
+            fi
+
+            printf 'failback-assist: unregistered %s and returned its datasets to mountpoint=none\n' \
+                "${_guest}"
+            return 0
+            ;;
+
+        release)
+            _home=$( placement_home "${_guest}" ) || _home=""
+
+            if [ -z "${_home}" ]; then
+                printf 'failback-assist: %s was not claimed here; nothing to release\n' \
+                    "${_guest}"
+                return 0
+            fi
+
+            _now=$( pol_now )
+            if ! promote_record "${_guest}" "${_self}" "${_home}" "${_now}" failback; then
+                printf 'failback-assist: FAIL (the succession record could not be appended)\n'
+                return 1
+            fi
+
+            if ! placement_clear "${_guest}"; then
+                printf 'failback-assist: FAIL (the placement claim could not be cleared)\n'
+                return 1
+            fi
+
+            printf 'failback-assist: released %s back to %s and closed the record\n' \
+                "${_guest}" "${_home}"
+            return 0
+            ;;
+
+        *)
+            printf 'failback-assist: FAIL (no such operation: %s)\n' "${_op}"
+            return 2
+            ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
+# The origin's half
+# ---------------------------------------------------------------------------
+
+# failback_remote <address> <guest> <op>
+#
+# One assist call on the interim. Prints the assist's whole output, so that the
+# caller may both read its records and show its verdict.
+failback_remote()
+{
+    seance_ssh "${1:?}" "${GATE_REMOTE_PROG} failback-assist ${2:?} ${3:?}"
+}
+
+# failback_interim <guest>
+#
+# Which living peer claims this guest. rc 1 and nothing when none does -- and
+# "none does" is not the same as "no peer answered", which placement_remote
+# names on stderr, because a failback run while the mesh is down would
+# otherwise look like a guest that had already come home.
+failback_interim()
+{
+    local _guest _self _peer _addr _live _tmp _silent
+
+    _guest=$1
+
+    _self=$( seance_self_key ) || return 1
+
+    _live=""
+    for _peer in $( conf_nodes ); do
+        [ "${_peer}" = "${_self}" ] && continue
+        _addr=$( seance_peer_addr "${_peer}" ) || continue
+        seance_ssh_probe "${_addr}" || continue
+        _live="${_live} ${_peer}"
+    done
+
+    _tmp=$( seance_tmpdir ) || return 1
+
+    # shellcheck disable=SC2086
+    #   Deliberate word splitting: ${_live} is a list of node keys.
+    placement_remote ${_live} > "${_tmp}/claims"
+
+    # A living peer that could not state its placement makes the answer
+    # unknowable, not empty: the interim might be exactly that peer, and
+    # "nobody claims it" would then send a failback at a guest that is running.
+    _silent=$( placement_silent "${_tmp}/claims" )
+    if [ -n "${_silent%% }" ]; then
+        printf 'failback: living peer(s) %s could not state their placement, so which node holds %s is unknown\n' \
+            "${_silent% }" "${_guest}" >&2
+        return 1
+    fi
+
+    placement_claims "${_tmp}/claims" "${_guest}" | grep . || return 1
+}
+
+# failback_remote_snapshots <address> <dataset>
+#
+# The interim's snapshot names for one dataset, short names only.
+failback_remote_snapshots()
+{
+    local _addr _ds
+
+    _addr=$1
+    _ds=$2
+
+    repl_ds_safe "${_ds}" || return 2
+
+    seance_ssh "${_addr}" "zfs list -H -o name -t snapshot -r '${_ds}' 2>/dev/null; exit 0" |
+        awk -F '@' -v d="${_ds}" 'NF == 2 && $1 == d { print $2 }'
+}
+
+# failback_base <origin-dataset> <interim-address> <interim-dataset> <originkey>
+#
+# The newest snapshot the two ends have in common, restricted to the ORIGIN's
+# own lineage. Prints the short name; rc 1 when there is none.
+#
+# Restricted deliberately: the base of the reverse stream is the point the
+# origin's data will be rolled back to, and picking a snapshot some other tool
+# happened to leave on both ends would make that point somebody else's
+# decision. The origin's lineage is the one seance wrote and the one it can
+# reason about.
+failback_base()
+{
+    local _ods _addr _ids _home _tmp _s _p _ts _best _cmp _short
+
+    _ods=$1
+    _addr=$2
+    _ids=$3
+    _home=$4
+
+    _tmp=$( seance_tmpdir ) || return 1
+
+    zfs_snapshots_r "${_ods}" 2>/dev/null |
+        awk -F '@' -v d="${_ods}" 'NF == 2 && $1 == d { print $2 }' > "${_tmp}/local"
+
+    failback_remote_snapshots "${_addr}" "${_ids}" > "${_tmp}/remote" || return 1
+
+    _best=""
+    while IFS= read -r _s || [ -n "${_s}" ]; do
+        [ -n "${_s}" ] || continue
+        grep -q -x -F -- "${_s}" "${_tmp}/remote" || continue
+
+        _p=$( pol_snap_parse "${_s}" ) || continue
+        [ "${_p%"${FAILBACK_TAB}"*}" = "${_home}" ] || continue
+        _ts=${_p#*"${FAILBACK_TAB}"}
+
+        if [ -z "${_best}" ]; then
+            _best=${_ts}
+            continue
+        fi
+        _cmp=$( pol_ts_cmp "${_ts}" "${_best}" ) || continue
+        [ "${_cmp}" = "1" ] && _best=${_ts}
+    done < "${_tmp}/local"
+
+    [ -n "${_best}" ] || return 1
+
+    _short=$( pol_snap_format "${_home}" "${_best}" ) || return 1
+    printf '%s\n' "${_short}"
+}
+
+# failback_plan <origin-root> <dataset-list> <interim-root> <address>
+#                <originkey> <planfile>
+#
+# Work out, per dataset, the base the reverse stream would roll the origin back
+# to and how many bytes would be lost by that rollback. Writes one
+# "<origin-ds><TAB><interim-ds><TAB><base><TAB><written>" record per dataset to
+# <planfile> and PRINTS THE TOTAL on stdout. rc 1 when any dataset has no base
+# or an unreadable written@, with the reason on stderr.
+failback_plan()
+{
+    local _root _dslist _iroot _addr _home _out _ds _tail _ids _base _written
+    local _total
+
+    _root=$1
+    _dslist=$2
+    _iroot=$3
+    _addr=$4
+    _home=$5
+    _out=$6
+
+    _total=0
+    : > "${_out}"
+
+    # The pool commits BEFORE anything is measured. `written@` is only exact
+    # once a transaction group has been written out, and a write made seconds
+    # ago is simply not in it yet -- observed in the guest, where 1 MiB read as
+    # 0 bytes until `zpool sync` (see lib/zfs.subr, zfs_pool_sync).
+    #
+    # A sync that FAILS makes every number below an undercount of unknown size,
+    # so the plan fails rather than producing one. That refuses the failback,
+    # which is the safe direction: the alternative is telling an operator there
+    # is nothing to lose and then destroying whatever there was.
+    if ! zfs_pool_sync "${_root}" >/dev/null 2>&1; then
+        printf 'failback: cannot commit the pool holding %s, so written@ cannot be\n' \
+            "${_root}" >&2
+        printf '        trusted -- and an untrustworthy byte count is worse than none,\n' >&2
+        printf '        because it reads as "nothing to lose". Fix the pool first.\n' >&2
+        return 1
+    fi
+
+    for _ds in ${_dslist}; do
+        _tail=${_ds#"${_root}"}
+        _ids="${_iroot}${_tail}"
+
+        if ! _base=$( failback_base "${_ds}" "${_addr}" "${_ids}" "${_home}" ); then
+            printf 'failback: %s and %s have no @seance-%s-* snapshot in common;\n' \
+                "${_ds}" "${_ids}" "${_home}" >&2
+            printf '        there is no base for a reverse incremental, and a full send over live data is not something seance will do\n' >&2
+            return 1
+        fi
+
+        _written=$( zfs_written_since "${_ds}" "${_base}" 2>/dev/null ) || _written=""
+        case "${_written}" in
+            ''|*[!0123456789]*)
+                printf 'failback: cannot read written@%s on %s: got [%s]\n' \
+                    "${_base}" "${_ds}" "${_written}" >&2
+                return 1
+                ;;
+        esac
+
+        _total=$(( _total + _written ))
+        printf '%s\t%s\t%s\t%s\n' "${_ds}" "${_ids}" "${_base}" "${_written}" \
+            >> "${_out}"
+    done
+
+    printf '%s\n' "${_total}"
+}
+
+# failback_refusal <guest> <interim> <total> <discard 0|1> <where>
+#
+# rc 1 -- and the whole refusal printed -- when the rollback would destroy
+# bytes and nobody has said that is acceptable. <where> is a sentence about
+# what state the guest is in, because the two places this is asked from leave
+# it in different ones.
+failback_refusal()
+{
+    local _guest _interim _total _discard _where
+
+    _guest=$1
+    _interim=$2
+    _total=$3
+    _discard=$4
+    _where=$5
+
+    [ "${_total}" -ne 0 ] || return 0
+    [ "${_discard}" -ne 1 ] || return 0
+
+    printf 'failback: REFUSED -- %d byte(s) have been written here to the copy of %s\n' \
+        "${_total}" "${_guest}"
+    printf '        since the base the reverse stream would roll back to. Receiving would\n'
+    printf '        destroy them. If they are the debris of the crash and not data, run:\n'
+    printf '            seance failback %s --discard-origin-writes\n' "${_guest}"
+    printf '        %s\n' "${_where}"
+
+    return 1
+}
+
+# failback_pull <rcfile> <timeout> <address> <remote-send> <local-dataset>
+#
+# "ssh <interim> zfs send ... | zfs recv -F ..." with the SENDER's status
+# captured, because a pipeline's status is its last command's and a send that
+# died into a receive that succeeded is the false pass this repository keeps
+# finding (common.subr).
+#
+# -F is what makes this the reverse of a promotion rather than an error: the
+# origin's live dataset is rolled back to the base and then rolled forward.
+# Nothing else in seance ever passes it, and lib/repl.subr never will (D-64).
+failback_pull()
+{
+    local _rcf _to _addr _send _ds _argv _rc_send _rc_recv
+
+    _rcf=$1
+    _to=$2
+    _addr=$3
+    _send=$4
+    _ds=$5
+
+    _argv=$( seance_ssh_argv "${_addr}" ) || return 2
+
+    # shellcheck disable=SC2086
+    #   Deliberate word splitting: ${_argv} is the ssh program and its options,
+    #   which must reach exec as separate words; the remote command follows as
+    #   one quoted argument.
+    seance_rc_capture "${_rcf}" seance_run_timeout "${_to}" ${_argv} "${_send}" |
+        seance_run_timeout "${_to}" \
+            zfs recv -F -u -x mountpoint -x canmount "${_ds}"
+    _rc_recv=$?
+
+    _rc_send=$( seance_rc_read "${_rcf}" )
+
+    [ "${_rc_send}" -eq 0 ] || return 1
+    [ "${_rc_recv}" -eq 0 ] || return 1
+
+    return 0
+}
+
+# failback_run <guest> <discard 0|1>
+#
+# rc 0 the guest is home and running, 1 the failback stopped, 2 a usage or
+# configuration error.
+failback_run()
+{
+    local _guest _discard _self _interim _addr _tmp _held _running _now
+    local _root _ds _dslist _tail _ids _iroot _base _final _written _total
+    local _to _line _evidence _lineage _sroot _sysdir
+
+    _guest=$1
+    _discard=${2:-0}
+
+    _self=$( seance_self_key ) || {
+        printf 'failback: FAIL (this node is not in its own configuration)\n'
+        return 2
+    }
+
+    FAILBACK_TMPDIR=$( seance_tmpdir ) || return 2
+    _tmp=${FAILBACK_TMPDIR}
+
+    # --- preconditions ----------------------------------------------------
+    if ! adapter_guest_type "${_guest}" > /dev/null 2>&1; then
+        printf 'failback: FAIL (%s is not registered on this node; failback returns a guest to a home that still knows it)\n' \
+            "${_guest}"
+        return 1
+    fi
+
+    _held=$( adapter_guest_held "${_guest}" 2>/dev/null ) || _held=""
+    _running=$( adapter_guest_running "${_guest}" 2>/dev/null ) || _running=""
+
+    if [ "${_held}" != "1" ] && [ "${_running}" != "0" ]; then
+        printf 'failback: FAIL (%s is neither held nor stopped here: held=%s running=%s).\n' \
+            "${_guest}" "${_held:-?}" "${_running:-?}"
+        printf '        A failback overwrites the copy of the guest on this node, and it will\n'
+        printf '        not do that underneath a running guest.\n'
+        return 1
+    fi
+
+    if ! _interim=$( failback_interim "${_guest}" ); then
+        printf 'failback: FAIL (no living peer claims %s).\n' "${_guest}"
+        printf '        Either it is already home, or the peer holding it is not answering -- and\n'
+        printf '        a failback from a peer that cannot be reached is not a failback.\n'
+        return 1
+    fi
+
+    if ! _addr=$( seance_peer_addr "${_interim}" ); then
+        printf 'failback: FAIL (node_%s_mgmt is not configured)\n' "${_interim}"
+        return 2
+    fi
+
+    printf 'failback: %s is claimed by %s; bringing it home to %s\n' \
+        "${_guest}" "${_interim}" "${_self}"
+
+    # --- the origin's own datasets ----------------------------------------
+    if ! adapter_guest_datasets "${_guest}" > "${_tmp}/ds" < /dev/null ||
+       [ ! -s "${_tmp}/ds" ]; then
+        printf 'failback: FAIL (this node has no datasets for %s to receive into)\n' \
+            "${_guest}"
+        return 1
+    fi
+    _root=""
+    read -r _root < "${_tmp}/ds"
+
+    _dslist=""
+    while IFS= read -r _ds || [ -n "${_ds}" ]; do
+        [ -n "${_ds}" ] || continue
+        repl_ds_safe "${_ds}" || {
+            printf 'failback: FAIL (unusable dataset name: %s)\n' "${_ds}"
+            return 2
+        }
+        _dslist="${_dslist} ${_ds}"
+    done < "${_tmp}/ds"
+    _dslist=${_dslist# }
+
+    # --- 0. the guard, BEFORE anything is stopped -------------------------
+    #
+    # The written@base measurement is about the ORIGIN's datasets, and the base
+    # is a snapshot of the origin's own lineage that the interim already has --
+    # neither depends on the guest being stopped. So it is measured first, and
+    # a refusal costs nothing: the guest goes on running on the interim while
+    # the operator looks at the bytes.
+    #
+    # A guard whose refusal costs an outage is a guard people learn to route
+    # around, and `--discard-origin-writes` becoming a habit is exactly what
+    # docs/RUNBOOK-failback.md warns against.
+    #
+    # The interim's replica root is DERIVED here, the same way `repl` derives
+    # where it sends (repl_standby_root + repl_replica_root). The interim's own
+    # answer arrives with the final snapshot below and is authoritative; this
+    # is a pre-flight, and when the derivation is not available it is skipped
+    # rather than guessed.
+    if _sroot=$( repl_standby_root "${_interim}" ); then
+        _iroot=$( repl_replica_root "${_sroot}" "${_self}" "${_root}" )
+
+        if _total=$( failback_plan "${_root}" "${_dslist}" "${_iroot}" \
+                "${_addr}" "${_self}" "${_tmp}/preflight" ); then
+            if ! failback_refusal "${_guest}" "${_interim}" "${_total}" \
+                    "${_discard}" \
+                    "${_guest} is still RUNNING on ${_interim}; nothing has been stopped."
+            then
+                return 1
+            fi
+        else
+            printf '  (pre-flight could not measure %s yet; the guard runs again below)\n' \
+                "${_guest}"
+        fi
+    else
+        printf '  (no standby root configured for %s, so the guard runs after the snapshot)\n' \
+            "${_interim}"
+    fi
+
+    # --- 1. stop it on the interim ----------------------------------------
+    printf '  undo: seance failback-assist %s is not reversible from here; the guest is\n' "${_guest}"
+    printf '        started again by finishing this failback, or on %s by hand\n' "${_interim}"
+    if ! failback_remote "${_addr}" "${_guest}" stop > "${_tmp}/stop" 2>&1; then
+        sed -e 's/^/  /' "${_tmp}/stop"
+        printf 'failback: FAIL (%s could not stop %s)\n' "${_interim}" "${_guest}"
+        return 1
+    fi
+    sed -e 's/^/  /' "${_tmp}/stop"
+
+    # --- 2. the final snapshot there --------------------------------------
+    if ! failback_remote "${_addr}" "${_guest}" snapshot > "${_tmp}/snap" 2>&1; then
+        sed -e 's/^/  /' "${_tmp}/snap"
+        printf 'failback: FAIL (%s could not take the final snapshot of %s)\n' \
+            "${_interim}" "${_guest}"
+        return 1
+    fi
+    sed -e 's/^/  /' "${_tmp}/snap"
+
+    _iroot=$( awk -F "${FAILBACK_TAB}" '$1 == "assist" && $2 == "snapshot" { print $3; exit }' \
+        "${_tmp}/snap" )
+    _final=$( awk -F "${FAILBACK_TAB}" '$1 == "assist" && $2 == "snapshot" { print $4; exit }' \
+        "${_tmp}/snap" )
+
+    if [ -z "${_iroot}" ] || [ -z "${_final}" ]; then
+        printf 'failback: FAIL (%s said it snapshotted %s but did not say what: empty output with a success status is a contract violation)\n' \
+            "${_interim}" "${_guest}"
+        return 1
+    fi
+
+    # --- 3. the guard again, on the interim's OWN answer ------------------
+    #
+    # The pre-flight above used a derived replica root. This one uses the root
+    # the interim itself named when it took the final snapshot, which is
+    # authoritative -- and it is the number that goes into the record.
+    if ! _total=$( failback_plan "${_root}" "${_dslist}" "${_iroot}" \
+            "${_addr}" "${_self}" "${_tmp}/plan" ); then
+        printf 'failback: FAIL (the reverse stream could not be planned; see above)\n'
+        return 1
+    fi
+
+    while IFS= read -r _line || [ -n "${_line}" ]; do
+        [ -n "${_line}" ] || continue
+        printf '  %s: base %s, %s byte(s) written here since it\n' \
+            "$( printf '%s\n' "${_line}" | cut -f 1 )" \
+            "$( printf '%s\n' "${_line}" | cut -f 3 )" \
+            "$( printf '%s\n' "${_line}" | cut -f 4 )"
+    done < "${_tmp}/plan"
+
+    if ! failback_refusal "${_guest}" "${_interim}" "${_total}" "${_discard}" \
+            "${_guest} is stopped on ${_interim}. Put it back with: seance failback-assist ${_guest} start"
+    then
+        return 1
+    fi
+
+    _evidence=failback
+    if [ "${_total}" -ne 0 ]; then
+        _evidence="discard:${_total}"
+        printf 'failback: discarding %d byte(s) written here since the base, by --discard-origin-writes\n' \
+            "${_total}"
+    fi
+
+    _to=$( conf_effective cadence "${_guest}" ) || _to=900
+    case "${_to}" in
+        ''|*[!0123456789]*) _to=900 ;;
+    esac
+    [ "${_to}" -lt "${FAILBACK_STREAM_TIMEOUT_MIN}" ] && _to=${FAILBACK_STREAM_TIMEOUT_MIN}
+
+    # The origin's datasets are unmounted first, deepest first, and mounted
+    # again after. `zfs recv -F` rolls a filesystem back, and rolling back
+    # under a live mount is not something to leave to whichever version of ZFS
+    # is on the node -- the guest is stopped or held here by precondition, so
+    # there is nothing using them, and doing it explicitly means the failure
+    # mode is "this dataset is busy" rather than a receive that half-worked.
+    printf '%s\n' "${_dslist}" | tr ' ' '\n' | LC_ALL=C sort -r > "${_tmp}/deepest"
+    while IFS= read -r _ds || [ -n "${_ds}" ]; do
+        [ -n "${_ds}" ] || continue
+        zfs_mounted "${_ds}" || continue
+        printf '  undo: zfs mount %s\n' "${_ds}"
+        if ! zfs_unmount "${_ds}"; then
+            printf 'failback: FAIL (%s is busy and could not be unmounted; nothing was received)\n' \
+                "${_ds}"
+            return 1
+        fi
+    done < "${_tmp}/deepest"
+
+    while IFS= read -r _line || [ -n "${_line}" ]; do
+        [ -n "${_line}" ] || continue
+
+        _ds=$( printf '%s\n' "${_line}" | cut -f 1 )
+        _ids=$( printf '%s\n' "${_line}" | cut -f 2 )
+        _base=$( printf '%s\n' "${_line}" | cut -f 3 )
+
+        printf '  undo: none -- zfs recv -F rolls %s back to @%s and then forward.\n' \
+            "${_ds}" "${_base}"
+        printf '        This is the crash-window loss the design accepts; it was measured above.\n'
+
+        if ! failback_pull "${_tmp}/send.rc" "${_to}" "${_addr}" \
+                "zfs send -p -I '@${_base}' '${_ids}@${_final}'" "${_ds}"; then
+            printf 'failback: FAIL (the reverse incremental of %s from %s did not land)\n' \
+                "${_ds}" "${_interim}"
+            return 1
+        fi
+
+        printf '  received %s -> %s (base @%s, head @%s)\n' \
+            "${_ids}" "${_ds}" "${_base}" "${_final}"
+    done < "${_tmp}/plan"
+
+    # Mounted again, root first, because the receive was told -u: nothing in
+    # seance mounts by accident, and the guest cannot start over an unmounted
+    # dataset.
+    for _ds in ${_dslist}; do
+        zfs_mounted "${_ds}" && continue
+        if ! zfs_mount "${_ds}"; then
+            printf 'failback: FAIL (%s came home but could not be mounted)\n' "${_ds}"
+            return 1
+        fi
+        printf '  mounted %s\n' "${_ds}"
+    done
+
+    # --- 4. unregister and unmount on the interim -------------------------
+    if ! failback_remote "${_addr}" "${_guest}" unregister > "${_tmp}/unreg" 2>&1; then
+        sed -e 's/^/  /' "${_tmp}/unreg"
+        printf 'failback: FAIL (%s could not unregister %s; the data is home but the interim still has it registered)\n' \
+            "${_interim}" "${_guest}"
+        return 1
+    fi
+    sed -e 's/^/  /' "${_tmp}/unreg"
+
+    # --- 4b. the configuration, back the way it came ----------------------
+    #
+    # The mirror in reverse, by the same code (D-82). The interim was the
+    # guest's home for the length of the outage, so its own configuration
+    # mirror carries whatever the platform wrote into ${jailsysdir}/<guest>/
+    # while it was there -- and this node holds a replica of that mirror if the
+    # interim ticked at all after the promotion.
+    #
+    # It is not fatal when it is absent. This node has its own copy of the
+    # guest's configuration from before it died; the interim's is newer, not
+    # essential, and refusing a completed data transfer over it would be the
+    # wrong trade at exactly the wrong moment. What is not acceptable is doing
+    # it silently, so both outcomes say which happened.
+    if _sroot=$( repl_standby_root "${_self}" ) &&
+       _sysdir=$( adapter_guest_sysdir "${_guest}" 2>/dev/null ) &&
+       ! repl_sys_travels "${_guest}"
+    then
+        if promote_sys_restore "${_guest}" \
+                "${_sroot}/${_interim}/${REPL_SYS_GUEST}" "${_sysdir}" "${_tmp}"
+        then
+            printf '  restored %s configuration from %s as it was on the interim\n' \
+                "${_guest}" "${_interim}"
+        else
+            printf '  NOTE: %s configuration was NOT restored from %s;\n' \
+                "${_guest}" "${_interim}"
+            printf '        this node is using the copy it had before it died\n'
+        fi
+    fi
+
+    # --- 5. release and start it here --------------------------------------
+    printf '  undo: seance gate (it re-holds a guest a peer still claims)\n'
+    if ! adapter_guest_release "${_guest}"; then
+        printf 'failback: FAIL (%s could not be released from slave mode here)\n' "${_guest}"
+        return 1
+    fi
+
+    printf '  undo: seance failback-assist %s stop\n' "${_guest}"
+    if ! adapter_guest_start "${_guest}"; then
+        printf 'failback: FAIL (%s could not be started here)\n' "${_guest}"
+        return 1
+    fi
+
+    _running=$( adapter_guest_running "${_guest}" ) || _running=""
+    if [ "${_running}" != "1" ]; then
+        printf 'failback: FAIL (%s was started but this node does not report it running [%s])\n' \
+            "${_guest}" "${_running:-?}"
+        return 1
+    fi
+
+    # --- 6. the interim stops claiming it, and the record closes ----------
+    if ! failback_remote "${_addr}" "${_guest}" release > "${_tmp}/rel" 2>&1; then
+        sed -e 's/^/  /' "${_tmp}/rel"
+        printf 'failback: FAIL (%s could not clear its claim on %s; two nodes now believe they host it)\n' \
+            "${_interim}" "${_guest}"
+        return 1
+    fi
+    sed -e 's/^/  /' "${_tmp}/rel"
+
+    _now=$( pol_now )
+    promote_record "${_guest}" "${_interim}" "${_self}" "${_now}" "${_evidence}" ||
+        printf 'failback: WARNING -- the succession record could not be appended here\n'
+
+    # --- 7. the interim's lineage on this node ----------------------------
+    failback_prune_lineage "${_dslist}" "${_interim}" "${_now}"
+
+    # --- 8. what happens next ---------------------------------------------
+    _lineage=$( pol_heirs "$( conf_get "node_${_self}_heir" "" )" \
+        "$( conf_get "node_${_self}_heir2" "" )" \
+        "$( conf_get "guest_${_guest}_heir" "" )" \
+        "$( conf_get "guest_${_guest}_heir2" "" )" 2>/dev/null | tr '\n' ' ' ) ||
+        _lineage=""
+
+    printf 'failback: %s is home on %s and running; the next repl tick sends @seance-%s-* to %s\n' \
+        "${_guest}" "${_self}" "${_self}" "${_lineage:-its heirs}"
+
+    return 0
+}
+
+# failback_prune_lineage <dataset-list> <interimkey> <now-epoch>
+#
+# The interim's lineage on the origin's datasets, pruned by the ordinary
+# retention ladder with the NEWEST of it protected.
+#
+# It needs doing explicitly because `repl` prunes only the lineage it writes --
+# repl_ts_for_dataset filters on the home node key -- so the @seance-<interim>-*
+# snapshots the reverse stream brought with it would otherwise stay forever.
+# The newest is kept because it is the exact point the guest's data came home
+# at, and that is worth a snapshot.
+failback_prune_lineage()
+{
+    local _dslist _interim _now _ds _tmp _ts _prune _short _newest _s _p
+
+    _dslist=$1
+    _interim=$2
+    _now=$3
+
+    _tmp=$( seance_tmpdir ) || return 1
+
+    for _ds in ${_dslist}; do
+        zfs_snapshots_r "${_ds}" 2>/dev/null |
+            awk -F '@' -v d="${_ds}" 'NF == 2 && $1 == d { print $2 }' |
+            while IFS= read -r _s || [ -n "${_s}" ]; do
+                [ -n "${_s}" ] || continue
+                _p=$( pol_snap_parse "${_s}" ) || continue
+                [ "${_p%"${FAILBACK_TAB}"*}" = "${_interim}" ] || continue
+                printf '%s\n' "${_p#*"${FAILBACK_TAB}"}"
+            done > "${_tmp}/its"
+
+        [ -s "${_tmp}/its" ] || continue
+
+        _newest=$( repl_newest "${_tmp}/its" )
+        : > "${_tmp}/prot"
+        [ -n "${_newest}" ] && printf '%s\n' "${_newest}" > "${_tmp}/prot"
+
+        _prune=$( pol_retention_prune_protected "${_now}" \
+            "$( conf_effective retention_recent )" \
+            "$( conf_effective retention_hourly )" "${_tmp}/prot" \
+            < "${_tmp}/its" ) || continue
+
+        for _ts in ${_prune}; do
+            _short=$( pol_snap_format "${_interim}" "${_ts}" ) || continue
+            printf '  undo: none -- %s@%s was the interim lineage and has been pruned\n' \
+                "${_ds}" "${_short}"
+            if zfs_destroy_snapshot "${_ds}" "${_short}"; then
+                seance_log info "failback: pruned ${_ds}@${_short}"
+            else
+                seance_log err "failback: could not prune ${_ds}@${_short}"
+            fi
+        done
+    done
+
+    return 0
+}
