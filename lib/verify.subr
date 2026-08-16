@@ -1,0 +1,316 @@
+# seance -- `verify`: render what should be, diff it against what is.
+#
+# Sourced, never executed. Design §9 and handoff §2.6. verify is the verb an
+# operator runs before trusting the fleet, and after changing anything in it.
+# It checks, in order:
+#
+#   1. the configuration parses and validates (`config --check`);
+#   2. every peer answers over the mesh, as ssh_user on ssh_port;
+#   3. pairwise clock delta is inside skew_tolerance;
+#   4. every peer holds the SAME configuration file, byte for byte;
+#   5. this node's standby parents on every peer are still hidden --
+#      canmount=noauto, mountpoint=none;
+#   6. the crontab line seance expects is installed somewhere cron reads.
+#
+# VERIFY NEVER WRITES ANYTHING. Not the crontab, not a standby property, not a
+# configuration file. It renders what it expects and says where reality differs
+# -- because a verifier that repairs is a verifier whose green run tells you
+# nothing about the state it was asked to check. The one verb that repairs a
+# standby parent is `repl`, and it says so in the log when it does.
+#
+# PASS / WARN / FAIL, one line each, then a verdict line. Exit codes:
+#
+#   0  everything PASSed
+#   1  something WARNed or FAILed -- reality and the rendering differ
+#   2  a contract error: the configuration could not be loaded or validated,
+#      or this node is not in it
+#
+# Configuration divergence is a FAIL and is the loud one (handoff §2.2): the
+# whole synchronisation story for the file that names how to power a machine
+# off is this check being read.
+#
+# shellcheck shell=sh
+# shellcheck disable=SC3043
+#   'local' is not in POSIX sh but is implemented by FreeBSD /bin/sh (sh(1),
+#   "local"); seance targets FreeBSD sh and nothing else (handoff §5).
+
+# Where cron looks. crontab(5) on FreeBSD 15.1: "Each line in system crontab
+# ( /etc/crontab, /etc/cron.d, /usr/local/etc/cron.d ) has five time and date
+# fields, followed by a valid user name ... followed by a command." cron(8)
+# FILES: "/etc/cron.d Directory for optional/modularized system crontab files"
+# and "/usr/local/etc/cron.d Directory for third-party package provided crontab
+# files". seance installs from ports/packages territory, so the rendering names
+# the third-party directory and the check accepts either. (Decision D-63.)
+VERIFY_CRON_PREFERRED="/usr/local/etc/cron.d/seance"
+VERIFY_CRON_ALSO="/etc/cron.d/seance"
+
+VERIFY_TAB=$( printf '\t.' )
+VERIFY_TAB=${VERIFY_TAB%.}
+
+VERIFY_PASS=0
+VERIFY_WARN=0
+VERIFY_FAIL=0
+
+verify_pass()
+{
+    VERIFY_PASS=$(( VERIFY_PASS + 1 ))
+    printf 'PASS %s\n' "$*"
+}
+
+verify_warn()
+{
+    VERIFY_WARN=$(( VERIFY_WARN + 1 ))
+    printf 'WARN %s\n' "$*"
+}
+
+verify_fail()
+{
+    VERIFY_FAIL=$(( VERIFY_FAIL + 1 ))
+    printf 'FAIL %s\n' "$*"
+}
+
+# verify_render <what>
+#
+# Print an expected configuration fragment and nothing else, so that it can be
+# redirected into place by an operator who has read it. rc 2 for an unknown
+# subject -- a typo must not print nothing and exit 0.
+verify_render()
+{
+    case "${1:-}" in
+        cron)
+            repl_cron_line
+            return 0
+            ;;
+        *)
+            seance_log err "verify: nothing to render called \"${1:-}\" (known: cron)"
+            return 2
+            ;;
+    esac
+}
+
+# verify_standby <peerkey> <standby-root> <homekey>
+#
+# Ask one peer about the two datasets this node's replicas hang from. Prints
+# one record per dataset:
+#
+#   <dataset><TAB>absent
+#   <dataset><TAB><mountpoint><TAB><canmount>
+#
+# Read-only: it looks, it does not repair.
+verify_standby()
+{
+    local _peer _sroot _home _addr _cmd
+
+    _peer=$1
+    _sroot=$2
+    _home=$3
+
+    _addr=$( seance_peer_addr "${_peer}" ) || return 1
+
+    repl_ds_safe "${_sroot}" || return 2
+    repl_ds_safe "${_sroot}/${_home}" || return 2
+
+    _cmd="for d in '${_sroot}' '${_sroot}/${_home}'; do
+    if zfs list -H -o name \"\$d\" > /dev/null 2>&1; then
+        printf '%s\t%s\t%s\n' \"\$d\" \\
+            \"\$( zfs get -H -o value mountpoint \"\$d\" )\" \\
+            \"\$( zfs get -H -o value canmount \"\$d\" )\"
+    else
+        printf '%s\tabsent\n' \"\$d\"
+    fi
+done
+exit 0"
+
+    seance_ssh "${_addr}" "${_cmd}"
+}
+
+# verify_cron
+#
+# Compare the rendered crontab line against the files cron actually reads.
+# Never writes; prints the install hint instead, which is the shape every
+# destructive-adjacent path in seance takes -- say the command, let the
+# operator run it.
+verify_cron()
+{
+    local _want _f _found _line
+
+    _want=$( repl_cron_line ) || {
+        verify_fail "cron: cannot render the expected line"
+        return 0
+    }
+
+    _found=""
+    for _f in "${VERIFY_CRON_PREFERRED}" "${VERIFY_CRON_ALSO}"; do
+        [ -r "${_f}" ] || continue
+        _found=${_f}
+        break
+    done
+
+    if [ -z "${_found}" ]; then
+        verify_warn "cron: no crontab fragment at ${VERIFY_CRON_PREFERRED} or ${VERIFY_CRON_ALSO};" \
+            "replication is not scheduled"
+        printf '     install it with:  seance verify --render cron > %s\n' \
+            "${VERIFY_CRON_PREFERRED}"
+        return 0
+    fi
+
+    _line=""
+    while IFS= read -r _line || [ -n "${_line}" ]; do
+        [ "${_line}" = "${_want}" ] && break
+        _line=""
+    done < "${_found}"
+
+    if [ "${_line}" = "${_want}" ]; then
+        verify_pass "cron: ${_found} carries the expected line"
+    else
+        verify_warn "cron: ${_found} does not carry the expected line"
+        printf '     expected:  %s\n' "${_want}"
+    fi
+}
+
+# verify_report
+#
+# The whole check. Returns the exit code documented at the top of this file.
+verify_report()
+{
+    local _home _conf _lsha _now _skew _peer _addr _tmp
+    local _psha _pdate _delta _sroot _root _line _ds _mp _cm _guest _names
+
+    if ! conf_check > /dev/null; then
+        conf_check
+        printf 'verify: FAIL (the configuration is invalid; nothing below it can be trusted)\n'
+        return 2
+    fi
+    verify_pass "config: seance config --check is clean"
+
+    _home=$( seance_self_key ) || {
+        printf 'verify: FAIL (this node is not in its own configuration)\n'
+        return 2
+    }
+
+    _conf=$( conf_file )
+    _lsha=$( sha256 -q "${_conf}" 2>/dev/null ) || _lsha=""
+    [ -n "${_lsha}" ] || verify_fail "config: cannot checksum ${_conf} on this node"
+
+    _skew=$( conf_effective skew_tolerance ) || _skew=120
+    _tmp=$( seance_tmpdir ) || return 2
+
+    # --- the standby root this node's replicas will use -------------------
+    #
+    # Derived per peer, because the %n substitution names the peer (D-59).
+    # When the key is unset the derivation needs a guest to look at, so the
+    # first guest the adapter reports stands in for the layout.
+    _root=""
+    if adapter_guest_list > "${_tmp}/guests" < /dev/null; then
+        _names=$( awk -F "${VERIFY_TAB}" 'NF > 0 { print $1 }' "${_tmp}/guests" )
+        for _guest in ${_names}; do
+            if adapter_guest_datasets "${_guest}" > "${_tmp}/ds" < /dev/null &&
+               [ -s "${_tmp}/ds" ]; then
+                read -r _root < "${_tmp}/ds"
+                break
+            fi
+        done
+    fi
+
+    for _peer in $( conf_nodes ); do
+        [ "${_peer}" = "${_home}" ] && continue
+
+        if ! _addr=$( seance_peer_addr "${_peer}" ); then
+            verify_fail "mesh: node ${_peer} has no node_${_peer}_mgmt address"
+            continue
+        fi
+
+        # 2. reachability
+        if ! seance_ssh_probe "${_addr}"; then
+            verify_fail "mesh: ${_home} -> ${_peer} (${_addr}) does not answer ssh"
+            continue
+        fi
+        verify_pass "mesh: ${_home} -> ${_peer} (${_addr})"
+
+        # 3. clock
+        _now=$( pol_now )
+        if ! _pdate=$( seance_ssh "${_addr}" 'date -u +%s' ); then
+            verify_warn "clock: ${_peer} did not answer with its time"
+        else
+            case "${_pdate}" in
+                ''|*[!0123456789]*)
+                    verify_warn "clock: ${_peer} answered \"${_pdate}\", which is not an epoch"
+                    ;;
+                *)
+                    _delta=$(( _pdate - _now ))
+                    [ "${_delta}" -lt 0 ] && _delta=$(( -_delta ))
+                    if [ "${_delta}" -le "${_skew}" ]; then
+                        verify_pass "clock: ${_peer} is ${_delta}s away (tolerance ${_skew}s)"
+                    else
+                        verify_warn "clock: ${_peer} is ${_delta}s away, past skew_tolerance ${_skew}s;" \
+                            "every staleness number that crosses this pair is a fiction"
+                    fi
+                    ;;
+            esac
+        fi
+
+        # 4. one configuration, everywhere
+        case "${_conf}" in
+            *"'"*) _psha="" ;;
+            *) _psha=$( seance_ssh "${_addr}" "sha256 -q '${_conf}' 2>/dev/null" ) || _psha="" ;;
+        esac
+
+        if [ -z "${_psha}" ]; then
+            verify_fail "config: ${_peer} has no readable ${_conf} -- THE MESH IS NOT CONFIGURED ALIKE"
+        elif [ "${_psha}" = "${_lsha}" ]; then
+            verify_pass "config: ${_peer} holds the same file"
+        else
+            verify_fail "config: ${_peer} HOLDS A DIFFERENT FILE (${_psha} there, ${_lsha} here);" \
+                "seance never copies it -- reconcile ${_conf} by hand on every node"
+        fi
+
+        # 5. the standby parents this node's replicas hang from
+        if ! _sroot=$( repl_standby_root "${_peer}" ); then
+            if [ -z "${_root}" ]; then
+                verify_warn "standby: cannot tell where ${_peer} keeps replicas;" \
+                    "standby_root is unset and this node reports no guest to derive it from"
+                continue
+            fi
+            _sroot=$( repl_standby_root_derived "${_root}" ) || {
+                verify_warn "standby: cannot derive a standby root from ${_root}"
+                continue
+            }
+        fi
+
+        if ! verify_standby "${_peer}" "${_sroot}" "${_home}" > "${_tmp}/standby"; then
+            verify_warn "standby: ${_peer} did not answer about ${_sroot}"
+            continue
+        fi
+
+        while IFS= read -r _line || [ -n "${_line}" ]; do
+            [ -n "${_line}" ] || continue
+            _ds=${_line%%"${VERIFY_TAB}"*}
+            _mp=${_line#*"${VERIFY_TAB}"}
+            _cm=${_mp#*"${VERIFY_TAB}"}
+            _mp=${_mp%%"${VERIFY_TAB}"*}
+
+            if [ "${_mp}" = "absent" ]; then
+                verify_warn "standby: ${_peer}:${_ds} does not exist yet (the next repl tick creates it)"
+                continue
+            fi
+
+            if [ "${_mp}" = "none" ] && [ "${_cm}" = "noauto" ]; then
+                verify_pass "standby: ${_peer}:${_ds} canmount=noauto mountpoint=none"
+            else
+                verify_fail "standby: ${_peer}:${_ds} is mountpoint=${_mp} canmount=${_cm};" \
+                    "a standby parent that can mount is a shadow mount waiting for a reboot"
+            fi
+        done < "${_tmp}/standby"
+    done
+
+    # 6. the schedule
+    verify_cron
+
+    printf 'verify: %d pass, %d warn, %d fail\n' \
+        "${VERIFY_PASS}" "${VERIFY_WARN}" "${VERIFY_FAIL}"
+
+    [ "${VERIFY_FAIL}" -gt 0 ] && return 1
+    [ "${VERIFY_WARN}" -gt 0 ] && return 1
+
+    return 0
+}

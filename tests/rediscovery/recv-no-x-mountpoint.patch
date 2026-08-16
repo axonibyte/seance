@@ -1,0 +1,11 @@
+--- a/lib/repl.subr	2026-08-16 09:33:41.586739000 -0400
++++ b/lib/repl.subr	2026-08-16 09:33:41.645785000 -0400
+@@ -622,7 +622,7 @@
+ # authority over a peer's pool.
+ repl_recv_cmd()
+ {
+-    printf "zfs recv -s -u -x mountpoint -x canmount '%s'\n" "${1:?}"
++    printf "zfs recv -s -u -x canmount '%s'\n" "${1:?}"
+ }
+ 
+ # repl_pipe <rcfile> <timeout> <address> <recv-command> -- <send argv...>

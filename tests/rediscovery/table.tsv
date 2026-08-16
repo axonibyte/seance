@@ -1,0 +1,17 @@
+# The rediscovery battery (TESTING.md §8).
+#
+# One row per protection that this project has already paid for once. Each row
+# names a patch that REVERTS the protection, and the test that must then fail.
+# A protection whose removal changes nothing is not a protection; it is a
+# comment with an if statement around it.
+#
+# Columns, tab separated:
+#   patch-file  relative to tests/rediscovery/, applied with patch -p1 at the
+#               repository root of a scratch copy
+#   tier        which tier the named test belongs to (run.sh --tier selects)
+#   stage       the tier-6/7 stage name, or '-' for tiers with no stages
+#   test        the test file, relative to the repository root, that MUST fail
+#
+patch-file	tier	stage	test
+recv-no-x-mountpoint.patch	6	repl	tests/tier6/t_repl.sh
+repl-skip-resume-token.patch	6	interrupt	tests/tier6/t_interrupt.sh
