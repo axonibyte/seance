@@ -1,0 +1,254 @@
+# seance tier 7 -- the shrinker.
+#
+# A seed tells you a bug exists; a trace tells you what it is (methodology
+# §11). On the first failing seed, two reductions in the order DESIGN §8 sets:
+#
+#   1. prefix bisection -- the shortest number of steps that still fails;
+#   2. event-kind removal -- for each kind still present, rerun without it and
+#      keep the removal if the failure survives, which answers "is this kind
+#      actually involved or merely present".
+#
+#     shrink_run <trace-file>
+#         reduce, print the reduction and the reduced trace, and set
+#         SHRINK_STEPS and SHRINK_SKIP. rc 0 when it reduced something,
+#         1 when the unreduced run did not reproduce.
+#
+#         Call it directly and redirect if you want its output in a file:
+#         'x=$( shrink_run ... )' runs it in a subshell, and SHRINK_STEPS and
+#         SHRINK_SKIP come back unchanged from a reduction that did happen.
+#
+# The reruns are driven through one injectable function, which the caller
+# defines:
+#
+#     shrink_rerun <steps> <skip-kinds>   -> rc 0 = passed, non-zero = failed
+#
+# <steps> is a step count; <skip-kinds> is a comma-separated list of event
+# kinds the generator must draw and then skip, or the empty string. DESIGN §8
+# writes SEANCE_SIM_SKIP=<kind>, singular; the list form is what accumulating
+# removals requires, and one string keeps the injected function's arity at the
+# two arguments the design names.
+#
+# The tier-7 driver's implementation of it re-runs the same seed against a
+# freshly built cluster. That is stated in the output rather than assumed
+# away: a reproduction is a strong signal, a non-reproduction is a weak one,
+# because the second run's cluster is not the first run's cluster.
+#
+# TRACE FILE FORMAT
+#
+# format: <trace>   <step> <kind> [args...]
+#     One line per event, whitespace-separated, <step> counting from 1 and
+#     increasing. Written as the run happens (DESIGN §2) so that a failing
+#     run's trace is data even if the process dies. Blank lines and lines
+#     beginning with '#' (the '# seed <n>' announcement) are ignored here.
+#
+# shellcheck shell=sh
+# shellcheck disable=SC3043
+#   'local' is not in POSIX sh but is implemented by FreeBSD /bin/sh (sh(1),
+#   "local"); seance targets FreeBSD sh and nothing else (handoff §5).
+
+SHRINK_STEPS=0
+SHRINK_SKIP=""
+
+# shrink_diag <message...>
+shrink_diag()
+{
+    printf '# shrink: %s\n' "$*" >&2
+}
+
+# shrink_say <message...> -- shrinking's report, on stdout, as data.
+shrink_say()
+{
+    printf 'shrink: %s\n' "$*"
+}
+
+# shrink_steps <trace-file> -- how many events the trace holds.
+shrink_steps()
+{
+    awk '/^[ \t]*#/ { next } NF > 0 { n++ } END { print n + 0 }' "$1"
+}
+
+# shrink_kinds <trace-file> <steps> [<skip-kinds>] -- the distinct event kinds
+# in the first <steps> events, in first-appearance order, minus any already
+# skipped.
+#
+# Bounded by <steps> because kind removal runs *after* prefix bisection: a kind
+# that only appears past the failing prefix is not in the trace being reduced,
+# and reporting it as "removed" would credit the shrinker with a reduction it
+# did not make.
+#
+# First-appearance order rather than sorted: the reduction is reported to a
+# person, and "the first kind that turned out not to matter" reads better in
+# the order the run met them.
+shrink_kinds()
+{
+    awk -v want="$2" -v skip="${3:-}" '
+        BEGIN {
+            n = split(skip, s, ",")
+            for (i = 1; i <= n; i++)
+                if (s[i] != "")
+                    dropped[s[i]] = 1
+        }
+        /^[ \t]*#/ { next }
+        NF > 0 {
+            step++
+            if (step > want)
+                next
+            if (NF > 1 && !($2 in dropped) && !($2 in seen)) {
+                seen[$2] = 1
+                order[++k] = $2
+            }
+        }
+        END { for (i = 1; i <= k; i++) print order[i] }
+    ' "$1"
+}
+
+# shrink_trace <trace-file> <steps> <skip-kinds> -- the reduced trace.
+shrink_trace()
+{
+    awk -v want="$2" -v skip="${3:-}" '
+        BEGIN {
+            n = split(skip, s, ",")
+            for (i = 1; i <= n; i++)
+                if (s[i] != "")
+                    dropped[s[i]] = 1
+        }
+        /^[ \t]*#/ { next }
+        NF > 0 {
+            step++
+            if (step > want)
+                next
+            if (NF > 1 && ($2 in dropped))
+                next
+            print
+        }
+    ' "$1"
+}
+
+# shrink_add_skip <comma-list> <kind> -- the list with the kind appended.
+shrink_add_skip()
+{
+    if [ -z "$1" ]; then
+        printf '%s\n' "$2"
+    else
+        printf '%s,%s\n' "$1" "$2"
+    fi
+}
+
+# shrink_bisect <total-steps> -- the smallest k in [1, total] for which
+# shrink_rerun k "" still fails; prints it, or prints nothing and returns 1 if
+# no prefix fails.
+#
+# A true binary search rather than DESIGN §8's "k halving down": it finds the
+# same prefix or a shorter one, for the same number of reruns, and reruns are
+# the expensive thing here. It assumes the failure is monotone in prefix
+# length -- if k fails, every longer prefix fails. Where that does not hold
+# (a defect a later event papers over) the answer is still a genuinely failing
+# prefix, just not provably the shortest, which is said in the output.
+shrink_bisect()
+{
+    local _total _lo _hi _mid _best
+
+    _total=$1
+    _lo=1
+    _hi=${_total}
+    _best=""
+
+    while [ "${_lo}" -le "${_hi}" ]; do
+        _mid=$(( (_lo + _hi) / 2 ))
+        shrink_diag "trying prefix of ${_mid} step(s)"
+        if shrink_rerun "${_mid}" ""; then
+            _lo=$(( _mid + 1 ))
+        else
+            _best=${_mid}
+            _hi=$(( _mid - 1 ))
+        fi
+    done
+
+    if [ -z "${_best}" ]; then
+        return 1
+    fi
+
+    printf '%s\n' "${_best}"
+}
+
+# shrink_run <trace-file>
+shrink_run()
+{
+    local _trace _total _steps _skip _kinds _k _try
+
+    _trace=$1
+    SHRINK_STEPS=0
+    SHRINK_SKIP=""
+
+    if ! command -v shrink_rerun > /dev/null 2>&1; then
+        shrink_diag "no shrink_rerun function is defined; nothing can be rerun"
+        return 2
+    fi
+
+    if [ ! -f "${_trace}" ]; then
+        shrink_diag "no such trace file: ${_trace}"
+        return 2
+    fi
+
+    _total=$( shrink_steps "${_trace}" )
+    if [ "${_total}" -lt 1 ]; then
+        shrink_diag "trace holds no events: ${_trace}"
+        return 2
+    fi
+
+    shrink_say "reruns land on a freshly built cluster, so a reproduction is a"
+    shrink_say "strong signal and a failure to reproduce is a weak one."
+
+    # Reproduce first. A shrinker that starts bisecting without confirming the
+    # failure will happily report a one-step "minimal" trace for a run that
+    # was never failing in the first place.
+    if shrink_rerun "${_total}" ""; then
+        shrink_say "did not reproduce: the full ${_total}-step trace passed on rerun"
+        return 1
+    fi
+
+    _steps=$( shrink_bisect "${_total}" ) || {
+        shrink_say "did not reduce: no prefix of the trace failed on its own,"
+        shrink_say "which contradicts the full trace failing -- the failure is"
+        shrink_say "not monotone in prefix length"
+        _steps=${_total}
+    }
+
+    shrink_say "prefix: ${_total} step(s) -> ${_steps}"
+
+    _skip=""
+    _kinds=$( shrink_kinds "${_trace}" "${_steps}" "" )
+
+    # shellcheck disable=SC2086
+    #   Deliberate word splitting: the kinds are a newline-separated list.
+    for _k in ${_kinds}; do
+        _try=$( shrink_add_skip "${_skip}" "${_k}" )
+        shrink_diag "trying without ${_k} (skip=${_try})"
+        if shrink_rerun "${_steps}" "${_try}"; then
+            shrink_say "kind ${_k}: involved (removing it makes the failure go away)"
+        else
+            _skip=${_try}
+            shrink_say "kind ${_k}: not involved, removed"
+        fi
+    done
+
+    # shellcheck disable=SC2034
+    #   Not unused: SHRINK_STEPS and SHRINK_SKIP are this file's documented
+    #   answer, read by the caller after shrink_run returns. A sourced
+    #   library's exports look unused from inside the library.
+    SHRINK_STEPS=${_steps}
+    # shellcheck disable=SC2034
+    #   As above.
+    SHRINK_SKIP=${_skip}
+
+    if [ -n "${_skip}" ]; then
+        shrink_say "removed kinds: ${_skip}"
+    else
+        shrink_say "removed kinds: none"
+    fi
+
+    shrink_say "reduced trace (${_steps} step(s)):"
+    shrink_trace "${_trace}" "${_steps}" "${_skip}"
+
+    return 0
+}

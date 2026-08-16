@@ -1,0 +1,241 @@
+# seance tier 7 -- the seeded generator.
+#
+# Quasi-nondeterminism (methodology §11, DESIGN.md §2): the event sequence
+# looks random and is reproducible exactly from a seed. Everything that must
+# vary between runs but not between replays -- the cluster instance tag,
+# temporary directory names -- is drawn *outside* this stream, from mktemp and
+# the clock, never from here.
+#
+#     gen_seed <n>                  seed the stream (32-bit, non-zero)
+#     gen_announce                  print '# seed <n>' -- the first line of a run
+#     gen_next                      print the next 32-bit value
+#     gen_below <n>                 print the next value reduced to [0, n)
+#     gen_choose <list>             print one word of a space-separated list
+#     gen_pick_weighted "<spec>"    print one kind from "kind:weight ..."
+#
+# Every one of them also assigns a global (GEN_VALUE, GEN_CHOICE, GEN_PICK):
+# printing is the documented interface, but a command substitution forks, and
+# the weight test draws ten thousand times. Callers in a hot loop read the
+# global; callers that want to read use the printed value.
+#
+# The PRNG is xorshift32 (Marsaglia 2003, the 13/17/5 triple), which is what
+# fits: FreeBSD /bin/sh does arithmetic in 64-bit intmax_t and supports the
+# full set of C bit operators, so a 32-bit xorshift needs one mask per left
+# shift and nothing else. It is not cryptographic and does not need to be --
+# what is required of it is that the same seed gives the same sequence on the
+# workstation and in the guest, and that different seeds give different ones.
+#
+# shellcheck shell=sh
+# shellcheck disable=SC3043
+#   'local' is not in POSIX sh but is implemented by FreeBSD /bin/sh (sh(1),
+#   "local"); seance targets FreeBSD sh and nothing else (handoff §5).
+
+GEN_MASK=4294967295
+
+# The state a zero seed is replaced by. xorshift32 has a fixed point at zero:
+# seeded with it, every value it will ever produce is zero, and a run would
+# look perfectly deterministic while exercising exactly one event kind. The
+# substitute is Marsaglia's own published starting state.
+GEN_ZERO_SUBSTITUTE=2463534242
+
+GEN_SEED=""
+GEN_STATE=""
+GEN_VALUE=0
+GEN_CHOICE=""
+GEN_PICK=""
+
+# gen_diag <message...>
+gen_diag()
+{
+    printf '# gen: %s\n' "$*" >&2
+}
+
+# gen_seed <n> -- seed the stream. <n> is any non-negative integer; it is
+# masked to 32 bits, and zero (or a multiple of 2^32) becomes the substitute.
+# The seed *as given* is what gen_announce prints and what SEANCE_SEED must be
+# set to for a replay, so it is remembered unmasked.
+gen_seed()
+{
+    local _n
+
+    if [ $# -ne 1 ]; then
+        gen_diag "gen_seed needs exactly one argument"
+        return 2
+    fi
+
+    _n=$1
+
+    case "${_n}" in
+        ''|*[!0-9]*)
+            gen_diag "seed is not a non-negative whole number: [${_n}]"
+            return 2
+            ;;
+    esac
+
+    GEN_SEED=${_n}
+    GEN_STATE=$(( _n & GEN_MASK ))
+    [ "${GEN_STATE}" -eq 0 ] && GEN_STATE=${GEN_ZERO_SUBSTITUTE}
+
+    return 0
+}
+
+# gen_announce -- the run's first line, per DESIGN §2: '# seed <n>'.
+#
+# Refuses rather than inventing a seed: a run that announces a seed it is not
+# using is worse than one that announces none, because the trace it prints
+# then cannot be replayed and nobody finds out until they try.
+gen_announce()
+{
+    if [ -z "${GEN_SEED}" ]; then
+        gen_diag "gen_announce called before gen_seed"
+        return 2
+    fi
+
+    printf '# seed %s\n' "${GEN_SEED}"
+}
+
+# gen_next -- the next 32-bit value, in [1, 2^32-1]. Also sets GEN_VALUE.
+gen_next()
+{
+    if [ -z "${GEN_STATE}" ]; then
+        gen_diag "gen_next called before gen_seed"
+        return 2
+    fi
+
+    GEN_STATE=$(( (GEN_STATE ^ (GEN_STATE << 13)) & GEN_MASK ))
+    GEN_STATE=$(( GEN_STATE ^ (GEN_STATE >> 17) ))
+    GEN_STATE=$(( (GEN_STATE ^ (GEN_STATE << 5)) & GEN_MASK ))
+
+    GEN_VALUE=${GEN_STATE}
+    printf '%s\n' "${GEN_VALUE}"
+}
+
+# gen_below <n> -- the next value reduced to [0, n). Also sets GEN_VALUE.
+#
+# Plain modulo. The bias is 2^32 mod n out of 2^32: for the largest n this
+# tier ever uses -- the sum of the event weights, under a hundred -- it is
+# below one part in forty million, which is four orders of magnitude under the
+# tolerance the weight test asserts. Rejection sampling would cost a variable
+# number of draws per event and make a trace's position in the stream depend
+# on the weights, which is a worse property than a bias nobody can measure.
+gen_below()
+{
+    local _n
+
+    _n=$1
+
+    case "${_n}" in
+        ''|*[!0-9]*)
+            gen_diag "gen_below needs a whole number, got [${_n}]"
+            return 2
+            ;;
+    esac
+
+    if [ "${_n}" -lt 1 ]; then
+        gen_diag "gen_below needs a positive bound, got [${_n}]"
+        return 2
+    fi
+
+    gen_next > /dev/null || return 2
+
+    GEN_VALUE=$(( GEN_VALUE % _n ))
+    printf '%s\n' "${GEN_VALUE}"
+}
+
+# gen_choose <word> [word...] -- one word, uniformly. Also sets GEN_CHOICE.
+#
+# The list is taken as separate arguments so that the caller decides how it
+# splits; 'gen_choose ${nodes}' is the usual form.
+gen_choose()
+{
+    local _i _n _w
+
+    if [ $# -lt 1 ]; then
+        gen_diag "gen_choose needs at least one word"
+        return 2
+    fi
+
+    _n=$#
+    gen_below "${_n}" > /dev/null || return 2
+
+    _i=0
+    for _w in "$@"; do
+        if [ "${_i}" -eq "${GEN_VALUE}" ]; then
+            GEN_CHOICE=${_w}
+            printf '%s\n' "${GEN_CHOICE}"
+            return 0
+        fi
+        _i=$(( _i + 1 ))
+    done
+
+    gen_diag "gen_choose fell off the end of a ${_n}-word list"
+    return 2
+}
+
+# gen_pick_weighted "<kind:weight> [<kind:weight> ...]" -- one kind, with
+# probability weight/total. Also sets GEN_PICK.
+#
+# The spec is one argument holding the whole table because the caller builds
+# it by filtering the full table down to the kinds that are *currently
+# applicable* (DESIGN §4: no heal with nothing isolated). Filtering the spec
+# rather than re-drawing until an applicable kind appears is what keeps the
+# stream aligned: the number of draws per event does not depend on the state.
+#
+# A weight of 0 is allowed and means "never" -- it is how a driver removes a
+# kind without changing the shape of the table. A total of 0 is a contract
+# error: there is nothing to pick.
+gen_pick_weighted()
+{
+    local _spec _e _kind _w _total _r _acc
+
+    if [ $# -ne 1 ]; then
+        gen_diag "gen_pick_weighted needs exactly one argument (the spec)"
+        return 2
+    fi
+
+    _spec=$1
+    _total=0
+
+    # shellcheck disable=SC2086
+    #   Deliberate word splitting: the spec is a whitespace-separated table.
+    for _e in ${_spec}; do
+        _kind=${_e%%:*}
+        _w=${_e#*:}
+        if [ "${_kind}" = "${_e}" ] || [ -z "${_kind}" ]; then
+            gen_diag "spec entry is not kind:weight: [${_e}]"
+            return 2
+        fi
+        case "${_w}" in
+            ''|*[!0-9]*)
+                gen_diag "weight is not a whole number: [${_e}]"
+                return 2
+                ;;
+        esac
+        _total=$(( _total + _w ))
+    done
+
+    if [ "${_total}" -lt 1 ]; then
+        gen_diag "spec has no weight to draw from: [${_spec}]"
+        return 2
+    fi
+
+    gen_below "${_total}" > /dev/null || return 2
+    _r=${GEN_VALUE}
+
+    _acc=0
+    # shellcheck disable=SC2086
+    #   Deliberate word splitting over the same table.
+    for _e in ${_spec}; do
+        _kind=${_e%%:*}
+        _w=${_e#*:}
+        _acc=$(( _acc + _w ))
+        if [ "${_r}" -lt "${_acc}" ]; then
+            GEN_PICK=${_kind}
+            printf '%s\n' "${GEN_PICK}"
+            return 0
+        fi
+    done
+
+    gen_diag "gen_pick_weighted fell off the end of [${_spec}] with r=${_r}"
+    return 2
+}

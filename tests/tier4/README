@@ -9,3 +9,10 @@ TESTING.md §5.
 Empty at M0: there is no ladder yet (M2) and no policy (M1).
 
 Files named t_*.sh are tests; anything else here is ignored.
+
+Since M3 this tier also holds t_sim_oracle_selftest.sh: tier 7's invariants
+and cheap oracle fed hand-built broken states, with every invariant required
+to be seen firing (TESTING.md §7, tests/cluster/sim/DESIGN.md §7). It is here
+rather than in tests/cluster/sim/ so that 'sh tools/lint.sh' runs it on the
+workstation on every pass -- an oracle checked once per reaper session is an
+oracle nobody checks (D-56).
