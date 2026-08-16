@@ -1,0 +1,12 @@
+--- a/lib/repl.subr	2026-08-16 09:33:41.680493000 -0400
++++ b/lib/repl.subr	2026-08-16 09:33:41.720988000 -0400
+@@ -813,8 +813,7 @@
+         #    "destination ... contains partially-complete state from
+         #    zfs receive -s" (observed) -- so this is not an optimisation but
+         #    the only way forward.
+-        _tok=$( awk -F "${REPL_TAB}" -v d="${_rds}" \
+-            '$1 == "T" && $2 == d { print $3; exit }' "${_probe}" )
++        _tok=""
+         if [ -n "${_tok}" ]; then
+             seance_log notice "repl ${_guest}->${_peer}: resuming an interrupted receive of ${_rds}"
+             if repl_pipe "${_rcf}" "${_to}" "${_addr}" "$( repl_recv_cmd "${_rds}" )" \

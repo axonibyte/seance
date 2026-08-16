@@ -33,6 +33,20 @@ ${H3_COLOR}Description${N0_COLOR}:
 ${H3_COLOR}Options${N0_COLOR}:
 
  ${N2_COLOR}mode=${N0_COLOR} - verb to run. The verb may also be given bare. Verbs:
+   repl    - one replication tick: snapshot the guests, finish any
+             interrupted receive, send the increment to each heir, prune
+             both ends, record the lag. This is the crontab target;
+             '--now' ignores the per-guest cadence, '--guest' and '--peer'
+             narrow it, '--dry-run' says what it would send and sends
+             nothing;
+   status  - the one screen: every guest, where it runs, how fresh its
+             replica is on each heir, and whether the mesh still agrees
+             about the configuration. '--tsv' for the machine-readable
+             form. The exit code is the fleet's health;
+   verify  - render the configuration seance expects and diff it against
+             reality: the mesh matrix, the clock delta, one config file
+             everywhere, the standby parents, the crontab line.
+             'verify --render cron' prints that line. verify NEVER writes;
    config  - print the effective configuration and its verdict;
              'config --check' validates and lists every problem;
    version - print the seance version;
@@ -44,11 +58,19 @@ ${H3_COLOR}Options${N0_COLOR}:
 
  The configuration file is \${SEANCE_CONF} if set, otherwise
  \${workdir}/etc/seance.conf; 'config --file <path>' overrides both.
+ State lives in \${workdir}/var/db/seance and locks in
+ \${workdir}/var/run/seance, both overridable with \${SEANCE_STATE_DIR}
+ and \${SEANCE_RUN_DIR}.
 
 ${H3_COLOR}Examples${N0_COLOR}:
 
  # cbsd seance version
  # cbsd seance mode=version
+ # cbsd seance status
+ # cbsd seance repl --now
+ # cbsd seance repl --guest web01 --dry-run
+ # cbsd seance verify
+ # cbsd seance verify --render cron
  # cbsd seance config
  # cbsd seance config --check
  # cbsd seance config --file /path/to/seance.conf

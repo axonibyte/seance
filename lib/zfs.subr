@@ -1,0 +1,121 @@
+# seance -- thin wrappers around zfs(8).
+#
+# Sourced, never executed. Every function here is one zfs invocation with its
+# arguments named, and nothing else: no policy, no parsing beyond what zfs's
+# own -H output already is, no decisions. The value is that every zfs command
+# seance runs locally is written down in one file, so the answer to "what does
+# seance do to my pool" is a single read.
+#
+# ZFS is deliberately NOT behind the CBSD adapter. The adapter's seam exists
+# because CBSD's invocation conventions change (design §2); replication is
+# seance's own layer and ZFS is its substrate, not a foreign system it must be
+# insulated from. The tier-3 seam guard forbids cbsd/jls/jexec/bhyvectl outside
+# the adapter and says nothing about zfs, for exactly this reason.
+#
+# Contract: stdout is data, stderr is diagnostics, rc is zfs's own -- 0 ok,
+# non-zero failed. Nothing here swallows stderr; a caller that wants a quiet
+# probe says so at the call site, and only for probes.
+#
+# shellcheck shell=sh
+# shellcheck disable=SC3043
+#   'local' is not in POSIX sh but is implemented by FreeBSD /bin/sh (sh(1),
+#   "local"); seance targets FreeBSD sh and nothing else (handoff §5).
+
+# zfs_exists <dataset>  -- rc 0 if the dataset exists. Quiet: it is a probe,
+# and "it is not there" is the answer, not a diagnostic.
+zfs_exists()
+{
+    zfs list -H -o name "${1:?}" > /dev/null 2>&1
+}
+
+# zfs_datasets_r <dataset>  -- every filesystem and volume at or under
+# <dataset>, one per line, parents before children (zfs list's own order).
+zfs_datasets_r()
+{
+    zfs list -H -o name -t filesystem,volume -r "${1:?}"
+}
+
+# zfs_snapshots_r <dataset>  -- every snapshot at or under <dataset>, one
+# "<dataset>@<name>" per line.
+zfs_snapshots_r()
+{
+    zfs list -H -o name -t snapshot -r "${1:?}"
+}
+
+# zfs_snapshot_r <dataset> <shortname>
+#
+# One atomic recursive snapshot of the dataset tree. Atomicity is the reason
+# replication takes a tree at a time rather than a dataset at a time: a guest
+# whose root and whose child were snapshotted a second apart is a guest whose
+# replica is not a point in time.
+zfs_snapshot_r()
+{
+    zfs snapshot -r "${1:?}@${2:?}"
+}
+
+# zfs_destroy_snapshot <dataset> <shortname>
+#
+# Destroy exactly one snapshot of exactly one dataset. Not -r, not -R, no
+# ranges: every destroy seance performs names a single snapshot it has already
+# decided about.
+zfs_destroy_snapshot()
+{
+    zfs destroy "${1:?}@${2:?}"
+}
+
+# zfs_get <property> <dataset>  -- the property's effective value.
+zfs_get()
+{
+    zfs get -H -o value "${1:?}" "${2:?}"
+}
+
+# zfs_get_source <property> <dataset>  -- "<value><TAB><source>", which is the
+# pair the shadow-mount law is stated in: 'none' is only half the answer, and
+# 'none local' on a replica means somebody set it there.
+zfs_get_source()
+{
+    zfs get -H -o value,source "${1:?}" "${2:?}"
+}
+
+# zfs_set <property=value> <dataset>
+zfs_set()
+{
+    zfs set "${1:?}" "${2:?}"
+}
+
+# zfs_inherit <property> <dataset>  -- drop a local property and take the
+# parent's answer again. Used to repair a replica whose mountpoint was set.
+zfs_inherit()
+{
+    zfs inherit "${1:?}" "${2:?}"
+}
+
+# zfs_create_hidden <dataset>
+#
+# Create a dataset that can never mount by accident: mountpoint=none and
+# canmount=noauto, set locally at creation. This is the standby-parent
+# ceremony from the shadow-mount era (design §4) and it is a create, not a
+# create-then-set, so there is no instant in which the dataset exists with an
+# inherited mountpoint.
+zfs_create_hidden()
+{
+    zfs create -o canmount=noauto -o mountpoint=none "${1:?}"
+}
+
+# zfs_resume_token <dataset>
+#
+# Print the dataset's receive_resume_token, or nothing when there is none.
+# A dataset that does not exist has no token and is not an error here: the
+# caller is asking "is there an interrupted receive to finish", and "there is
+# no dataset yet" is a perfectly good no.
+zfs_resume_token()
+{
+    local _t
+
+    _t=$( zfs get -H -o value receive_resume_token "${1:?}" 2>/dev/null ) ||
+        return 0
+
+    [ "${_t}" = "-" ] && return 0
+
+    printf '%s\n' "${_t}"
+}

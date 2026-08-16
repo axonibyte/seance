@@ -1,0 +1,1205 @@
+# seance -- layer 1: replication.
+#
+# Sourced, never executed. One tick of `seance repl` is, per guest, per peer:
+#
+#   1. one atomic recursive snapshot of the guest's dataset tree;
+#   2. finish any interrupted receive on the peer, from its resume token;
+#   3. send each dataset incrementally from the newest snapshot the two ends
+#      have in common, or in full when they have none;
+#   4. hold the shadow-mount law on every replica dataset;
+#   5. prune both ends by the same retention ladder, protecting the base;
+#   6. write the lag record `status` reads.
+#
+# The exact command lines, and the evidence behind each of them, are in
+# docs/repl-wire.md. The contract this file keeps:
+#
+#   # contract: local snapshot   zfs snapshot -r <root>@seance-<selfkey>-<ts>
+#   # contract: send (full)      zfs send -p <ds>@<new>
+#   # contract: send (incr)      zfs send -p -I @<base> <ds>@<new>
+#   # contract: send (resume)    zfs send -t <token>
+#   # contract: receive          zfs recv -s -u -x mountpoint -x canmount <rds>
+#   # contract: replica law      mountpoint never local/received on a replica,
+#   #                            canmount=noauto, enforced every tick
+#   # contract: standby parents  canmount=noauto mountpoint=none, asserted
+#   #                            every tick and repaired if drifted
+#   # contract: replica path     <standby_root>/<homekey>/<basename of root>
+#   #                            plus each dataset's tail below that root
+#   # contract: lag record       "<replica_ts|-> <tick_epoch> <rc>", one file
+#   #                            per guest per peer under <state>/lag/
+#
+# -p rather than -R: -R sends the whole tree as one replication stream, and an
+# incremental replication stream is only receivable in practice with -F, which
+# "destroy[s] snapshots and file systems that do not exist on the sending side"
+# (zfs-receive(8)). seance may not hold that weapon: another tool's snapshot on
+# a replica is not seance's to destroy, and neither is a dataset seance did not
+# create. So the tree is walked one dataset at a time -- the adapter already
+# promises the list, root first -- and each dataset carries its own properties
+# (-p) and its own resume token.
+#
+# Sending properties is not decoration. A guest's dataset carries a LOCAL
+# mountpoint (CBSD sets one at creation, sudoexec/mkdatadir:14-23), -p puts it
+# in the stream, and a receive without -x mountpoint plants it on the replica:
+# a second dataset claiming the live guest's mountpoint. That is the August
+# defect verbatim, which is why -x mountpoint is load-bearing here and not
+# belt-and-braces. Observed both ways in the guest; see docs/repl-wire.md.
+#
+# shellcheck shell=sh
+# shellcheck disable=SC3043
+#   'local' is not in POSIX sh but is implemented by FreeBSD /bin/sh (sh(1),
+#   "local"); seance targets FreeBSD sh and nothing else (handoff §5).
+
+# The floor on how long one stream may take. A send is bounded by the guest's
+# cadence -- it has to finish before the next tick fires, and if it does not,
+# killing it is right, because the receive is resumable and the next tick
+# continues from the token instead of starting again. The floor stops a
+# five-minute cadence from guillotining a first full send that was never going
+# to fit inside one.
+REPL_STREAM_TIMEOUT_MIN=1800
+
+# lockf(1) exits EX_TEMPFAIL when -t 0 could not take the lock (sysexits(3):
+# EX_TEMPFAIL is 75; observed to be exactly this in the guest). It is the one
+# status meaning "another tick owns this pair" rather than "this pair failed".
+REPL_RC_LOCKED=75
+
+# The characters a dataset name may contain before seance will interpolate it
+# into a command string for a peer's shell. ZFS permits alphanumerics and
+# [-_.:/ ]; seance refuses the space, and everything outside this set, rather
+# than quoting its way around it.
+REPL_DS_SAFE='abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.:/-'
+
+REPL_TAB=$( printf '\t.' )
+REPL_TAB=${REPL_TAB%.}
+
+# ---------------------------------------------------------------------------
+# Paths and node facts
+#
+# RELOCATION NOTE: seance_state_dir, seance_run_dir, seance_self_key and
+# seance_peer_addr are not replication concepts -- status and verify use them
+# too. They live here because lib/common.subr belonged to another unit while
+# this one was written. The state and run directories belong in common.subr
+# beside the other path discipline; the two key lookups belong beside
+# conf_self_key. Moving them is a cut, a paste and a re-source.
+# ---------------------------------------------------------------------------
+
+# seance_state_dir  -- where seance keeps what it must remember across ticks.
+#
+# $SEANCE_STATE_DIR wins (D-3: it is how the tiers and the pseudo-cluster point
+# seance at a directory of their own), then CBSD's workdir. rc 1 when neither
+# is available: guessing is how a node ends up writing its lag records
+# somewhere nobody looks.
+seance_state_dir()
+{
+    if [ -n "${SEANCE_STATE_DIR:-}" ]; then
+        printf '%s\n' "${SEANCE_STATE_DIR}"
+        return 0
+    fi
+
+    if [ -n "${SEANCE_CBSD_WORKDIR:-}" ]; then
+        printf '%s/var/db/seance\n' "${SEANCE_CBSD_WORKDIR}"
+        return 0
+    fi
+
+    return 1
+}
+
+# seance_run_dir  -- where seance keeps what dies with the boot: the locks.
+seance_run_dir()
+{
+    if [ -n "${SEANCE_RUN_DIR:-}" ]; then
+        printf '%s\n' "${SEANCE_RUN_DIR}"
+        return 0
+    fi
+
+    if [ -n "${SEANCE_CBSD_WORKDIR:-}" ]; then
+        printf '%s/var/run/seance\n' "${SEANCE_CBSD_WORKDIR}"
+        return 0
+    fi
+
+    return 1
+}
+
+# seance_self_key  -- this node's config key, from the adapter's node name.
+#
+# rc 1 when no node block claims this host: a hard failure everywhere it is
+# asked (D-4), because a node that cannot find itself cannot name its own
+# snapshots, and a snapshot nobody can attribute is not a wire protocol.
+seance_self_key()
+{
+    local _nn
+
+    _nn=$( adapter_node_self ) || return 1
+    [ -n "${_nn}" ] || return 1
+
+    conf_self_key "${_nn}"
+}
+
+# seance_peer_addr <nodekey>  -- the address peers reach that node on.
+seance_peer_addr()
+{
+    local _a
+
+    _a=$( conf_get "node_${1:?}_mgmt" "" )
+    [ -n "${_a}" ] || return 1
+
+    printf '%s\n' "${_a}"
+}
+
+# repl_ds_safe <name>  -- rc 0 if the name may be interpolated into a command
+# string destined for a peer's shell.
+repl_ds_safe()
+{
+    case "${1:-}" in
+        '') return 1 ;;
+        *[!$REPL_DS_SAFE]*) return 1 ;;
+    esac
+
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# Where a replica lives
+# ---------------------------------------------------------------------------
+
+# repl_standby_root <peer-nodekey>
+#
+# The dataset under which <peer> keeps other nodes' replicas.
+#
+# The configured value is used verbatim, except that the token %n is replaced
+# by the node key of the node that OWNS that standby root -- the peer. A fleet
+# whose nodes have identical pool layouts writes `standby_root=<pool>/standby`
+# and never meets %n; a fleet whose nodes do not (different pool names, or a
+# per-node subtree, as the pseudo-cluster has) writes
+# `standby_root=tank/state/seance/%n/standby` and still keeps ONE configuration
+# file across the mesh -- which is the invariant `verify` enforces and which a
+# per-node value would break. (Decision D-59.)
+#
+# rc 1 when the key is unset; the caller then derives.
+repl_standby_root()
+{
+    local _peer _v _out _rest
+
+    _peer=${1:?}
+
+    _v=$( conf_get standby_root "" )
+    [ -n "${_v}" ] || return 1
+
+    _out=""
+    _rest=${_v}
+    while :; do
+        case "${_rest}" in
+            *%n*)
+                _out="${_out}${_rest%%\%n*}${_peer}"
+                _rest=${_rest#*%n}
+                ;;
+            *)
+                _out="${_out}${_rest}"
+                break
+                ;;
+        esac
+    done
+
+    printf '%s\n' "${_out}"
+}
+
+# repl_standby_root_derived <guest-root-dataset>
+#
+# The fallback when standby_root is unset: the guest root's parent, plus
+# /standby -- which on CBSD is <pool>/standby, because a CBSD guest's dataset
+# is <pool>/<jname> (D-6). A derivation can only speak for THIS node's layout,
+# so a fleet that is not uniform must set the key; that is documented rather
+# than guessed at.
+repl_standby_root_derived()
+{
+    local _root
+
+    _root=${1:?}
+
+    case "${_root}" in
+        */*) ;;
+        *) return 1 ;;
+    esac
+
+    printf '%s/standby\n' "${_root%/*}"
+}
+
+# repl_replica_root <standby-root> <homekey> <guest-root-dataset>
+repl_replica_root()
+{
+    printf '%s/%s/%s\n' "${1:?}" "${2:?}" "${3##*/}"
+}
+
+# ---------------------------------------------------------------------------
+# Lag records and locks
+# ---------------------------------------------------------------------------
+
+# repl_lag_file <guest> <peerkey>
+#
+# One file per pair, named "<guest>.<peer>". Peer keys are [a-z0-9]+ and cannot
+# contain a dot, so the name still parses from the right when the guest's own
+# name contains one -- which a CBSD jail name may.
+repl_lag_file()
+{
+    local _d
+
+    _d=$( seance_state_dir ) || return 1
+    printf '%s/lag/%s.%s\n' "${_d}" "${1:?}" "${2:?}"
+}
+
+# repl_lag_write <guest> <peerkey> <replica_ts|-> <tick_epoch> <rc>
+repl_lag_write()
+{
+    local _f
+
+    _f=$( repl_lag_file "$1" "$2" ) || return 1
+
+    mkdir -p "${_f%/*}" || return 1
+    printf '%s %s %s\n' "$3" "$4" "$5" > "${_f}"
+}
+
+# repl_lag_read <guest> <peerkey>
+#
+# Print the record, or nothing (rc 1) when the pair has never ticked. This
+# record is the whole of what `status` knows about a peer: status never asks
+# the peers themselves (design §5), so a dead peer cannot make status hang.
+repl_lag_read()
+{
+    local _f _line
+
+    _f=$( repl_lag_file "$1" "$2" ) || return 1
+    [ -r "${_f}" ] || return 1
+
+    _line=""
+    read -r _line < "${_f}"
+    [ -n "${_line}" ] || return 1
+
+    printf '%s\n' "${_line}"
+}
+
+# repl_lag_fail <guest> <peerkey> <tick_epoch> <rc>
+#
+# Record a failed tick WITHOUT losing what the peer was last known to have.
+#
+# A pair that fails early -- an unreachable peer, an adapter that would not
+# answer -- must still move its record on, or `status` goes on reporting the
+# last successful tick and exits 0 while replication is broken. Keeping the
+# previous timestamp is not optimism: it is still the newest snapshot the peer
+# is known to hold, and its age keeps growing until pol_is_stale calls it, which
+# is exactly the escalation the staleness threshold is for. The rc field is what
+# makes the failure itself visible in the meantime.
+repl_lag_fail()
+{
+    local _prev _ts
+
+    _ts="-"
+    if _prev=$( repl_lag_read "$1" "$2" ); then
+        _ts=${_prev%% *}
+    fi
+
+    repl_lag_write "$1" "$2" "${_ts}" "$3" "$4"
+}
+
+# repl_lock_file <guest> <peerkey>
+repl_lock_file()
+{
+    local _d
+
+    _d=$( seance_run_dir ) || return 1
+    printf '%s/lock/%s.%s\n' "${_d}" "${1:?}" "${2:?}"
+}
+
+# repl_lock_held <guest> <peerkey>
+#
+# rc 0 if a tick currently owns this pair. Asked by taking the lock and letting
+# it go again, which is the only honest question: the file exists whether or
+# not anybody holds it, and a stale file would report a replication that
+# finished last Tuesday as "in progress".
+repl_lock_held()
+{
+    local _l _rc
+
+    _l=$( repl_lock_file "$1" "$2" ) || return 1
+    [ -e "${_l}" ] || return 1
+
+    lockf -s -t 0 "${_l}" true < /dev/null
+    _rc=$?
+
+    [ "${_rc}" -eq "${REPL_RC_LOCKED}" ]
+}
+
+# ---------------------------------------------------------------------------
+# Snapshot bookkeeping
+# ---------------------------------------------------------------------------
+
+# repl_ts_of <dataset@short> <homekey>
+#
+# Print the timestamp of a snapshot reference belonging to our lineage; rc 1
+# for anything else. Everything else is left alone forever: another tool's
+# snapshot, and another node's lineage, are both somebody else's to destroy.
+repl_ts_of()
+{
+    local _s _short _p
+
+    _s=$( pol_snap_split "${1:-}" ) || return 1
+    _short=${_s#*"${REPL_TAB}"}
+
+    _p=$( pol_snap_parse "${_short}" ) || return 1
+    [ "${_p%"${REPL_TAB}"*}" = "${2:?}" ] || return 1
+
+    printf '%s\n' "${_p#*"${REPL_TAB}"}"
+}
+
+# repl_ts_for_dataset <listing-file> <dataset> <homekey>
+#
+# Read a snapshot listing (one "<dataset>@<short>" per line, from either end)
+# and print the timestamps that belong to <dataset> and to our lineage.
+repl_ts_for_dataset()
+{
+    local _file _ds _home _line _ts
+
+    _file=$1
+    _ds=$2
+    _home=$3
+
+    [ -r "${_file}" ] || return 0
+
+    while IFS= read -r _line || [ -n "${_line}" ]; do
+        case "${_line}" in
+            "${_ds}@"*) ;;
+            *) continue ;;
+        esac
+        _ts=$( repl_ts_of "${_line}" "${_home}" ) || continue
+        printf '%s\n' "${_ts}"
+    done < "${_file}"
+}
+
+# repl_newest_common <local-ts-file> <remote-ts-file>
+#
+# The newest timestamp present in both lists, or nothing. The base is computed
+# rather than remembered: a base seance recorded and the peer no longer has is
+# a base that produces a stream the peer refuses, and the peer's own snapshot
+# list is the only account of the peer that cannot be out of date.
+repl_newest_common()
+{
+    local _best _ts _cmp
+
+    _best=""
+
+    [ -r "$1" ] || return 0
+    [ -r "$2" ] || return 0
+
+    while IFS= read -r _ts || [ -n "${_ts}" ]; do
+        [ -n "${_ts}" ] || continue
+        grep -q -x -F -- "${_ts}" "$2" || continue
+
+        if [ -z "${_best}" ]; then
+            _best=${_ts}
+            continue
+        fi
+
+        _cmp=$( pol_ts_cmp "${_ts}" "${_best}" ) || continue
+        [ "${_cmp}" = "1" ] && _best=${_ts}
+    done < "$1"
+
+    [ -n "${_best}" ] || return 0
+    printf '%s\n' "${_best}"
+}
+
+# repl_newest <ts-file>  -- the newest timestamp in a list, or nothing.
+repl_newest()
+{
+    local _best _ts _cmp
+
+    _best=""
+    [ -r "$1" ] || return 0
+
+    while IFS= read -r _ts || [ -n "${_ts}" ]; do
+        [ -n "${_ts}" ] || continue
+        if [ -z "${_best}" ]; then
+            _best=${_ts}
+            continue
+        fi
+        _cmp=$( pol_ts_cmp "${_ts}" "${_best}" ) || continue
+        [ "${_cmp}" = "1" ] && _best=${_ts}
+    done < "$1"
+
+    [ -n "${_best}" ] || return 0
+    printf '%s\n' "${_best}"
+}
+
+# ---------------------------------------------------------------------------
+# The peer's half, spoken over ssh
+#
+# Each of these builds ONE command string and hands it to the peer's shell.
+# Dataset names are checked against REPL_DS_SAFE before interpolation and are
+# single-quoted inside the string; a name that would need escaping is refused
+# rather than escaped.
+# ---------------------------------------------------------------------------
+
+# repl_remote_probe <address> <replica-root>
+#
+# The peer's account of the replica subtree, one record per line:
+#
+#   E<TAB><dataset>              the dataset exists
+#   T<TAB><dataset><TAB><token>  it holds an interrupted receive
+#   S<TAB><dataset>@<short>      a snapshot it has
+#
+# One round trip for all three, because a tick that asks a peer three separate
+# questions is a tick that can be half-answered by a peer that dies between
+# them.
+repl_remote_probe()
+{
+    local _addr _root _cmd
+
+    _addr=$1
+    _root=$2
+
+    repl_ds_safe "${_root}" || return 2
+
+    _cmd="root='${_root}'
+if zfs list -H -o name \"\$root\" > /dev/null 2>&1; then
+    zfs list -H -o name -t filesystem,volume -r \"\$root\" | while read -r d; do
+        printf 'E\t%s\n' \"\$d\"
+        t=\$( zfs get -H -o value receive_resume_token \"\$d\" 2>/dev/null )
+        if [ -n \"\$t\" ] && [ \"\$t\" != '-' ]; then
+            printf 'T\t%s\t%s\n' \"\$d\" \"\$t\"
+        fi
+    done
+    zfs list -H -o name -t snapshot -r \"\$root\" | while read -r s; do
+        printf 'S\t%s\n' \"\$s\"
+    done
+fi
+exit 0"
+
+    seance_ssh "${_addr}" "${_cmd}"
+}
+
+# repl_remote_ensure_parent <address> <dataset>
+#
+# Make sure a standby parent exists and is hidden: canmount=noauto,
+# mountpoint=none. Prints one word -- created, ok, or repaired:<what> -- so the
+# caller logs a repair rather than performing one silently. A parent whose
+# mountpoint drifted to a real path is a mounted standby tree waiting to
+# happen, and the point of asserting it every tick is to find that out on the
+# quiet day rather than on the day of the promotion.
+repl_remote_ensure_parent()
+{
+    local _addr _ds _cmd
+
+    _addr=$1
+    _ds=$2
+
+    repl_ds_safe "${_ds}" || return 2
+
+    _cmd="ds='${_ds}'
+if ! zfs list -H -o name \"\$ds\" > /dev/null 2>&1; then
+    zfs create -o canmount=noauto -o mountpoint=none \"\$ds\" || exit 1
+    echo created
+    exit 0
+fi
+fixed=''
+if [ \"\$( zfs get -H -o value mountpoint \"\$ds\" )\" != 'none' ]; then
+    zfs set mountpoint=none \"\$ds\" || exit 1
+    fixed=\"\${fixed}mountpoint,\"
+fi
+if [ \"\$( zfs get -H -o value canmount \"\$ds\" )\" != 'noauto' ]; then
+    zfs set canmount=noauto \"\$ds\" || exit 1
+    fixed=\"\${fixed}canmount,\"
+fi
+if [ -n \"\$fixed\" ]; then
+    echo \"repaired:\${fixed%,}\"
+else
+    echo ok
+fi
+exit 0"
+
+    seance_ssh "${_addr}" "${_cmd}"
+}
+
+# repl_remote_enforce_law <address> <replica-root>
+#
+# The shadow-mount law, held on every dataset of the replica subtree every
+# tick: mountpoint must not be local or received on a replica (a real path
+# there is a mount waiting to happen over live data), and canmount must be
+# noauto.
+#
+# canmount is not an inheritable property, so a received dataset takes the
+# default 'on' whatever its parent says; -x canmount only keeps the SOURCE's
+# value out. Setting it is therefore the enforcement, and the receive flag
+# alone is not -- observed, and stated here rather than assumed anywhere.
+#
+# Two words, and the difference between them is load-bearing:
+#
+#   enforced   the property had never been set here. Expected exactly once per
+#              replica dataset, on the tick that created it, because canmount
+#              cannot be inherited and arrives at its default.
+#   repaired   the property had a value of its own and it was the wrong one.
+#              Something set it: a hand-mount, or a receive that should not
+#              have carried it. Always a warning, never routine -- and a tick
+#              that has to repair a mountpoint it has just received is a tick
+#              whose receive flags are wrong. tests/tier6/t_repl.sh asserts
+#              that a first tick repairs nothing, which is what keeps
+#              -x mountpoint load-bearing rather than merely present.
+#
+# Prints one line per action, and nothing when the law already held.
+repl_remote_enforce_law()
+{
+    local _addr _root _cmd
+
+    _addr=$1
+    _root=$2
+
+    repl_ds_safe "${_root}" || return 2
+
+    _cmd="root='${_root}'
+zfs list -H -o name -t filesystem,volume -r \"\$root\" 2>/dev/null | while read -r d; do
+    src=\$( zfs get -H -o source mountpoint \"\$d\" )
+    if [ \"\$src\" = 'local' ] || [ \"\$src\" = 'received' ]; then
+        zfs inherit mountpoint \"\$d\" || exit 1
+        printf 'repaired mountpoint on %s\n' \"\$d\"
+    fi
+    if [ \"\$( zfs get -H -o value canmount \"\$d\" )\" != 'noauto' ]; then
+        if [ \"\$( zfs get -H -o source canmount \"\$d\" )\" = 'default' ]; then
+            zfs set canmount=noauto \"\$d\" || exit 1
+            printf 'enforced canmount on %s\n' \"\$d\"
+        else
+            zfs set canmount=noauto \"\$d\" || exit 1
+            printf 'repaired canmount on %s\n' \"\$d\"
+        fi
+    fi
+done
+exit 0"
+
+    seance_ssh "${_addr}" "${_cmd}"
+}
+
+# repl_remote_destroy <address> <dataset> <shortname>
+repl_remote_destroy()
+{
+    local _addr _ds _snap
+
+    _addr=$1
+    _ds=$2
+    _snap=$3
+
+    repl_ds_safe "${_ds}" || return 2
+    repl_ds_safe "${_snap}" || return 2
+
+    seance_ssh "${_addr}" "zfs destroy '${_ds}@${_snap}'"
+}
+
+# ---------------------------------------------------------------------------
+# Sending
+# ---------------------------------------------------------------------------
+
+# repl_stream_timeout <guest>
+#
+# A stream gets the guest's cadence, or the floor, whichever is larger.
+repl_stream_timeout()
+{
+    local _c
+
+    _c=$( conf_effective cadence "${1:-}" ) || _c=900
+
+    case "${_c}" in
+        ''|*[!0123456789]*) _c=900 ;;
+    esac
+
+    if [ "${_c}" -lt "${REPL_STREAM_TIMEOUT_MIN}" ]; then
+        printf '%s\n' "${REPL_STREAM_TIMEOUT_MIN}"
+    else
+        printf '%s\n' "${_c}"
+    fi
+}
+
+# repl_recv_cmd <replica-dataset>  -- the receive half, verbatim.
+#
+#   -s  keep a partial receive and its resume token instead of discarding it
+#   -u  do not mount what arrives
+#   -x mountpoint -x canmount   the shadow-mount law
+#
+# There is no -F, and there will not be: -F on a replication stream destroys
+# snapshots and datasets the sender does not have, and seance has no such
+# authority over a peer's pool.
+repl_recv_cmd()
+{
+    printf "zfs recv -s -u -x mountpoint -x canmount '%s'\n" "${1:?}"
+}
+
+# repl_pipe <rcfile> <timeout> <address> <recv-command> -- <send argv...>
+#
+# Run "<send> | ssh <peer> <recv>" with the SENDER's exit status captured to a
+# file, because a pipeline's status is its last command's, and a send that died
+# into a receive that succeeded is precisely the false pass this repository
+# keeps finding (common.subr, the RC-capture pattern).
+#
+# rc 0 only when both halves succeeded.
+repl_pipe()
+{
+    local _rcf _to _addr _recv _argv _rc_recv _rc_send
+
+    _rcf=$1
+    _to=$2
+    _addr=$3
+    _recv=$4
+    shift 4
+    [ "${1:-}" = "--" ] || return 2
+    shift
+
+    _argv=$( seance_ssh_argv "${_addr}" ) || return 2
+
+    # shellcheck disable=SC2086
+    #   Deliberate word splitting: ${_argv} is the ssh program and its options,
+    #   built by the transport, which must reach exec as separate words. The
+    #   remote command follows it as one quoted argument.
+    seance_rc_capture "${_rcf}" seance_run_timeout "${_to}" "$@" |
+        seance_run_timeout "${_to}" ${_argv} "${_recv}"
+    _rc_recv=$?
+
+    _rc_send=$( seance_rc_read "${_rcf}" )
+
+    if [ "${_rc_send}" -eq "${TRANSPORT_RC_TIMEOUT}" ] ||
+       [ "${_rc_recv}" -eq "${TRANSPORT_RC_TIMEOUT}" ]; then
+        seance_log err "repl: a stream outlived its ${_to}s budget and was killed;" \
+            "the next tick resumes it from the peer's receive token"
+    fi
+
+    [ "${_rc_send}" -eq 0 ] || return 1
+    [ "${_rc_recv}" -eq 0 ] || return 1
+
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# One pair: one guest, one peer
+# ---------------------------------------------------------------------------
+
+# repl_pair <guest> <peerkey> <homekey> <now-epoch> <dry-run 0|1>
+#
+# rc 0 ok, 1 the pair failed, 2 a contract error (bad configuration, or an
+# adapter that broke its promise).
+#
+# The caller holds the lock, and the caller has already taken the snapshot:
+# the tick snapshots once per guest before any peer is contacted, so that every
+# peer receives the same instant.
+repl_pair()
+{
+    local _guest _peer _home _now _dry
+    local _addr _root _ds _dslist _tail _rroot _rds _sroot _tmp
+    local _probe _lsnaps _base _newest _tok _rc _to _rcf
+    local _prot _prune _snap _short _res _sent _acked _line
+
+    _guest=$1
+    _peer=$2
+    _home=$3
+    _now=$4
+    _dry=$5
+
+    _addr=$( seance_peer_addr "${_peer}" ) || {
+        seance_log err "repl ${_guest}->${_peer}: no node_${_peer}_mgmt in the configuration"
+        return 2
+    }
+
+    _tmp=$( seance_tmpdir ) || return 2
+
+    # --- the guest's datasets, root first ---------------------------------
+    if ! adapter_guest_datasets "${_guest}" > "${_tmp}/datasets" < /dev/null; then
+        seance_log err "repl ${_guest}->${_peer}: adapter_guest_datasets failed"
+        repl_lag_fail "${_guest}" "${_peer}" "${_now}" 1
+        return 1
+    fi
+    if [ ! -s "${_tmp}/datasets" ]; then
+        seance_log err "repl ${_guest}->${_peer}: the adapter reported no datasets for ${_guest};" \
+            "empty output with a success status is a contract violation"
+        repl_lag_fail "${_guest}" "${_peer}" "${_now}" 2
+        return 2
+    fi
+
+    _root=""
+    read -r _root < "${_tmp}/datasets"
+    repl_ds_safe "${_root}" || {
+        seance_log err "repl ${_guest}->${_peer}: unusable dataset name: ${_root}"
+        repl_lag_fail "${_guest}" "${_peer}" "${_now}" 2
+        return 2
+    }
+
+    _dslist=""
+    while IFS= read -r _ds || [ -n "${_ds}" ]; do
+        [ -n "${_ds}" ] || continue
+        repl_ds_safe "${_ds}" || {
+            seance_log err "repl ${_guest}->${_peer}: unusable dataset name: ${_ds}"
+            return 2
+        }
+        if [ "${_ds}" != "${_root}" ]; then
+            case "${_ds}" in
+                "${_root}/"*) ;;
+                *)
+                    seance_log err "repl ${_guest}->${_peer}: ${_ds} is not under the root ${_root};" \
+                        "the adapter must list one tree, root first"
+                    return 2
+                    ;;
+            esac
+        fi
+        _dslist="${_dslist} ${_ds}"
+    done < "${_tmp}/datasets"
+    _dslist=${_dslist# }
+
+    # --- where the replica lives ------------------------------------------
+    if ! _sroot=$( repl_standby_root "${_peer}" ); then
+        _sroot=$( repl_standby_root_derived "${_root}" ) || {
+            seance_log err "repl ${_guest}->${_peer}: cannot derive a standby root from ${_root};" \
+                "set standby_root in the configuration"
+            return 2
+        }
+    fi
+    _rroot=$( repl_replica_root "${_sroot}" "${_home}" "${_root}" )
+    repl_ds_safe "${_rroot}" || {
+        seance_log err "repl ${_guest}->${_peer}: unusable replica dataset name: ${_rroot}"
+        return 2
+    }
+
+    if [ "${_dry}" -eq 1 ]; then
+        printf 'would replicate %s -> %s:%s\n' "${_root}" "${_peer}" "${_rroot}"
+        return 0
+    fi
+
+    # --- the standby parents, asserted every tick -------------------------
+    for _ds in "${_sroot}" "${_sroot}/${_home}"; do
+        if ! _res=$( repl_remote_ensure_parent "${_addr}" "${_ds}" ); then
+            seance_log err "repl ${_guest}->${_peer}: cannot assert the standby parent ${_ds}"
+            repl_lag_fail "${_guest}" "${_peer}" "${_now}" 1
+            return 1
+        fi
+        case "${_res}" in
+            ok) ;;
+            created)
+                seance_log info "repl ${_peer}: created standby parent ${_ds} (canmount=noauto mountpoint=none)"
+                ;;
+            repaired:*)
+                seance_log warning "repl ${_peer}: standby parent ${_ds} had drifted; repaired ${_res#repaired:}"
+                ;;
+            *)
+                seance_log warning "repl ${_peer}: unexpected answer while asserting ${_ds}: ${_res}"
+                ;;
+        esac
+    done
+
+    # --- what the peer has, and what we have ------------------------------
+    _probe="${_tmp}/probe"
+    if ! repl_remote_probe "${_addr}" "${_rroot}" > "${_probe}"; then
+        seance_log err "repl ${_guest}->${_peer}: the peer did not answer the replica probe"
+        repl_lag_fail "${_guest}" "${_peer}" "${_now}" 1
+        return 1
+    fi
+    awk -F "${REPL_TAB}" '$1 == "S" { print $2 }' "${_probe}" > "${_tmp}/rsnaps"
+
+    _lsnaps="${_tmp}/lsnaps"
+    if ! zfs_snapshots_r "${_root}" > "${_lsnaps}"; then
+        seance_log err "repl ${_guest}->${_peer}: cannot list local snapshots of ${_root}"
+        repl_lag_fail "${_guest}" "${_peer}" "${_now}" 1
+        return 1
+    fi
+
+    _to=$( repl_stream_timeout "${_guest}" )
+    _rcf="${_tmp}/send.rc"
+    _sent=0
+    _rc=0
+
+    for _ds in ${_dslist}; do
+        _tail=${_ds#"${_root}"}
+        _rds="${_rroot}${_tail}"
+
+        # 1. Finish an interrupted receive before starting anything else. A
+        #    dataset holding a resume token refuses every other stream --
+        #    "destination ... contains partially-complete state from
+        #    zfs receive -s" (observed) -- so this is not an optimisation but
+        #    the only way forward.
+        _tok=$( awk -F "${REPL_TAB}" -v d="${_rds}" \
+            '$1 == "T" && $2 == d { print $3; exit }' "${_probe}" )
+        if [ -n "${_tok}" ]; then
+            seance_log notice "repl ${_guest}->${_peer}: resuming an interrupted receive of ${_rds}"
+            if repl_pipe "${_rcf}" "${_to}" "${_addr}" "$( repl_recv_cmd "${_rds}" )" \
+                    -- zfs send -t "${_tok}"; then
+                _sent=$(( _sent + 1 ))
+            else
+                seance_log err "repl ${_guest}->${_peer}: the resumed receive of ${_rds} failed"
+                _rc=1
+                continue
+            fi
+
+            if ! repl_remote_probe "${_addr}" "${_rroot}" > "${_probe}"; then
+                seance_log err "repl ${_guest}->${_peer}: the peer did not answer after the resume"
+                repl_lag_fail "${_guest}" "${_peer}" "${_now}" 1
+                return 1
+            fi
+            awk -F "${REPL_TAB}" '$1 == "S" { print $2 }' "${_probe}" > "${_tmp}/rsnaps"
+        fi
+
+        repl_ts_for_dataset "${_lsnaps}" "${_ds}" "${_home}" > "${_tmp}/lts"
+        repl_ts_for_dataset "${_tmp}/rsnaps" "${_rds}" "${_home}" > "${_tmp}/rts"
+
+        _newest=$( repl_newest "${_tmp}/lts" )
+        if [ -z "${_newest}" ]; then
+            seance_log err "repl ${_guest}->${_peer}: ${_ds} carries no ${POL_SNAP_PREFIX}${_home}-* snapshot to send"
+            _rc=1
+            continue
+        fi
+
+        _base=$( repl_newest_common "${_tmp}/lts" "${_tmp}/rts" )
+        [ "${_base}" = "${_newest}" ] && continue
+
+        _short=$( pol_snap_format "${_home}" "${_newest}" ) || {
+            seance_log err "repl ${_guest}->${_peer}: cannot render a snapshot name for ${_home}/${_newest}"
+            _rc=2
+            continue
+        }
+
+        if [ -n "${_base}" ]; then
+            if repl_pipe "${_rcf}" "${_to}" "${_addr}" "$( repl_recv_cmd "${_rds}" )" \
+                    -- zfs send -p -I "@$( pol_snap_format "${_home}" "${_base}" )" \
+                        "${_ds}@${_short}"; then
+                _sent=$(( _sent + 1 ))
+            else
+                seance_log err "repl ${_guest}->${_peer}: incremental send of ${_ds} failed"
+                _rc=1
+            fi
+        else
+            seance_log notice "repl ${_guest}->${_peer}: no snapshot in common for ${_ds}; sending it in full"
+            if repl_pipe "${_rcf}" "${_to}" "${_addr}" "$( repl_recv_cmd "${_rds}" )" \
+                    -- zfs send -p "${_ds}@${_short}"; then
+                _sent=$(( _sent + 1 ))
+            else
+                seance_log err "repl ${_guest}->${_peer}: full send of ${_ds} failed"
+                _rc=1
+            fi
+        fi
+    done
+
+    # --- the shadow-mount law, on what has arrived ------------------------
+    if ! _res=$( repl_remote_enforce_law "${_addr}" "${_rroot}" ); then
+        seance_log err "repl ${_guest}->${_peer}: cannot hold the replica property law on ${_rroot}"
+        _rc=1
+    elif [ -n "${_res}" ]; then
+        printf '%s\n' "${_res}" > "${_tmp}/repairs"
+        while IFS= read -r _line || [ -n "${_line}" ]; do
+            [ -n "${_line}" ] || continue
+            case "${_line}" in
+                enforced*) seance_log info "repl ${_peer}: ${_line}" ;;
+                *) seance_log warning "repl ${_peer}: ${_line}" ;;
+            esac
+        done < "${_tmp}/repairs"
+    fi
+
+    # --- prune, both ends, by the same ladder -----------------------------
+    if ! repl_remote_probe "${_addr}" "${_rroot}" > "${_probe}"; then
+        seance_log err "repl ${_guest}->${_peer}: the peer did not answer the post-send probe"
+        repl_lag_fail "${_guest}" "${_peer}" "${_now}" 1
+        return 1
+    fi
+    awk -F "${REPL_TAB}" '$1 == "S" { print $2 }' "${_probe}" > "${_tmp}/rsnaps"
+
+    _acked=""
+
+    for _ds in ${_dslist}; do
+        _tail=${_ds#"${_root}"}
+        _rds="${_rroot}${_tail}"
+
+        repl_ts_for_dataset "${_lsnaps}" "${_ds}" "${_home}" > "${_tmp}/lts"
+        repl_ts_for_dataset "${_tmp}/rsnaps" "${_rds}" "${_home}" > "${_tmp}/rts"
+
+        _base=$( repl_newest_common "${_tmp}/lts" "${_tmp}/rts" )
+        [ "${_ds}" = "${_root}" ] && _acked=${_base}
+
+        _prot="${_tmp}/protected"
+        : > "${_prot}"
+        [ -n "${_base}" ] && printf '%s\n' "${_base}" > "${_prot}"
+
+        if ! _prune=$( pol_retention_prune_protected "${_now}" \
+                "$( conf_effective retention_recent )" \
+                "$( conf_effective retention_hourly )" "${_prot}" \
+                < "${_tmp}/lts" ); then
+            seance_log err "repl ${_guest}->${_peer}: retention refused the local snapshot list of ${_ds}"
+            _rc=1
+            continue
+        fi
+        for _snap in ${_prune}; do
+            _short=$( pol_snap_format "${_home}" "${_snap}" ) || continue
+            if zfs_destroy_snapshot "${_ds}" "${_short}"; then
+                seance_log info "repl: pruned ${_ds}@${_short}"
+            else
+                seance_log err "repl: could not prune ${_ds}@${_short}"
+                _rc=1
+            fi
+        done
+
+        [ -s "${_tmp}/rts" ] || continue
+
+        if ! _prune=$( pol_retention_prune_protected "${_now}" \
+                "$( conf_effective retention_recent )" \
+                "$( conf_effective retention_hourly )" "${_prot}" \
+                < "${_tmp}/rts" ); then
+            seance_log err "repl ${_guest}->${_peer}: retention refused the replica snapshot list of ${_rds}"
+            _rc=1
+            continue
+        fi
+        for _snap in ${_prune}; do
+            _short=$( pol_snap_format "${_home}" "${_snap}" ) || continue
+            if repl_remote_destroy "${_addr}" "${_rds}" "${_short}"; then
+                seance_log info "repl: pruned ${_peer}:${_rds}@${_short}"
+            else
+                seance_log err "repl: could not prune ${_peer}:${_rds}@${_short}"
+                _rc=1
+            fi
+        done
+    done
+
+    # --- the record status reads ------------------------------------------
+    [ -n "${_acked}" ] || _acked="-"
+    repl_lag_write "${_guest}" "${_peer}" "${_acked}" "${_now}" "${_rc}" ||
+        seance_log err "repl ${_guest}->${_peer}: could not write the lag record"
+
+    seance_log info "repl ${_guest}->${_peer}: ${_sent} stream(s), newest common ${_acked}, rc ${_rc}"
+
+    return "${_rc}"
+}
+
+# ---------------------------------------------------------------------------
+# The tick
+# ---------------------------------------------------------------------------
+
+# repl_peers <guest> <homekey>
+#
+# The peers a guest is replicated to: its succession, one per line, first heir
+# first. A guest is replicated to the nodes that would have to run it and to no
+# others -- a replica on a node that can never inherit the guest is disk nobody
+# will ever promote, and one more copy of the data to keep in step.
+# (Decision D-60.)
+repl_peers()
+{
+    local _guest _home
+
+    _guest=$1
+    _home=$2
+
+    pol_heirs \
+        "$( conf_get "node_${_home}_heir" "" )" \
+        "$( conf_get "node_${_home}_heir2" "" )" \
+        "$( conf_get "guest_${_guest}_heir" "" )" \
+        "$( conf_get "guest_${_guest}_heir2" "" )"
+}
+
+# repl_due <guest> <homekey> <now-epoch>
+#
+# rc 0 if this guest's cadence has elapsed since its last tick, rc 1 if it has
+# not. The cron line fires at the shortest cadence in the fleet and each guest
+# decides for itself whether it is due, from its own lag records -- so a fleet
+# of guests with different cadences needs one crontab entry rather than one per
+# guest. (Decision D-61.)
+repl_due()
+{
+    local _guest _home _now _cad _peer _rec _last _t
+
+    _guest=$1
+    _home=$2
+    _now=$3
+
+    _cad=$( conf_effective cadence "${_guest}" ) || return 0
+    case "${_cad}" in
+        ''|*[!0123456789]*) return 0 ;;
+    esac
+
+    _last=""
+    for _peer in $( repl_peers "${_guest}" "${_home}" ); do
+        _rec=$( repl_lag_read "${_guest}" "${_peer}" ) || return 0
+        _t=${_rec#* }
+        _t=${_t%% *}
+        case "${_t}" in
+            ''|*[!0123456789]*) return 0 ;;
+        esac
+        if [ -z "${_last}" ] || [ "${_t}" -gt "${_last}" ]; then
+            _last=${_t}
+        fi
+    done
+
+    [ -n "${_last}" ] || return 0
+
+    [ $(( _now - _last )) -ge "${_cad}" ]
+}
+
+# repl_cron_line
+#
+# The crontab(5) line seance expects to be installed, rendered from the
+# configuration: the shortest cadence in the fleet, in whole minutes, never
+# less than one. `verify` prints this and diffs it against reality; nothing in
+# seance ever writes it.
+repl_cron_line()
+{
+    local _g _c _min _mins
+
+    _min=$( conf_effective cadence ) || _min=900
+    for _g in $( conf_guests ); do
+        _c=$( conf_effective cadence "${_g}" ) || continue
+        case "${_c}" in
+            ''|*[!0123456789]*) continue ;;
+        esac
+        [ "${_c}" -lt "${_min}" ] && _min=${_c}
+    done
+
+    _mins=$(( _min / 60 ))
+    [ "${_mins}" -lt 1 ] && _mins=1
+
+    printf '*/%d * * * * root %s repl\n' "${_mins}" "${SEANCE_ROOT}/bin/seance"
+}
+
+# repl_tick <guest-filter|""> <peer-filter|""> <dry-run 0|1> <now 0|1>
+#           <locked 0|1>
+#
+# One tick. Prints the verdict line and returns 0 when every pair it attempted
+# succeeded, 1 when any failed.
+#
+# Each pair runs under lockf(1) against a per-pair lock file, in a fresh
+# invocation of the dispatcher (--locked). Two reasons, and the second is the
+# load-bearing one: lockf releases the lock when the process dies, which a lock
+# file carrying a pid does not; and a pair that wedges takes its own process
+# down with it and leaves the rest of the tick standing. (Decision D-62.)
+repl_tick()
+{
+    local _gf _pf _dry _now_flag _locked
+    local _home _now _ts _short _guest _peer _peers _rc _names _droot
+    local _guests _pairs _ok _failed _skipped _busy _tmp _lock _rundir
+
+    _gf=$1
+    _pf=$2
+    _dry=$3
+    _now_flag=$4
+    _locked=$5
+
+    _home=$( seance_self_key ) ||
+        seance_die 2 "repl: this node is not in the configuration; no node_*_nodename matches it"
+
+    _now=$( pol_now )
+    _ts=$( pol_epoch_to_ts "${_now}" ) ||
+        seance_die 1 "repl: cannot render the current time as a timestamp"
+
+    _tmp=$( seance_tmpdir ) || return 1
+
+    if ! adapter_guest_list > "${_tmp}/guests" < /dev/null; then
+        seance_die 1 "repl: adapter_guest_list failed"
+    fi
+
+    # Names only, and iterated with 'for' rather than 'while read' over a
+    # descriptor: the body of this loop starts ssh and a nested dispatcher,
+    # both of which read stdin (D-24).
+    _names=$( awk -F "${REPL_TAB}" 'NF > 0 { print $1 }' "${_tmp}/guests" )
+
+    _guests=0
+    _pairs=0
+    _ok=0
+    _failed=0
+    _skipped=0
+    _busy=0
+
+    for _guest in ${_names}; do
+        [ -n "${_gf}" ] && [ "${_gf}" != "${_guest}" ] && continue
+
+        _guests=$(( _guests + 1 ))
+
+        if [ "${_locked}" -eq 0 ] && [ "${_now_flag}" -eq 0 ] && [ "${_dry}" -eq 0 ] &&
+           ! repl_due "${_guest}" "${_home}" "${_now}"; then
+            seance_log info "repl ${_guest}: not due yet (cadence $( conf_effective cadence "${_guest}" )s)"
+            _skipped=$(( _skipped + 1 ))
+            continue
+        fi
+
+        if ! _peers=$( repl_peers "${_guest}" "${_home}" ); then
+            seance_log err "repl ${_guest}: no heir is configured for ${_home}; there is nowhere to replicate to"
+            _failed=$(( _failed + 1 ))
+            continue
+        fi
+
+        # One recursive snapshot per guest per tick, before any peer is
+        # contacted, so that every peer receives the same instant. A locked
+        # sub-invocation does not snapshot: its parent already has.
+        if [ "${_locked}" -eq 0 ] && [ "${_dry}" -eq 0 ]; then
+            _short=$( pol_snap_format "${_home}" "${_ts}" ) ||
+                seance_die 2 "repl: node key ${_home} cannot appear in a snapshot name"
+
+            adapter_guest_datasets "${_guest}" > "${_tmp}/ds" < /dev/null || {
+                seance_log err "repl ${_guest}: adapter_guest_datasets failed"
+                _failed=$(( _failed + 1 ))
+                continue
+            }
+            _droot=""
+            [ -s "${_tmp}/ds" ] && read -r _droot < "${_tmp}/ds"
+            if [ -z "${_droot}" ]; then
+                seance_log err "repl ${_guest}: the adapter reported no datasets"
+                _failed=$(( _failed + 1 ))
+                continue
+            fi
+            if ! zfs_snapshot_r "${_droot}" "${_short}"; then
+                seance_log err "repl ${_guest}: zfs snapshot -r ${_droot}@${_short} failed"
+                _failed=$(( _failed + 1 ))
+                continue
+            fi
+        fi
+
+        for _peer in ${_peers}; do
+            [ -n "${_pf}" ] && [ "${_pf}" != "${_peer}" ] && continue
+            _pairs=$(( _pairs + 1 ))
+
+            if [ "${_locked}" -eq 1 ] || [ "${_dry}" -eq 1 ]; then
+                repl_pair "${_guest}" "${_peer}" "${_home}" "${_now}" "${_dry}"
+                _rc=$?
+                if [ "${_rc}" -eq 0 ]; then
+                    _ok=$(( _ok + 1 ))
+                else
+                    _failed=$(( _failed + 1 ))
+                fi
+                continue
+            fi
+
+            _lock=$( repl_lock_file "${_guest}" "${_peer}" ) ||
+                seance_die 2 "repl: no run directory; set SEANCE_RUN_DIR or run under CBSD"
+            _rundir=${_lock%/*}
+            mkdir -p "${_rundir}" || seance_die 1 "repl: cannot create ${_rundir}"
+
+            lockf -s -t 0 "${_lock}" "${SEANCE_ROOT}/bin/seance" repl \
+                --guest "${_guest}" --peer "${_peer}" --locked < /dev/null
+            _rc=$?
+
+            case "${_rc}" in
+                0)
+                    _ok=$(( _ok + 1 ))
+                    ;;
+                "${REPL_RC_LOCKED}")
+                    seance_log notice "repl ${_guest}->${_peer}: another tick holds this pair; skipped"
+                    _busy=$(( _busy + 1 ))
+                    ;;
+                *)
+                    _failed=$(( _failed + 1 ))
+                    ;;
+            esac
+        done
+    done
+
+    # A filter that matched nothing is a contract error, not a quiet success.
+    # 'seance repl --guest webd01' with the name mistyped would otherwise print
+    # a cheerful "0 guests x 0 pairs, 0 ok, 0 failed" and exit 0, which is the
+    # false pass this project exists to catch, wearing a verdict line.
+    if [ -n "${_gf}" ] && [ "${_guests}" -eq 0 ]; then
+        seance_die 2 "repl: no guest called \"${_gf}\" on this node"
+    fi
+    if [ -n "${_pf}" ] && [ "${_pairs}" -eq 0 ]; then
+        seance_die 2 "repl: no guest here replicates to \"${_pf}\""
+    fi
+
+    if [ "${_locked}" -eq 1 ]; then
+        [ "${_failed}" -eq 0 ] && return 0
+        return 1
+    fi
+
+    printf 'repl: %d guests x %d pairs, %d ok, %d failed, %d skipped, %d in progress\n' \
+        "${_guests}" "${_pairs}" "${_ok}" "${_failed}" "${_skipped}" "${_busy}"
+
+    [ "${_failed}" -eq 0 ] && return 0
+    return 1
+}

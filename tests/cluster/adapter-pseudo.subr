@@ -1,0 +1,494 @@
+# seance -- the shape-A pseudo-cluster adapter.
+#
+# Sourced by bin/seance through $SEANCE_ADAPTER when seance runs inside a
+# pseudo-cluster node (TESTING.md §1, shape A). It implements the same function
+# set as lib/adapter.subr, with the same contracts, and it is the reason tiers
+# 6 and 7 can drive the real verbs: everything the replication engine and the
+# policy engine actually touch -- datasets, snapshots, sends, ssh, CARP -- is
+# real here. Only the guest LIFECYCLE is imaginary: a guest is a record in a
+# file and a dataset tree, not a process.
+#
+# That is the honest boundary. A jail inside a vnet jail is not a guest, and
+# pretending otherwise would make the expensive tier test the pretence. What
+# the pseudo-cluster is for is the parts of seance that a fake CBSD cannot fake
+# away, and every one of those is real below.
+#
+# Layout, per node:
+#
+#   <root>                       the node's delegated dataset, mounted /seance
+#   <root>/<guest>               one guest's dataset root, LOCAL mountpoint
+#                                (CBSD sets one at creation --
+#                                sudoexec/mkdatadir:14-23 -- and the shadow-
+#                                mount law is only tested if the source has one)
+#   <root>/<guest>/sys           the guest's config directory, a dataset child
+#                                so that it travels with replication the way
+#                                jails-system/<name>/ does
+#   <root>/standby               where other nodes' replicas land
+#   /var/db/seance-pseudo/guests.tsv    the guest records
+#
+# Records are "<name> <type> <astart> <home> <running> <held>", tab separated.
+#
+# shellcheck shell=sh
+# shellcheck disable=SC3043
+#   'local' is not in POSIX sh but is implemented by FreeBSD /bin/sh (sh(1),
+#   "local"); seance targets FreeBSD sh and nothing else (handoff §5).
+
+PSEUDO_DIR=${SEANCE_PSEUDO_DIR:-/var/db/seance-pseudo}
+PSEUDO_DB="${PSEUDO_DIR}/guests.tsv"
+PSEUDO_MOUNT=${SEANCE_PSEUDO_MOUNT:-/seance}
+PSEUDO_ROOT=""
+
+PSEUDO_TAB=$( printf '\t.' )
+PSEUDO_TAB=${PSEUDO_TAB%.}
+
+# pseudo_diag <message...>  -- diagnostics, to stderr, as the contract requires.
+pseudo_diag()
+{
+    printf 'adapter-pseudo: %s\n' "$*" >&2
+}
+
+# pseudo_root  -- the node's delegated dataset.
+#
+# From $SEANCE_PSEUDO_ROOT when the stage says so, otherwise from the mount
+# table: whatever is mounted at /seance inside this node. Derived rather than
+# configured because the node's dataset name is a fact about the substrate, not
+# a seance setting.
+pseudo_root()
+{
+    local _r
+
+    if [ -n "${PSEUDO_ROOT}" ]; then
+        printf '%s\n' "${PSEUDO_ROOT}"
+        return 0
+    fi
+
+    if [ -n "${SEANCE_PSEUDO_ROOT:-}" ]; then
+        PSEUDO_ROOT=${SEANCE_PSEUDO_ROOT}
+        printf '%s\n' "${PSEUDO_ROOT}"
+        return 0
+    fi
+
+    _r=$( mount -p | awk -v m="${PSEUDO_MOUNT}" '$2 == m { print $1; exit }' )
+    [ -n "${_r}" ] || return 1
+
+    PSEUDO_ROOT=${_r}
+    printf '%s\n' "${PSEUDO_ROOT}"
+}
+
+# pseudo_name_ok <name>  -- the guest-name rule, applied on the way in.
+#
+# [a-z0-9][a-z0-9._-]* -- CBSD's own jail names are of this shape, and a name
+# outside it cannot appear in a tab-separated record or a dataset name without
+# a quoting story the adapter contract does not have (handoff §2.3).
+pseudo_name_ok()
+{
+    case "${1:-}" in
+        ''|[!abcdefghijklmnopqrstuvwxyz0123456789]*) return 1 ;;
+        *[!abcdefghijklmnopqrstuvwxyz0123456789._-]*) return 1 ;;
+    esac
+
+    return 0
+}
+
+# pseudo_field <name> <n>  -- the nth field of a guest's record, 1-based.
+pseudo_field()
+{
+    [ -r "${PSEUDO_DB}" ] || return 1
+
+    awk -F "${PSEUDO_TAB}" -v g="$1" -v n="$2" \
+        '$1 == g { print $n; found = 1; exit } END { exit !found }' \
+        "${PSEUDO_DB}"
+}
+
+# pseudo_set_field <name> <n> <value>  -- rewrite one field of one record.
+pseudo_set_field()
+{
+    local _tmp
+
+    [ -r "${PSEUDO_DB}" ] || return 1
+
+    _tmp="${PSEUDO_DB}.new.$$"
+
+    awk -F "${PSEUDO_TAB}" -v OFS="${PSEUDO_TAB}" \
+        -v g="$1" -v n="$2" -v v="$3" \
+        '$1 == g { $n = v; found = 1 } { print } END { exit !found }' \
+        "${PSEUDO_DB}" > "${_tmp}" || { rm -f "${_tmp}"; return 1; }
+
+    mv "${_tmp}" "${PSEUDO_DB}"
+}
+
+# ---------------------------------------------------------------------------
+# The adapter contract
+# ---------------------------------------------------------------------------
+
+# contract: adapter_init() -> nothing [no output]
+#
+# Prepare the adapter for this process. rc 0 ready, 2 this host cannot host
+# the adapter at all.
+adapter_init()
+{
+    mkdir -p "${PSEUDO_DIR}" || {
+        pseudo_diag "cannot create ${PSEUDO_DIR}"
+        return 2
+    }
+
+    [ -e "${PSEUDO_DB}" ] || : > "${PSEUDO_DB}"
+
+    pseudo_root > /dev/null || {
+        pseudo_diag "no delegated dataset is mounted at ${PSEUDO_MOUNT};" \
+            "set SEANCE_PSEUDO_ROOT"
+        return 2
+    }
+
+    return 0
+}
+
+# contract: adapter_node_self() -> nodename [promises output]
+#
+# This node's name. rc 0 with output, 1 if it cannot be determined. Never
+# empty with rc 0.
+adapter_node_self()
+{
+    local _n
+
+    _n=$( hostname -s 2>/dev/null ) || return 1
+    [ -n "${_n}" ] || return 1
+
+    printf '%s\n' "${_n}"
+}
+
+# contract: adapter_fact(key) -> value [promises output]
+#
+# The node facts, one at a time, by key: workdir, nodename, jailsysdir,
+# jaildatadir, dbdir, etcdir, distdir. rc 2 for an unknown key -- a typo'd fact
+# must not read as an empty one.
+#
+# A pseudo-cluster node has no CBSD, so these are the jail-local equivalents of
+# what CBSD would answer, and they are answered rather than refused because the
+# seam is only a seam if every implementation can speak the whole of it:
+#
+#   workdir      the directory this adapter keeps its world in
+#   jailsysdir   the parent of the guests' config directories -- a guest's own
+#                is <jailsysdir>/<name>/sys, and adapter_guest_sysdir is the
+#                accessor to use rather than that arithmetic
+#   jaildatadir  the parent of the guests' data, which here is the same place
+#   dbdir        this adapter's records
+#   etcdir       where the node's configuration lives
+#   distdir      the seance tree this node runs from
+adapter_fact()
+{
+    case "${1:-}" in
+        workdir)     printf '%s\n' "${PSEUDO_DIR}" ;;
+        nodename)    adapter_node_self ;;
+        jailsysdir)  printf '%s\n' "${PSEUDO_MOUNT}" ;;
+        jaildatadir) printf '%s\n' "${PSEUDO_MOUNT}" ;;
+        dbdir)       printf '%s\n' "${PSEUDO_DIR}" ;;
+        etcdir)      printf '%s\n' "/etc" ;;
+        distdir)     printf '%s\n' "${SEANCE_ROOT:-/usr/local/seance}" ;;
+        *)
+            pseudo_diag "adapter_fact: no such fact: [${1:-}]"
+            return 2
+            ;;
+    esac
+
+    return 0
+}
+
+# contract: adapter_guest_list() -> name<TAB>type<TAB>astart<TAB>status<TAB>running [list: may be empty]
+#
+# One record per guest on this node. type is bhyve|jail, astart and running are
+# 0|1, status is CBSD's status integer (0 master, 2 slave/held). No header. An
+# empty list is a valid answer: rc 0 with no output means "no guests here", and
+# this is one of the functions that does NOT promise output.
+adapter_guest_list()
+{
+    [ -r "${PSEUDO_DB}" ] || return 0
+
+    awk -F "${PSEUDO_TAB}" -v OFS="${PSEUDO_TAB}" \
+        'NF >= 6 { print $1, $2, $3, ($6 == "1" ? 2 : 0), $5 }' "${PSEUDO_DB}"
+}
+
+# contract: adapter_guest_type(name) -> bhyve|jail [promises output]
+#
+# rc 0 with output, 1 if there is no such guest, 2 for a name that is not one.
+adapter_guest_type()
+{
+    local _t
+
+    pseudo_name_ok "${1:-}" || { pseudo_diag "bad guest name: ${1:-}"; return 2; }
+
+    _t=$( pseudo_field "$1" 2 ) || return 1
+    [ -n "${_t}" ] || return 1
+
+    printf '%s\n' "${_t}"
+}
+
+# contract: adapter_guest_running(name) -> 1|0 [promises output]
+#
+# rc 0 with output, 1 if there is no such guest, 2 for a name that is not one.
+adapter_guest_running()
+{
+    local _r
+
+    pseudo_name_ok "${1:-}" || { pseudo_diag "bad guest name: ${1:-}"; return 2; }
+
+    _r=$( pseudo_field "$1" 5 ) || return 1
+
+    if [ "${_r}" = "1" ]; then
+        printf '1\n'
+    else
+        printf '0\n'
+    fi
+}
+
+# contract: adapter_guest_start(name) -> nothing [no output]
+#
+# rc 0 started (or already running), 1 the start failed, 2 no such guest or a
+# name that is not one.
+adapter_guest_start()
+{
+    pseudo_name_ok "${1:-}" || { pseudo_diag "bad guest name: ${1:-}"; return 2; }
+
+    pseudo_field "$1" 1 > /dev/null || { pseudo_diag "no such guest: $1"; return 2; }
+
+    if [ "$( pseudo_field "$1" 6 )" = "1" ]; then
+        pseudo_diag "$1 is held (slave mode); refusing to start it"
+        return 1
+    fi
+
+    pseudo_set_field "$1" 5 1 || return 1
+}
+
+# contract: adapter_guest_stop(name) -> nothing [no output]
+#
+# rc 0 stopped (or already stopped), 1 the stop failed, 2 no such guest or a
+# name that is not one.
+adapter_guest_stop()
+{
+    pseudo_name_ok "${1:-}" || { pseudo_diag "bad guest name: ${1:-}"; return 2; }
+
+    pseudo_field "$1" 1 > /dev/null || { pseudo_diag "no such guest: $1"; return 2; }
+
+    pseudo_set_field "$1" 5 0 || return 1
+}
+
+# contract: adapter_guest_datasets(name) -> dataset per line, root first [promises output]
+#
+# Every ZFS dataset belonging to the guest, THE ROOT FIRST and every other line
+# a descendant of it. rc 0 with output, 1 if the guest has no dataset at all.
+adapter_guest_datasets()
+{
+    local _root _ds
+
+    pseudo_name_ok "${1:-}" || { pseudo_diag "bad guest name: ${1:-}"; return 2; }
+
+    _root=$( pseudo_root ) || return 1
+    _ds="${_root}/$1"
+
+    zfs list -H -o name "${_ds}" > /dev/null 2>&1 || {
+        pseudo_diag "guest $1 has no dataset at ${_ds}"
+        return 1
+    }
+
+    zfs list -H -o name -t filesystem,volume -r "${_ds}"
+}
+
+# contract: adapter_guest_sysdir(name) -> path [promises output]
+#
+# The directory holding the guest's configuration -- the analogue of CBSD's
+# ${jailsysdir}/<name>/. rc 0 with output, 1 if there is none.
+adapter_guest_sysdir()
+{
+    local _d
+
+    pseudo_name_ok "${1:-}" || { pseudo_diag "bad guest name: ${1:-}"; return 2; }
+
+    _d="${PSEUDO_MOUNT}/$1/sys"
+    [ -d "${_d}" ] || return 1
+
+    printf '%s\n' "${_d}"
+}
+
+# contract: adapter_guest_register(name,rcfile) -> nothing [no output]
+#
+# Make a replicated guest startable here, from the configuration that travelled
+# with it. rc 0 registered, 1 the registration failed, 2 a bad name or an
+# unreadable rcfile.
+adapter_guest_register()
+{
+    local _name _rc _type _astart _home
+
+    _name=${1:-}
+    _rc=${2:-}
+
+    pseudo_name_ok "${_name}" || { pseudo_diag "bad guest name: ${_name}"; return 2; }
+    [ -r "${_rc}" ] || { pseudo_diag "no readable rcfile: ${_rc}"; return 2; }
+
+    if pseudo_field "${_name}" 1 > /dev/null 2>&1; then
+        pseudo_diag "${_name} is already registered here"
+        return 1
+    fi
+
+    # The rcfile is the guest's own description, replicated with its datasets.
+    # Parsed, not sourced, for the same reason seance.conf is (handoff §2.2).
+    _type=$( awk -F= '$1 == "type" { print $2; exit }' "${_rc}" )
+    _astart=$( awk -F= '$1 == "astart" { print $2; exit }' "${_rc}" )
+    _home=$( awk -F= '$1 == "home" { print $2; exit }' "${_rc}" )
+
+    [ -n "${_type}" ] || _type=jail
+    [ -n "${_astart}" ] || _astart=0
+    [ -n "${_home}" ] || _home=$( adapter_node_self )
+
+    printf '%s\t%s\t%s\t%s\t0\t0\n' \
+        "${_name}" "${_type}" "${_astart}" "${_home}" >> "${PSEUDO_DB}"
+}
+
+# contract: adapter_guest_unregister(name) -> nothing [no output]
+#
+# Forget a guest here; its datasets are untouched. rc 0 done, 1 failed, 2 a
+# name that is not one.
+adapter_guest_unregister()
+{
+    local _tmp
+
+    pseudo_name_ok "${1:-}" || { pseudo_diag "bad guest name: ${1:-}"; return 2; }
+    [ -r "${PSEUDO_DB}" ] || return 1
+
+    _tmp="${PSEUDO_DB}.new.$$"
+    awk -F "${PSEUDO_TAB}" -v g="$1" '$1 != g' "${PSEUDO_DB}" > "${_tmp}" ||
+        { rm -f "${_tmp}"; return 1; }
+    mv "${_tmp}" "${PSEUDO_DB}"
+}
+
+# contract: adapter_guest_hold(name) -> nothing [no output]
+#
+# Withhold the guest from every start path (CBSD slave mode, D-21). rc 0 held,
+# 1 failed, 2 no such guest or a name that is not one.
+adapter_guest_hold()
+{
+    pseudo_name_ok "${1:-}" || { pseudo_diag "bad guest name: ${1:-}"; return 2; }
+    pseudo_field "$1" 1 > /dev/null || { pseudo_diag "no such guest: $1"; return 2; }
+
+    pseudo_set_field "$1" 6 1 || return 1
+}
+
+# contract: adapter_guest_release(name) -> nothing [no output]
+#
+# The inverse of adapter_guest_hold. rc 0 released, 1 failed, 2 no such guest
+# or a name that is not one.
+adapter_guest_release()
+{
+    pseudo_name_ok "${1:-}" || { pseudo_diag "bad guest name: ${1:-}"; return 2; }
+    pseudo_field "$1" 1 > /dev/null || { pseudo_diag "no such guest: $1"; return 2; }
+
+    pseudo_set_field "$1" 6 0 || return 1
+}
+
+# contract: adapter_guest_held(name) -> 1|0 [promises output]
+#
+# rc 0 with output, 1 if there is no such guest, 2 for a name that is not one.
+adapter_guest_held()
+{
+    local _h
+
+    pseudo_name_ok "${1:-}" || { pseudo_diag "bad guest name: ${1:-}"; return 2; }
+
+    _h=$( pseudo_field "$1" 6 ) || return 1
+
+    if [ "${_h}" = "1" ]; then
+        printf '1\n'
+    else
+        printf '0\n'
+    fi
+}
+
+# contract: adapter_kernel_version() -> uname-style kernel version [promises output]
+#
+# rc 0 with output, 1 otherwise. Real here, not mocked: kernel homogeneity is a
+# precondition for promoting a jail guest (D-5), and a pseudo-cluster whose
+# nodes genuinely share one kernel is the true answer rather than a fabricated
+# one.
+#
+# freebsd-version -k first, because that is what the real adapter asks and the
+# two must agree on a real host; uname -r when it has nothing to say, which
+# inside a jail is always -- freebsd-version -k reads the kernel image under
+# /boot, and a jail has no /boot (observed: it printed nothing, and the first
+# run of the repl stage reported "kernel unknown" on all three nodes). uname -r
+# is the RUNNING kernel's release, which for a jail is the host's, and the
+# host's kernel is exactly the one a jail guest would be promoted onto.
+adapter_kernel_version()
+{
+    local _v
+
+    _v=$( freebsd-version -k 2>/dev/null ) || _v=""
+    [ -n "${_v}" ] || _v=$( uname -r 2>/dev/null ) || _v=""
+    [ -n "${_v}" ] || return 1
+
+    printf '%s\n' "${_v}"
+}
+
+# contract: adapter_carp_state(vhid) -> MASTER|BACKUP|INIT|absent [promises output]
+#
+# rc 0 with output always; 2 if <vhid> is not a number. Parsed from ifconfig(8),
+# whose carp line reads "carp: MASTER vhid 1 advbase 1 advskew 0" (observed in
+# the guest, recorded by the substrate stage's CARP probe, D-27).
+adapter_carp_state()
+{
+    local _vhid _s
+
+    _vhid=${1:-}
+    case "${_vhid}" in
+        ''|*[!0123456789]*) pseudo_diag "carp: vhid must be a number: ${_vhid}"; return 2 ;;
+    esac
+
+    _s=$( ifconfig 2>/dev/null |
+        awk -v v="${_vhid}" '
+            $1 == "carp:" && $4 == v { print $2; found = 1; exit }
+            END { if (!found) print "absent" }
+        ' )
+
+    [ -n "${_s}" ] || _s=absent
+
+    printf '%s\n' "${_s}"
+}
+
+# ---------------------------------------------------------------------------
+# Fixture helpers -- NOT part of the adapter contract
+#
+# Deliberately not named adapter_*: they exist so a tier-6 stage can build a
+# world, and lib/adapter.subr has no equivalent because CBSD's own tooling is
+# how a real guest is made.
+# ---------------------------------------------------------------------------
+
+# pseudo_guest_create <name> <type> <home> [astart]
+#
+# Create a guest: its dataset root with a LOCAL mountpoint (the shadow-mount
+# law has nothing to bite on if the source's mountpoint is inherited -- see
+# docs/repl-wire.md), its sys child, and its record.
+pseudo_guest_create()
+{
+    local _name _type _home _astart _root _ds
+
+    _name=$1
+    _type=$2
+    _home=$3
+    _astart=${4:-1}
+
+    pseudo_name_ok "${_name}" || { pseudo_diag "bad guest name: ${_name}"; return 2; }
+
+    _root=$( pseudo_root ) || return 1
+    _ds="${_root}/${_name}"
+
+    zfs create -o "mountpoint=${PSEUDO_MOUNT}/${_name}" "${_ds}" || return 1
+    zfs create "${_ds}/sys" || return 1
+
+    {
+        printf 'name=%s\n' "${_name}"
+        printf 'type=%s\n' "${_type}"
+        printf 'astart=%s\n' "${_astart}"
+        printf 'home=%s\n' "${_home}"
+    } > "${PSEUDO_MOUNT}/${_name}/sys/rc.conf_${_name}" || return 1
+
+    printf '%s\t%s\t%s\t%s\t1\t0\n' \
+        "${_name}" "${_type}" "${_astart}" "${_home}" >> "${PSEUDO_DB}"
+}

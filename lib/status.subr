@@ -1,0 +1,340 @@
+# seance -- `status`: the one screen.
+#
+# Sourced, never executed. Design §9: every guest, where it is, how fresh its
+# replicas are, whether the mesh still agrees about the configuration, and an
+# exit code that is the fleet's health rather than the command's mood.
+#
+# What this file may ask, and what it may not:
+#
+#   * replica freshness comes from the LAG RECORDS this node wrote, never from
+#     the peers. That is the state model (design §5): a survivor must be able
+#     to answer from local facts, and a `status` that ssh'd to a dead node for
+#     its own freshness numbers would hang exactly when it is needed.
+#   * kernel version and configuration checksum DO cross the mesh, because
+#     both are questions about the living. A peer that does not answer is a
+#     warning and never a hang: every probe is bounded by the transport.
+#
+# The verdict, and the exit code with it:
+#
+#   0  every replica fresh, every peer answering, one configuration
+#   1  a warning: a stale replica, an unreachable peer, a kernel mismatch,
+#      a replication in progress that has not yet acknowledged anything
+#   2  the configuration is invalid, or this node cannot find itself in it --
+#      a contract error, and nothing below it can be trusted
+#
+# Configuration divergence is a FAIL line and exit 1, printed loudly rather
+# than as a footnote (handoff §2.2): seance never propagates the file, so the
+# only thing standing between a fleet and two nodes disagreeing about who
+# fences whom is this line being read.
+#
+# shellcheck shell=sh
+# shellcheck disable=SC3043
+#   'local' is not in POSIX sh but is implemented by FreeBSD /bin/sh (sh(1),
+#   "local"); seance targets FreeBSD sh and nothing else (handoff §5).
+
+STATUS_TAB=$( printf '\t.' )
+STATUS_TAB=${STATUS_TAB%.}
+
+STATUS_WARN=0
+STATUS_FAIL=0
+
+# status_warn <message...> / status_fail <message...>
+#
+# Counted, so that the verdict line is arithmetic rather than an impression.
+status_warn()
+{
+    STATUS_WARN=$(( STATUS_WARN + 1 ))
+    printf 'WARN %s\n' "$*"
+}
+
+status_fail()
+{
+    STATUS_FAIL=$(( STATUS_FAIL + 1 ))
+    printf 'FAIL %s\n' "$*"
+}
+
+# status_age_human <seconds>  -- "42s", "7m12s", "3h04m", "2d05h".
+#
+# Ages are read at three in the morning by somebody who has just been paged.
+# 9412 is not an age; 2h36m is.
+status_age_human()
+{
+    local _s
+
+    _s=${1:-0}
+
+    case "${_s}" in
+        ''|*[!0123456789]*) printf '%s\n' "?"; return 0 ;;
+    esac
+
+    if [ "${_s}" -lt 60 ]; then
+        printf '%ds\n' "${_s}"
+    elif [ "${_s}" -lt 3600 ]; then
+        printf '%dm%02ds\n' "$(( _s / 60 ))" "$(( _s % 60 ))"
+    elif [ "${_s}" -lt 86400 ]; then
+        printf '%dh%02dm\n' "$(( _s / 3600 ))" "$(( _s % 3600 / 60 ))"
+    else
+        printf '%dd%02dh\n' "$(( _s / 86400 ))" "$(( _s % 86400 / 3600 ))"
+    fi
+}
+
+# status_peer_facts <peerkey> <conf-path> <outfile>
+#
+# One ssh per peer for both cross-mesh questions:
+#
+#   K<TAB><freebsd-version -k>
+#   C<TAB><sha256 of the configuration file>
+#
+# rc 1 when the peer did not answer. The configuration is read at the same
+# path on every node -- seance does not distribute the file (handoff §2.2), so
+# there is nothing for it to translate a path against, and a fleet that keeps
+# it in two places has a problem `verify` should be naming rather than papering
+# over.
+status_peer_facts()
+{
+    local _peer _conf _out _addr _cmd
+
+    _peer=$1
+    _conf=$2
+    _out=$3
+
+    _addr=$( seance_peer_addr "${_peer}" ) || return 1
+
+    case "${_conf}" in
+        *"'"*) return 1 ;;
+    esac
+
+    # freebsd-version -k reads the kernel image under /boot and has nothing to
+    # say on a node that cannot see one -- a jailed node, notably, which is
+    # what the pseudo-cluster's nodes are. uname -r is then the honest answer,
+    # because it is the RUNNING kernel's release, and the running kernel is the
+    # one a jail guest would be promoted onto (D-5). The same order is used by
+    # the adapters for the local answer, so the two sides of the comparison
+    # cannot be measuring different things.
+    _cmd="k=\$( freebsd-version -k 2>/dev/null )
+[ -n \"\$k\" ] || k=\$( uname -r 2>/dev/null )
+printf 'K\t%s\n' \"\$k\"
+if [ -r '${_conf}' ]; then printf 'C\t%s\n' \"\$( sha256 -q '${_conf}' )\"; fi
+exit 0"
+
+    seance_ssh "${_addr}" "${_cmd}" > "${_out}" 2>/dev/null
+}
+
+# status_report <tsv 0|1>
+#
+# The screen, or the same facts one tab-separated record per line. Returns the
+# exit code described at the top of this file.
+status_report()
+{
+    local _tsv _home _now _skew _conf _lsha _lkern _tmp
+    local _guest _type _running _held _names _row _peer _peers
+    local _rec _ts _tick _rc _age _age_h _verdict _max _fresh _total
+    local _psha _pkern _line _guests
+
+    _tsv=$1
+
+    _home=$( seance_self_key ) || {
+        seance_log err "status: this node is not in the configuration; no node_*_nodename matches it"
+        printf 'status: FAIL (this node is not in its own configuration)\n'
+        return 2
+    }
+
+    if ! conf_check > /dev/null; then
+        conf_check
+        printf 'status: FAIL (the configuration is invalid; run "seance config --check")\n'
+        return 2
+    fi
+
+    _now=$( pol_now )
+    _skew=$( conf_effective skew_tolerance ) || _skew=120
+    _conf=$( conf_file )
+    _tmp=$( seance_tmpdir ) || return 2
+
+    _lsha=$( sha256 -q "${_conf}" 2>/dev/null ) || _lsha=""
+    _lkern=$( adapter_kernel_version ) || _lkern=""
+
+    if [ "${_tsv}" -eq 0 ]; then
+        printf 'node %s (%s) kernel %s\n' \
+            "${_home}" "$( adapter_node_self )" "${_lkern:-unknown}"
+    else
+        printf 'node%s%s%s%s%s%s\n' "${STATUS_TAB}" "${_home}" \
+            "${STATUS_TAB}" "$( adapter_node_self )" \
+            "${STATUS_TAB}" "${_lkern:-unknown}"
+    fi
+
+    # --- guests and their replicas ----------------------------------------
+    if ! adapter_guest_list > "${_tmp}/guests" < /dev/null; then
+        status_fail "adapter_guest_list failed; this node cannot enumerate its own guests"
+        _names=""
+    else
+        _names=$( awk -F "${STATUS_TAB}" 'NF > 0 { print $1 }' "${_tmp}/guests" )
+    fi
+
+    _guests=0
+    _fresh=0
+    _total=0
+
+    for _guest in ${_names}; do
+        _guests=$(( _guests + 1 ))
+
+        _row=$( awk -F "${STATUS_TAB}" -v g="${_guest}" \
+            '$1 == g { print; exit }' "${_tmp}/guests" )
+        _type=$( printf '%s\n' "${_row}" | awk -F "${STATUS_TAB}" '{ print $2 }' )
+        _running=$( printf '%s\n' "${_row}" | awk -F "${STATUS_TAB}" '{ print $5 }' )
+        if [ "${_running}" = "1" ]; then
+            _running=yes
+        else
+            _running=no
+        fi
+
+        _held=$( adapter_guest_held "${_guest}" 2>/dev/null ) || _held=""
+        case "${_held}" in
+            1) _held=yes ;;
+            0) _held=no ;;
+            *) _held=unknown ;;
+        esac
+
+        if [ "${_tsv}" -eq 0 ]; then
+            printf 'guest %-16s type %-6s home %-10s running %-3s held %s\n' \
+                "${_guest}" "${_type:-?}" "${_home}" "${_running}" "${_held}"
+        else
+            printf 'guest%s%s%s%s%s%s%s%s%s%s\n' \
+                "${STATUS_TAB}" "${_guest}" "${STATUS_TAB}" "${_type:-?}" \
+                "${STATUS_TAB}" "${_home}" "${STATUS_TAB}" "${_running}" \
+                "${STATUS_TAB}" "${_held}"
+        fi
+
+        _max=$( conf_effective staleness_max "${_guest}" ) || _max=2700
+        _peers=$( repl_peers "${_guest}" "${_home}" ) || _peers=""
+
+        if [ -z "${_peers}" ]; then
+            status_warn "guest ${_guest} has no heir: nothing replicates it"
+            continue
+        fi
+
+        for _peer in ${_peers}; do
+            _total=$(( _total + 1 ))
+
+            if repl_lock_held "${_guest}" "${_peer}"; then
+                _line="in-progress"
+            else
+                _line="-"
+            fi
+
+            if ! _rec=$( repl_lag_read "${_guest}" "${_peer}" ); then
+                _verdict="NEVER"
+                _ts="-"
+                _age="-"
+                _age_h="-"
+                _rc="-"
+                status_warn "replica ${_guest}@${_peer}: no tick has ever completed"
+            else
+                _ts=${_rec%% *}
+                _tick=${_rec#* }
+                _rc=${_tick#* }
+                _tick=${_tick%% *}
+
+                if [ "${_ts}" = "-" ]; then
+                    _verdict="NONE"
+                    _age="-"
+                    _age_h="-"
+                    status_warn "replica ${_guest}@${_peer}: the last tick acknowledged no snapshot"
+                else
+                    if ! _age=$( pol_age "${_ts}" "${_now}" "${_skew}" ); then
+                        _verdict="SKEWED"
+                        _age_h="?"
+                        status_warn "replica ${_guest}@${_peer}: stamped ${_age}s in the future; a clock is wrong"
+                        _age="-"
+                    else
+                        _age_h=$( status_age_human "${_age}" )
+                        # pol_is_stale returns the verdict, not the predicate:
+                        # rc 0 is FRESH, rc 1 is stale.
+                        if pol_is_stale "${_age}" "${_max}"; then
+                            _verdict="fresh"
+                            _fresh=$(( _fresh + 1 ))
+                        else
+                            _verdict="STALE"
+                            status_warn "replica ${_guest}@${_peer}: ${_age_h} old, past staleness_max ${_max}s"
+                        fi
+                    fi
+                fi
+
+                [ "${_rc}" = "0" ] ||
+                    status_warn "replica ${_guest}@${_peer}: the last tick exited ${_rc}"
+            fi
+
+            if [ "${_tsv}" -eq 0 ]; then
+                printf '  replica %-10s %-16s age %-8s %-7s rc %-3s %s\n' \
+                    "${_peer}" "${_ts}" "${_age_h}" "${_verdict}" "${_rc}" \
+                    "${_line}"
+            else
+                printf 'replica%s%s%s%s%s%s%s%s%s%s%s%s%s%s\n' \
+                    "${STATUS_TAB}" "${_guest}" "${STATUS_TAB}" "${_peer}" \
+                    "${STATUS_TAB}" "${_ts}" "${STATUS_TAB}" "${_age}" \
+                    "${STATUS_TAB}" "${_verdict}" "${STATUS_TAB}" "${_rc}" \
+                    "${STATUS_TAB}" "${_line}"
+            fi
+        done
+    done
+
+    # --- CARP -------------------------------------------------------------
+    #
+    # M1 reads CARP and does nothing with it, and there is no configuration
+    # key naming which vhid belongs to which node yet -- adding one here would
+    # be scaffolding for M3 (charter §7). So the line says what is true.
+    if [ "${_tsv}" -eq 0 ]; then
+        printf 'carp: not configured (no vhid map until the CARP milestone)\n'
+    else
+        printf 'carp%snot-configured\n' "${STATUS_TAB}"
+    fi
+
+    # --- the mesh: kernels and the configuration --------------------------
+    for _peer in $( conf_nodes ); do
+        [ "${_peer}" = "${_home}" ] && continue
+
+        if ! status_peer_facts "${_peer}" "${_conf}" "${_tmp}/facts"; then
+            status_warn "peer ${_peer} did not answer"
+            if [ "${_tsv}" -eq 1 ]; then
+                printf 'peer%s%s%sunreachable\n' \
+                    "${STATUS_TAB}" "${_peer}" "${STATUS_TAB}"
+            else
+                printf 'peer %-10s unreachable\n' "${_peer}"
+            fi
+            continue
+        fi
+
+        _pkern=$( awk -F "${STATUS_TAB}" '$1 == "K" { print $2; exit }' "${_tmp}/facts" )
+        _psha=$( awk -F "${STATUS_TAB}" '$1 == "C" { print $2; exit }' "${_tmp}/facts" )
+
+        if [ -z "${_pkern}" ]; then
+            status_warn "peer ${_peer}: could not read its kernel version"
+        elif [ -n "${_lkern}" ] && [ "${_pkern}" != "${_lkern}" ]; then
+            status_warn "peer ${_peer}: kernel ${_pkern} differs from ${_lkern};" \
+                "jail guests cannot be promoted across it (D-5)"
+        fi
+
+        if [ -z "${_psha}" ]; then
+            status_fail "peer ${_peer}: has no readable ${_conf} -- THE MESH IS NOT CONFIGURED ALIKE"
+        elif [ -n "${_lsha}" ] && [ "${_psha}" != "${_lsha}" ]; then
+            status_fail "peer ${_peer}: CONFIGURATION DIFFERS (${_psha} here ${_lsha});" \
+                "seance never copies this file -- fix it by hand on every node"
+        fi
+
+        if [ "${_tsv}" -eq 1 ]; then
+            printf 'peer%s%s%s%s%s%s\n' "${STATUS_TAB}" "${_peer}" \
+                "${STATUS_TAB}" "${_pkern:-unknown}" \
+                "${STATUS_TAB}" "${_psha:-none}"
+        else
+            printf 'peer %-10s kernel %-22s conf %s\n' \
+                "${_peer}" "${_pkern:-unknown}" "${_psha:-MISSING}"
+        fi
+    done
+
+    printf 'status: %d guests, %d/%d replicas fresh, %d warnings, %d failures\n' \
+        "${_guests}" "${_fresh}" "${_total}" "${STATUS_WARN}" "${STATUS_FAIL}"
+
+    [ "${STATUS_FAIL}" -gt 0 ] && return 1
+    [ "${STATUS_WARN}" -gt 0 ] && return 1
+
+    return 0
+}

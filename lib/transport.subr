@@ -1,0 +1,175 @@
+# seance -- the transport: ssh to peers, and a timeout around anything.
+#
+# Sourced, never executed. Two jobs and nothing else:
+#
+#   * seance_ssh          -- run one command on a peer, over the mesh, with the
+#                            site's ssh settings taken from the configuration;
+#   * seance_run_timeout  -- bound any command in time, so that a replication
+#                            tick cannot hang until the next one overtakes it.
+#
+# It lives in its own file rather than in common.subr because common.subr is
+# the file that knows nothing about the outside world (logging, exit codes,
+# temporary directories) and this one is entirely about the outside world. It
+# reads configuration, so conf.subr must be loaded before it is used.
+#
+# Contract, as everywhere: stdout is data, stderr is diagnostics, exit 0 ok,
+# 1 the operation failed, 2 a usage or contract error. A timeout is reported
+# as rc 124, which is what timeout(1) itself returns (timeout(1), EXIT STATUS)
+# and is deliberately distinct from "the command failed".
+#
+# shellcheck shell=sh
+# shellcheck disable=SC3043
+#   'local' is not in POSIX sh but is implemented by FreeBSD /bin/sh (sh(1),
+#   "local"); seance targets FreeBSD sh and nothing else (handoff §5).
+
+# How long a peer has to answer a control command -- a listing, a property
+# read, a snapshot destroy. Not configurable, and deliberately so: it is not a
+# site preference but the boundary between "slow" and "not answering", and a
+# site that needs to move it has a network problem seance cannot configure its
+# way out of. Bulk transfers get their own, much larger budget from the
+# replication engine (see repl.subr, REPL_STREAM_TIMEOUT_MIN).
+TRANSPORT_CTL_TIMEOUT=60
+
+# How long ssh may spend establishing a connection before it is a failure.
+# Peers are on a LAN; a peer that has not completed a TCP handshake in ten
+# seconds is a peer 'verify' should be shouting about.
+TRANSPORT_CONNECT_TIMEOUT=10
+
+# The exit status timeout(1) uses when it had to kill its child. Named rather
+# than written as a literal at three call sites.
+TRANSPORT_RC_TIMEOUT=124
+
+# seance_run_timeout <seconds> <command> [args...]
+#
+# Run the command with a hard time limit. Returns the command's own status, or
+# 124 if the limit expired.
+#
+# -k 5: timeout(1) sends TERM at the deadline and, five seconds later, KILL --
+# because a wedged 'zfs send' that ignores TERM must still leave the tick, and
+# a tick that cannot end is worse than a tick that failed.
+seance_run_timeout()
+{
+    local _secs _rc
+
+    _secs=${1:-}
+    [ $# -ge 2 ] || return 2
+
+    case "${_secs}" in
+        ''|*[!0123456789]*) return 2 ;;
+    esac
+    [ "${_secs}" -gt 0 ] || return 2
+
+    shift
+
+    timeout -k 5 "${_secs}" "$@"
+    _rc=$?
+
+    # A killed command is diagnosed here, once, rather than left for each
+    # caller to recognise 124 for itself. Silence at this point is how a tick
+    # comes to report a failure whose real cause was the clock.
+    [ "${_rc}" -eq "${TRANSPORT_RC_TIMEOUT}" ] &&
+        seance_log warning "timed out after ${_secs}s and was killed: $1"
+
+    return "${_rc}"
+}
+
+# transport_ssh_target <address>
+#
+# Print "<ssh_user>@<address>". rc 2 if the address is empty.
+transport_ssh_target()
+{
+    local _addr _user
+
+    _addr=${1:-}
+    [ -n "${_addr}" ] || return 2
+
+    _user=$( conf_effective ssh_user ) || _user=root
+
+    printf '%s@%s\n' "${_user}" "${_addr}"
+}
+
+# transport_ssh_opts
+#
+# Print the ssh option words, one line, for the caller to word-split
+# deliberately. BatchMode=yes is not negotiable: a replication tick fired from
+# cron has no terminal, and an ssh that stops to ask for a password is an ssh
+# that hangs until the timeout kills it.
+#
+# ssh_extra_opts is appended last and unquoted, so a site can override anything
+# above it -- that is the point of the key (D-35), and seance does not parse
+# ssh's options.
+transport_ssh_opts()
+{
+    local _port _extra
+
+    _port=$( conf_effective ssh_port ) || _port=22
+    _extra=$( conf_effective ssh_extra_opts ) || _extra=""
+
+    printf -- '-p %s -o BatchMode=yes -o ConnectTimeout=%s %s\n' \
+        "${_port}" "${TRANSPORT_CONNECT_TIMEOUT}" "${_extra}"
+}
+
+# seance_ssh <address> <command-string> [timeout-seconds]
+#
+# Run ONE command string on a peer and print its stdout. The command is a
+# single string, not an argument vector, because that is what ssh actually
+# transports: it joins its arguments with spaces and hands the result to the
+# peer's shell, so an argument vector would only look safer than it is.
+# Callers quote for the remote shell themselves.
+#
+# stdin is /dev/null. ssh reads stdin when it has one, and a caller that ran
+# this inside a 'while read' loop would otherwise lose the rest of its input --
+# the defect class recorded in D-24.
+seance_ssh()
+{
+    local _addr _cmd _to _target _opts
+
+    _addr=${1:-}
+    _cmd=${2:-}
+    _to=${3:-${TRANSPORT_CTL_TIMEOUT}}
+
+    [ -n "${_addr}" ] || return 2
+    [ -n "${_cmd}" ] || return 2
+
+    _target=$( transport_ssh_target "${_addr}" ) || return 2
+    _opts=$( transport_ssh_opts ) || return 2
+
+    # shellcheck disable=SC2086
+    #   Deliberate word splitting: ${_opts} is an option list being turned
+    #   into one argument per word, which is the whole reason it is a string.
+    seance_run_timeout "${_to}" ssh ${_opts} "${_target}" "${_cmd}" < /dev/null
+}
+
+# seance_ssh_argv <address>
+#
+# Print the ssh invocation -- program, options and target -- as one line, for a
+# caller that must place it inside a pipeline rather than call it:
+#
+#     zfs send ... | $( seance_ssh_argv "${addr}" ) 'zfs recv ...'
+#
+# There is no timeout here on purpose: the caller owns the pipeline and bounds
+# the whole of it, because bounding only one half of a pipe leaves the other
+# half running.
+seance_ssh_argv()
+{
+    local _addr _target _opts
+
+    _addr=${1:-}
+    [ -n "${_addr}" ] || return 2
+
+    _target=$( transport_ssh_target "${_addr}" ) || return 2
+    _opts=$( transport_ssh_opts ) || return 2
+
+    printf 'ssh %s %s\n' "${_opts}" "${_target}"
+}
+
+# seance_ssh_probe <address> [timeout-seconds]
+#
+# rc 0 if the peer answers a trivial command, 1 if it does not. No output.
+# This is the mesh-reachability measurement 'verify' and 'status' both make,
+# in one place so that they cannot disagree about what "reachable" means.
+seance_ssh_probe()
+{
+    seance_ssh "${1:-}" 'exit 0' "${2:-${TRANSPORT_CONNECT_TIMEOUT}}" \
+        > /dev/null 2>&1
+}

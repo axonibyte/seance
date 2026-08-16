@@ -30,6 +30,59 @@ readonly SEANCE_ROOT
 # shellcheck source-path=SCRIPTDIR
 # shellcheck source=../lib/conf.subr
 . "${SEANCE_ROOT}/lib/conf.subr"
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=../lib/transport.subr
+. "${SEANCE_ROOT}/lib/transport.subr"
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=../lib/zfs.subr
+. "${SEANCE_ROOT}/lib/zfs.subr"
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=../lib/repl.subr
+. "${SEANCE_ROOT}/lib/repl.subr"
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=../lib/status.subr
+. "${SEANCE_ROOT}/lib/status.subr"
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=../lib/verify.subr
+. "${SEANCE_ROOT}/lib/verify.subr"
+
+# The adapter: everything that knows what a guest is on this host. One file,
+# selected by $SEANCE_ADAPTER so that the pseudo-cluster and the conformance
+# suite can put a different one in its place (D-3) -- the seam is the point of
+# the design (§2), and a seam only one implementation can pass is not a seam.
+#
+# Sourced when present, and only then: version, help and config are answerable
+# on a workstation with no adapter at all, and a dispatcher that could not
+# print its own version without CBSD would be a dispatcher the cheap test tiers
+# could not drive. adapter_init is NOT called here -- see seance_adapter_init.
+#
+# Exported, not merely set: `repl` re-executes this dispatcher once per
+# guest-peer pair under lockf(1) (D-62), and a child that resolved a different
+# adapter from its parent would be a seam with two sides.
+SEANCE_ADAPTER=${SEANCE_ADAPTER:-${SEANCE_ROOT}/lib/adapter.subr}
+export SEANCE_ADAPTER
+if [ -r "${SEANCE_ADAPTER}" ]; then
+    # shellcheck disable=SC1090
+    #   The adapter's path is chosen at run time by design; there is no
+    #   constant path for shellcheck to follow.
+    . "${SEANCE_ADAPTER}"
+fi
+
+# seance_adapter_init
+#
+# Bring the adapter up, once, for the verbs that need it. Separate from the
+# sourcing above because adapter_init talks to the host -- it finds CBSD's
+# workdir and node name -- and a verb that does not need the host must not fail
+# on a machine that has none.
+seance_adapter_init()
+{
+    command -v adapter_node_self > /dev/null 2>&1 ||
+        seance_die 2 "no adapter at ${SEANCE_ADAPTER}: this verb needs one"
+
+    if command -v adapter_init > /dev/null 2>&1; then
+        adapter_init || seance_die 2 "the adapter at ${SEANCE_ADAPTER} could not initialise"
+    fi
+}
 
 seance_usage()
 {
@@ -37,6 +90,12 @@ seance_usage()
 usage: seance <verb> [args]
 
 Verbs:
+  repl [--guest <g>] [--peer <p>] [--dry-run] [--now]
+                     run one replication tick: snapshot, send, prune, record
+  status [--tsv]     the one screen: guests, replica freshness, mesh health
+  verify [--render cron]
+                     render the configuration seance expects and diff it
+                     against reality; never writes anything
   config [--check] [--file <path>]
                      print the effective configuration; --check validates it
                      and prints one line per problem
@@ -48,6 +107,128 @@ The configuration file is \$SEANCE_CONF if set, otherwise
 
 Exit codes: 0 ok, 1 operation failed, 2 usage or contract error.
 EOF
+}
+
+# seance_load_conf
+#
+# Find, parse and validate the configuration for a verb that acts on the
+# fleet. An invalid configuration is exit 2 and no action: a tick that ran on
+# the defaults a typo hid is worse than a tick that did not run (D-34).
+seance_load_conf()
+{
+    local _file
+
+    _file=$( seance_conf_path ) ||
+        seance_die 2 "no config file: set SEANCE_CONF, or run under CBSD"
+
+    conf_load "${_file}" || exit 2
+
+    conf_check > /dev/null || {
+        conf_check >&2
+        seance_die 2 "the configuration is invalid; nothing will run on it"
+    }
+}
+
+# seance_repl [--guest <g>] [--peer <p>] [--dry-run] [--now] [--locked]
+#
+# --now      ignore the per-guest cadence gate and tick regardless. cron does
+#            not pass it; an operator who wants a tick this minute does.
+# --locked   internal: this invocation already holds the pair's lock and must
+#            do exactly the one pair it was given. repl re-executes itself
+#            under lockf(1) for each pair (D-62), and this is how the child
+#            knows not to snapshot or to recurse.
+seance_repl()
+{
+    local _guest _peer _dry _now _locked
+
+    _guest=""
+    _peer=""
+    _dry=0
+    _now=0
+    _locked=0
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --guest)
+                [ $# -ge 2 ] || seance_die 2 "repl: --guest needs a guest name"
+                _guest=$2
+                shift
+                ;;
+            --guest=*) _guest=${1#--guest=} ;;
+            --peer)
+                [ $# -ge 2 ] || seance_die 2 "repl: --peer needs a node key"
+                _peer=$2
+                shift
+                ;;
+            --peer=*) _peer=${1#--peer=} ;;
+            --dry-run) _dry=1 ;;
+            --now) _now=1 ;;
+            --locked) _locked=1 ;;
+            *) seance_die 2 "repl: unknown argument: $1" ;;
+        esac
+        shift
+    done
+
+    seance_load_conf
+    seance_adapter_init
+    seance_tmp_init
+
+    repl_tick "${_guest}" "${_peer}" "${_dry}" "${_now}" "${_locked}"
+}
+
+# seance_status [--tsv]
+seance_status()
+{
+    local _tsv
+
+    _tsv=0
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --tsv) _tsv=1 ;;
+            *) seance_die 2 "status: unknown argument: $1" ;;
+        esac
+        shift
+    done
+
+    seance_load_conf
+    seance_adapter_init
+    seance_tmp_init
+
+    status_report "${_tsv}"
+}
+
+# seance_verify [--render <what>]
+seance_verify()
+{
+    local _render
+
+    _render=""
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --render)
+                [ $# -ge 2 ] || seance_die 2 "verify: --render needs a subject (cron)"
+                _render=$2
+                shift
+                ;;
+            --render=*) _render=${1#--render=} ;;
+            *) seance_die 2 "verify: unknown argument: $1" ;;
+        esac
+        shift
+    done
+
+    seance_load_conf
+
+    if [ -n "${_render}" ]; then
+        verify_render "${_render}"
+        return $?
+    fi
+
+    seance_adapter_init
+    seance_tmp_init
+
+    verify_report
 }
 
 seance_version()
@@ -162,6 +343,18 @@ _verb=$1
 shift
 
 case "${_verb}" in
+    repl)
+        seance_repl "$@"
+        exit $?
+        ;;
+    status)
+        seance_status "$@"
+        exit $?
+        ;;
+    verify)
+        seance_verify "$@"
+        exit $?
+        ;;
     config)
         seance_config "$@"
         exit $?

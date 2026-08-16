@@ -1,0 +1,49 @@
+The rediscovery battery (TESTING.md §8).
+
+The methodology's own acceptance test, and the one seance is unusually equipped
+to pass: the defect catalogue already exists. The August 2026 migration produced
+real failures with known mechanisms, and the harness must rediscover them when
+their protections are reverted.
+
+Each row of table.tsv names a patch that removes one protection and the test
+that must then fail. run.sh applies each patch to a SCRATCH COPY of the tree,
+runs the named test there, and requires a failure. The working tree is never
+touched, so there is no restore step and nothing to forget to undo.
+
+    sh tests/rediscovery/run.sh --tier 6
+
+--tier is required, never defaulted: tier 6 needs root, ZFS and vnet jails, and
+takes minutes per row. Nothing runs this automatically. It is the check you run
+before you believe the suite, not the one you run after every edit.
+
+The rows, and what each is about:
+
+  recv-no-x-mountpoint.patch
+      Removes -x mountpoint from the receive. 'zfs send -p' carries a
+      dataset's locally set properties, a CBSD guest's dataset carries a local
+      mountpoint, and a receive without the flag plants it on the replica: a
+      second dataset claiming the live guest's mount. The August defect,
+      verbatim.
+
+      What catches it is NOT the property assertion -- seance also holds the
+      law on every tick and would repair the property before the assertion
+      looked. What catches it is the assertion that a clean tick has nothing to
+      repair. Defence in depth means one reverted layer is caught by the layer
+      that notices it working.
+
+  repl-skip-resume-token.patch
+      Makes the engine ignore the peer's receive_resume_token. A dataset
+      holding a token refuses every other stream -- "destination contains
+      partially-complete state from zfs receive -s" -- so a fat guest whose
+      send was interrupted would never replicate again, while looking busy
+      every tick. Caught by the interrupt stage, which kills a send mid-stream
+      and then requires the next tick to finish it.
+
+Adding a row: write the patch against the current tree with
+
+    diff -u a/<file> b/<file> > tests/rediscovery/<name>.patch
+
+(paths relative, applied with patch -p1 at the repository root), add the row to
+table.tsv, and run the battery. A patch that no longer applies is itself a
+finding -- the protection it reverts has moved, and run.sh says so rather than
+passing over it.
