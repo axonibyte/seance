@@ -1,0 +1,33 @@
+# seance ships no build artifacts: it is sh, installed by cloning this
+# repository into CBSD's module directory. Pipelines exist here for exactly one
+# purpose today -- mirroring every branch and tag to GitHub.
+#
+# No test step is wired: the harness targets FreeBSD /bin/sh (tiers 1-4 on a
+# FreeBSD workstation, tiers 5-7 inside reaper sessions on the freebsd-15.1
+# guest); a Linux CI image cannot host it and would only pass vacuously. See
+# TESTING.md. A shellcheck-only step is a possible future addition, not a
+# substitute.
+#
+# The image is pinned to a major rather than :latest so a rebuild next year
+# runs the same git and ssh; the mirror step needs nothing else from it.
+image: atlassian/default-image:4
+
+definitions:
+  steps:
+    - step: &doMirror
+        name: Mirror repository
+        clone:
+          enabled: false
+        script:
+          - git clone --mirror git@bitbucket.org:${BITBUCKET_REPO_OWNER}/${BITBUCKET_REPO_SLUG}.git
+          - cd ${BITBUCKET_REPO_SLUG}.git
+          - git push --mirror git@github.com:${BITBUCKET_REPO_OWNER}/${BITBUCKET_REPO_SLUG}.git
+
+pipelines:
+  branches:
+    '**':
+      - step: *doMirror
+
+  tags:
+    '**':
+      - step: *doMirror
