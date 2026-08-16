@@ -1,0 +1,29 @@
+# seance tier 7 -- the fixed seed battery.
+#
+# One seed per line, decimal, comments and blank lines ignored. These five
+# were drawn once from /dev/urandom on 2026-08-16 and committed; they are the
+# default battery (DESIGN.md §9), run at SEANCE_SIM_STEPS=60 each. Nothing
+# about them is special, and that is the point: a fixed battery costs a known
+# amount and finds the same things on every machine, which is what makes a
+# regression here a regression and not a mood.
+#
+# THE PROMOTION RULE
+#
+# Any seed that ever finds a defect is appended to this file permanently, with
+# a comment naming what it found and the commit that fixed it. It is never
+# removed -- not when the defect is fixed, not when the run gets slow, not
+# when somebody is sure it is now redundant. A seed that found something once
+# is the only kind of seed with a proven track record, and the battery is the
+# cheapest possible guard against that exact defect returning.
+#
+# Hunting runs (SEANCE_HUNT=1) draw fresh seeds from /dev/urandom and print
+# each one before using it; when one fails, copy the printed seed here.
+#
+# Appending a seed is not a decision that needs anyone's permission. Removing
+# one is, and the answer is no.
+
+1043489862
+2885768256
+1772760640
+275565795
+2950315648

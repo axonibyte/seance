@@ -1,0 +1,948 @@
+# seance tier 7 -- the checker.
+#
+# The five invariants of TESTING.md §7 (and 4a of DESIGN.md §6), evaluated
+# against a *model state* and an *observed state*. Neither state is a live
+# cluster: both are plain directories of TSV files, so the same checker serves
+# the oracle self-test (hand-built broken states, no cluster at all) and the
+# tier-7 world driver (states materialised from the pseudo-cluster).
+#
+# An invariant that never fires is indistinguishable from a passing suite
+# (methodology §11). Everything here is therefore built to be fed lies:
+# observations come through injectable functions, every observation failure is
+# a firing rather than a silent zero, and tests/tier4/t_sim_oracle_selftest.sh
+# must see every invariant fire before tier 7 is allowed to cost anything.
+#
+# Output is one line per verdict on stdout:
+#     invariant <n> ok
+#     invariant <n> FIRED: <why>
+# with one FIRED line per distinct violation, and rc 0 (clean) or 1 (fired).
+# Diagnostics -- things that are wrong with the *inputs* rather than with
+# seance -- go to stderr as well as firing.
+#
+# ---------------------------------------------------------------------------
+# THE STATE FILE CONTRACT
+# ---------------------------------------------------------------------------
+#
+# Both kinds of state are directories. Every file is tab-separated, one record
+# per line; blank lines are ignored; there is no header, no quoting and no
+# escaping, so no field may contain a tab or a newline. Every file listed as
+# mandatory must exist even when it is empty -- a missing file is a contract
+# error and fires the invariant that needed it, because an oracle that reads a
+# missing file as "nothing wrong" is the failure mode this tier exists to
+# avoid.
+#
+# The M3 world driver implements this contract; the self-test writes it by
+# hand. Where they disagree, this comment is the contract.
+#
+# --- observed state (mandatory: running placement snapshots records props
+#     datasets invocations) --------------------------------------------------
+#
+# format: <obs>/running       <guest> <node> <running>
+#     <running> is 0 or 1. One row per (guest, node) pair the observer looked
+#     at; rows with 0 may be omitted. "Running" is what the *adapter on that
+#     node* says -- for the pseudo-cluster, a guest record in the running
+#     state, not a process.
+#
+# format: <obs>/placement     <node> <guest> <claim>
+#     One row per entry of that node's ${SEANCE_STATE_DIR}/placement, which
+#     lists guests the node hosts *away from their home* (D-44.6), plus one
+#     row per guest that node is holding in slave mode (D-21).
+#     <claim> is 'active' (the node is authorised to run it) or 'held' (the
+#     gate is withholding it; the node must not run it).
+#     A guest with no 'active' row anywhere is placed at its home.
+#
+# format: <obs>/snapshots     <node> <guest> <snapshot>
+#     One row per ZFS snapshot of that guest's root dataset on that node.
+#     <snapshot> is the part *after* the '@', verbatim, so foreign names
+#     (`zrepl-...`) are visible to the checker rather than filtered by it.
+#
+# format: <obs>/records       <node> <guest> <old_home> <new_home> <ts> <evidence>
+#     One row per line of that node's succession.log (D-44.6), with the node
+#     that holds the log prepended. This file is also invariant 2's "logs
+#     parse" check: a row that is not exactly six fields is a violation.
+#
+# format: <obs>/props         <node> <guest> <property> <value>
+#     ZFS properties of that guest's root dataset on that node. Invariant 4a
+#     reads 'canmount' and 'mountpoint'; other properties may be present and
+#     are ignored. A (node, guest) pair with no rows is read as "that node
+#     holds no dataset for that guest", which is why the driver must emit rows
+#     for every replica it knows about.
+#
+# format: <obs>/datasets      <node> <dataset>
+#     Every dataset (never a snapshot, never a zvol's snapshots) that node
+#     holds for seance's estate, by full ZFS name. This MUST be observed from
+#     the substrate host rather than from inside the node: a node being dead
+#     is not a reason for its datasets to stop existing, and an observer that
+#     cannot see a stopped node's datasets would turn invariant 4 -- the one
+#     that says seance never destroys data -- into a check that fires on every
+#     kill event and is therefore switched off within a week.
+#
+# format: <obs>/invocations   <capture-dir>
+#     One absolute path per line: a directory written by oracle_run for a
+#     seance invocation made during the step that produced this state. May be
+#     empty; the file itself is mandatory so that a driver which forgets to
+#     record invocations gets a contract error instead of a silent pass.
+#
+# --- model state (mandatory: nodes guests lineage; optional: refused) --------
+#
+# format: <model>/nodes       <node> <state>
+#     <state> is alive, dead or isolated. This is the node roster: invariants
+#     2, 3, 4 and 4a iterate it, so a node missing here is a node nobody
+#     checks.
+#
+# format: <model>/guests      <guest> <home>
+#     The guest roster and each guest's home node. The model does not record
+#     placement here: placement is *observed*, and the model's expectation
+#     about it is expressed by the records the world was supposed to write.
+#
+# format: <model>/lineage     <guest> <node> <newest_ts>
+#     The newest @seance-* timestamp the model believes exists for that
+#     (guest, node), in seance's UTC form (YYYYMMDDThhmmssZ), or '-' for none.
+#     The model is deliberately partial: it predicts monotonicity, never exact
+#     names, so invariant 3 asserts model <= observed and never equality.
+#
+# format: <model>/refused     <guest> <node>
+#     Optional. Pairs for which seance has printed a FAIL verdict rather than
+#     repairing them -- DESIGN §6 invariant 4a allows a hand-mounted replica
+#     to be either repaired or refused, but not silently accepted. A pair
+#     listed here is exempt from 4a until it is repaired and the row removed.
+#     The file being optional is safe in the direction that matters: forget it
+#     and 4a fires; forge it and the self-test's negative control does not.
+#
+# shellcheck shell=sh
+# shellcheck disable=SC3043
+#   'local' is not in POSIX sh but is implemented by FreeBSD /bin/sh (sh(1),
+#   "local"); seance targets FreeBSD sh and nothing else (handoff §5).
+
+# The evidence vocabulary of a succession record (D-44.6). Strict on purpose:
+# an evidence token this checker does not recognise fires invariant 2 rather
+# than being waved through, so extending the vocabulary in M2 is a change that
+# announces itself here.
+INV_EVIDENCE_RE='^(fence:[A-Za-z0-9_.-]+|force:[^[:space:]]+|failback|discard:[0-9]+)$'
+
+# The evidence a *promotion* (a placement move away from home) must carry.
+# TESTING.md §7 invariant 2: "every promotion was preceded by a confirmed
+# fence or a recorded human force" -- a 'failback' token on a move away from
+# home is a mislabelled promotion, not a promotion with evidence.
+INV_PROMOTION_EVIDENCE_RE='^(fence:[A-Za-z0-9_.-]+|force:[^[:space:]]+)$'
+
+# The evidence a return home must carry (D-44.6).
+INV_FAILBACK_EVIDENCE_RE='^(failback|discard:[0-9]+)$'
+
+# Properties a replica may carry. A replica is a copy of a dataset on a node
+# not authorised to run its guest; seance receives with -x mountpoint -x
+# canmount -u precisely so these stay inert (design §4, the shadow-mount law).
+INV_REPLICA_CANMOUNT="noauto off"
+INV_REPLICA_MOUNTPOINT="none -"
+
+INV_FIRED=0
+
+# ---------------------------------------------------------------------------
+# Reporting
+# ---------------------------------------------------------------------------
+
+# inv_diag <message...> -- something wrong with the inputs, on stderr.
+inv_diag()
+{
+    printf '# invariants: %s\n' "$*" >&2
+}
+
+# inv_begin <n> -- start an invariant's evaluation.
+inv_begin()
+{
+    INV_FIRED=0
+}
+
+# inv_fire <n> <why...> -- record one violation.
+inv_fire()
+{
+    local _n
+
+    _n=$1
+    shift
+
+    printf 'invariant %s FIRED: %s\n' "${_n}" "$*"
+    INV_FIRED=$(( INV_FIRED + 1 ))
+}
+
+# inv_verdict <n> -- print 'ok' when nothing fired; rc 0 clean, 1 fired.
+inv_verdict()
+{
+    if [ "${INV_FIRED}" -eq 0 ]; then
+        printf 'invariant %s ok\n' "$1"
+        return 0
+    fi
+
+    return 1
+}
+
+# ---------------------------------------------------------------------------
+# Small readers
+# ---------------------------------------------------------------------------
+
+# inv_count -- count non-blank lines on stdin.
+inv_count()
+{
+    awk 'NF > 0 { n++ } END { print n + 0 }'
+}
+
+# inv_join -- space-join non-blank lines from stdin onto one line.
+inv_join()
+{
+    awk 'NF > 0 { s = (s == "" ? $0 : s " " $0) } END { print s }'
+}
+
+# inv_state_file <state-dir> <name> -- print the path, rc 2 if absent.
+inv_state_file()
+{
+    local _f
+
+    _f="$1/$2"
+
+    if [ ! -f "${_f}" ]; then
+        inv_diag "state file missing: ${_f}"
+        return 2
+    fi
+
+    printf '%s\n' "${_f}"
+}
+
+# ---------------------------------------------------------------------------
+# The injectable observation functions
+#
+# These are the seam. The definitions here read the file contract above; the
+# world driver overrides them with functions that query the pseudo-cluster,
+# and the self-test uses these. Contract for every one of them: rc 0 means the
+# observation was made (possibly with no rows), any non-zero rc means it could
+# not be made -- and the invariant that asked fires. There is no third answer.
+# ---------------------------------------------------------------------------
+
+# obs_running <state> <guest> -- nodes where the guest is observed running.
+obs_running()
+{
+    local _f
+
+    _f=$( inv_state_file "$1" running ) || return 2
+    awk -F'\t' -v g="$2" '$1 == g && $3 == "1" { print $2 }' "${_f}"
+}
+
+# obs_placement <state> <node> -- "<guest><TAB><claim>" for that node.
+obs_placement()
+{
+    local _f
+
+    _f=$( inv_state_file "$1" placement ) || return 2
+    awk -F'\t' -v n="$2" '$1 == n && NF >= 3 { print $2 "\t" $3 }' "${_f}"
+}
+
+# obs_snapshots <state> <node> <guest> -- snapshot names, without the '@'.
+#
+# DESIGN §7 writes this as obs_snapshots <node> <ds>. The checker only ever
+# asks about a guest's root dataset, and the guest name is the one key that is
+# stable across nodes (a replica's dataset name is not: D-6 puts it under
+# <standby_root>/<homekey>/), so the guest is the argument and mapping it to a
+# dataset is the world driver's job.
+obs_snapshots()
+{
+    local _f
+
+    _f=$( inv_state_file "$1" snapshots ) || return 2
+    awk -F'\t' -v n="$2" -v g="$3" '$1 == n && $2 == g { print $3 }' "${_f}"
+}
+
+# obs_records <state> <node> -- that node's succession log, node field dropped.
+obs_records()
+{
+    local _f
+
+    _f=$( inv_state_file "$1" records ) || return 2
+    awk -F'\t' -v n="$2" '$1 == n && NF > 0 {
+        line = $2
+        for (i = 3; i <= NF; i++) line = line "\t" $i
+        print line
+    }' "${_f}"
+}
+
+# obs_props <state> <node> <guest> -- "<property><TAB><value>".
+obs_props()
+{
+    local _f
+
+    _f=$( inv_state_file "$1" props ) || return 2
+    awk -F'\t' -v n="$2" -v g="$3" '$1 == n && $2 == g && NF >= 4 {
+        print $3 "\t" $4
+    }' "${_f}"
+}
+
+# obs_datasets <state> <node> -- dataset names that node holds.
+obs_datasets()
+{
+    local _f
+
+    _f=$( inv_state_file "$1" datasets ) || return 2
+    awk -F'\t' -v n="$2" '$1 == n && NF >= 2 { print $2 }' "${_f}"
+}
+
+# obs_invocations <state> -- capture directories for this step's invocations.
+obs_invocations()
+{
+    local _f
+
+    _f=$( inv_state_file "$1" invocations ) || return 2
+    awk 'NF > 0 { print $0 }' "${_f}"
+}
+
+# ---------------------------------------------------------------------------
+# Rosters and derived facts
+# ---------------------------------------------------------------------------
+
+# inv_nodes <model> -- the node roster, one per line.
+inv_nodes()
+{
+    local _f
+
+    _f=$( inv_state_file "$1" nodes ) || return 2
+    awk -F'\t' 'NF > 0 { print $1 }' "${_f}"
+}
+
+# inv_guests <model> -- the guest roster, one per line.
+inv_guests()
+{
+    local _f
+
+    _f=$( inv_state_file "$1" guests ) || return 2
+    awk -F'\t' 'NF > 0 { print $1 }' "${_f}"
+}
+
+# inv_home <model> <guest> -- the guest's home node, or '' if unknown.
+inv_home()
+{
+    local _f
+
+    _f=$( inv_state_file "$1" guests ) || return 2
+    awk -F'\t' -v g="$2" '$1 == g { print $2; exit }' "${_f}"
+}
+
+# inv_guest_roster <model> <obs> -- model guests plus any guest the world
+# shows running or claimed. A guest the model has never heard of is exactly
+# the kind of thing invariant 1 exists to notice, so the union is taken rather
+# than the model's list alone.
+inv_guest_roster()
+{
+    local _mf _rf _pf
+
+    _mf=$( inv_state_file "$1" guests ) || return 2
+    _rf=$( inv_state_file "$2" running ) || return 2
+    _pf=$( inv_state_file "$2" placement ) || return 2
+
+    {
+        awk -F'\t' 'NF > 0 { print $1 }' "${_mf}"
+        awk -F'\t' 'NF > 0 { print $1 }' "${_rf}"
+        awk -F'\t' 'NF > 1 { print $2 }' "${_pf}"
+    } | sort -u
+}
+
+# inv_active_nodes <state> <nodes> <guest> -- nodes with an 'active' claim.
+inv_active_nodes()
+{
+    local _state _nodes _g _n _hit
+
+    _state=$1
+    _nodes=$2
+    _g=$3
+
+    # shellcheck disable=SC2086
+    #   Deliberate word splitting: ${_nodes} is a whitespace-separated roster
+    #   being turned into one iteration per node.
+    for _n in ${_nodes}; do
+        _hit=$( obs_placement "${_state}" "${_n}" |
+            awk -F'\t' -v g="${_g}" '$1 == g && $2 == "active" { print "y" }' )
+        [ -n "${_hit}" ] && printf '%s\n' "${_n}"
+    done
+
+    return 0
+}
+
+# inv_effective_placement <state> <nodes> <guest> <home>
+#
+# The node authorised to run the guest: the one claiming it 'active', or its
+# home when nobody claims it. When more than one node claims it the first is
+# printed -- the multiplicity itself is invariant 1's business, and invariant
+# 2 must still be able to say something about the move that happened.
+inv_effective_placement()
+{
+    local _a
+
+    _a=$( inv_active_nodes "$1" "$2" "$3" | awk 'NR == 1 { print }' )
+
+    if [ -n "${_a}" ]; then
+        printf '%s\n' "${_a}"
+    else
+        printf '%s\n' "$4"
+    fi
+}
+
+# inv_newest_ts -- newest seance timestamp among snapshot names on stdin.
+#
+# Deliberately independent of lib/policy.subr: an oracle that borrows the
+# parser it is checking cannot notice that the parser is wrong. The name is
+# split right-to-left because a node field may contain dashes (handoff §2.1),
+# and seance's timestamps sort lexicographically iff they sort chronologically
+# (fixed-width UTC), which is what makes the comparison a string compare.
+inv_newest_ts()
+{
+    awk '
+        /^seance-/ {
+            n = split($0, p, "-")
+            ts = p[n]
+            if (ts ~ /^[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]T[0-9][0-9][0-9][0-9][0-9][0-9]Z$/ &&
+                ts > best)
+                best = ts
+        }
+        END { if (best != "") print best }
+    '
+}
+
+# ---------------------------------------------------------------------------
+# Invariant 1 -- no guest is active on two nodes
+#
+# The split-brain invariant: the reason seance exists. Two clauses, because
+# there are two ways for a guest to be in two places and only one of them
+# involves a running process. A 'held' claim (the gate, D-21) is explicitly
+# not a claim to run: a returning node that holds its estate while a peer runs
+# it is the correct state, not a violation.
+# ---------------------------------------------------------------------------
+
+inv_1()
+{
+    inv_begin 1
+    inv_1_body "$1" "$2"
+    inv_verdict 1
+}
+
+inv_1_body()
+{
+    local _model _obs _guests _nodes _g _run _n _act _c
+
+    _model=$1
+    _obs=$2
+
+    _guests=$( inv_guest_roster "${_model}" "${_obs}" ) || {
+        inv_fire 1 "cannot read the guest roster"
+        return 0
+    }
+    _nodes=$( inv_nodes "${_model}" ) || {
+        inv_fire 1 "cannot read the node roster"
+        return 0
+    }
+
+    # shellcheck disable=SC2086
+    #   Deliberate word splitting over the newline-separated roster.
+    for _g in ${_guests}; do
+        _run=$( obs_running "${_obs}" "${_g}" ) || {
+            inv_fire 1 "cannot observe where ${_g} is running"
+            continue
+        }
+        _c=$( printf '%s\n' "${_run}" | inv_count )
+        if [ "${_c}" -gt 1 ]; then
+            inv_fire 1 "guest ${_g} is running on ${_c} nodes:" \
+                "$( printf '%s\n' "${_run}" | inv_join )"
+        fi
+
+        _act=$( inv_active_nodes "${_obs}" "${_nodes}" "${_g}" )
+        _c=$( printf '%s\n' "${_act}" | inv_count )
+        if [ "${_c}" -gt 1 ]; then
+            inv_fire 1 "guest ${_g} is claimed active by ${_c} nodes:" \
+                "$( printf '%s\n' "${_act}" | inv_join )"
+        fi
+    done
+
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# Invariant 2 -- every promotion has evidence, and the logs parse
+#
+# Clause A: every succession record is six fields and carries an evidence
+#     token from D-44.6's vocabulary. This is also DESIGN §6.5's "logs parse".
+# Clause B: a guest placed away from home has a record naming the node it sits
+#     on, with fence: or force: evidence.
+# Clause C: a guest whose placement moved between two observed states has a
+#     record for the move -- and a move *home* is a failback, which carries
+#     failback/discard evidence rather than a fence.
+#
+# B without C would miss a guest that came home without a record; C without B
+# would miss a state that simply arrived already wrong, which is what a
+# missing first observation looks like.
+# ---------------------------------------------------------------------------
+
+inv_2()
+{
+    inv_begin 2
+    inv_2_body "$1" "$2" "${3:-}"
+    inv_verdict 2
+}
+
+inv_2_body()
+{
+    local _model _obs _prev _nodes _guests _n _g _recs _home _cur _was _bad
+
+    _model=$1
+    _obs=$2
+    _prev=${3:-}
+
+    _nodes=$( inv_nodes "${_model}" ) || {
+        inv_fire 2 "cannot read the node roster"
+        return 0
+    }
+    _guests=$( inv_guests "${_model}" ) || {
+        inv_fire 2 "cannot read the guest roster"
+        return 0
+    }
+
+    # Clause A.
+    # shellcheck disable=SC2086
+    #   Deliberate word splitting over the newline-separated roster.
+    for _n in ${_nodes}; do
+        _recs=$( obs_records "${_obs}" "${_n}" ) || {
+            inv_fire 2 "cannot read the succession log of ${_n}"
+            continue
+        }
+        _bad=$( printf '%s\n' "${_recs}" |
+            awk -F'\t' 'NF > 0 && NF != 5 { print NR ": " NF " fields" }' )
+        if [ -n "${_bad}" ]; then
+            inv_fire 2 "succession log of ${_n} does not parse (want 5 fields" \
+                "guest/old_home/new_home/ts/evidence):" \
+                "$( printf '%s\n' "${_bad}" | inv_join )"
+        fi
+        _bad=$( printf '%s\n' "${_recs}" |
+            awk -F'\t' -v re="${INV_EVIDENCE_RE}" 'NF == 5 && $5 !~ re {
+                print $1 "=[" $5 "]"
+            }' )
+        if [ -n "${_bad}" ]; then
+            inv_fire 2 "succession record on ${_n} has no recognised evidence:" \
+                "$( printf '%s\n' "${_bad}" | inv_join )"
+        fi
+    done
+
+    # Clauses B and C.
+    # shellcheck disable=SC2086
+    #   Deliberate word splitting over the newline-separated roster.
+    for _g in ${_guests}; do
+        _home=$( inv_home "${_model}" "${_g}" )
+        _cur=$( inv_effective_placement "${_obs}" "${_nodes}" "${_g}" "${_home}" )
+
+        if [ "${_cur}" != "${_home}" ]; then
+            inv_2_require_record "${_obs}" "${_nodes}" "${_g}" "${_cur}" \
+                "${INV_PROMOTION_EVIDENCE_RE}" \
+                "is placed on ${_cur}, away from home ${_home}, but no" \
+                "succession record on any node promotes it there with a" \
+                "confirmed fence or a recorded force"
+        fi
+
+        [ -n "${_prev}" ] || continue
+
+        _was=$( inv_effective_placement "${_prev}" "${_nodes}" "${_g}" "${_home}" )
+        [ "${_was}" = "${_cur}" ] && continue
+
+        if [ "${_cur}" = "${_home}" ]; then
+            inv_2_require_record "${_obs}" "${_nodes}" "${_g}" "${_cur}" \
+                "${INV_FAILBACK_EVIDENCE_RE}" \
+                "moved from ${_was} back to its home ${_cur} with no" \
+                "succession record carrying failback evidence"
+        else
+            inv_2_require_record "${_obs}" "${_nodes}" "${_g}" "${_cur}" \
+                "${INV_PROMOTION_EVIDENCE_RE}" \
+                "moved from ${_was} to ${_cur} with no succession record" \
+                "carrying a confirmed fence or a recorded force"
+        fi
+    done
+
+    return 0
+}
+
+# inv_2_require_record <obs> <nodes> <guest> <new_home> <evidence-re> <why...>
+#
+# Fires unless some node's succession log holds a record for the guest whose
+# new_home is <new_home> and whose evidence matches <evidence-re>.
+inv_2_require_record()
+{
+    local _obs _nodes _g _new _re _n _hit
+
+    _obs=$1
+    _nodes=$2
+    _g=$3
+    _new=$4
+    _re=$5
+    shift 5
+
+    _hit=""
+    # shellcheck disable=SC2086
+    #   Deliberate word splitting over the newline-separated roster.
+    for _n in ${_nodes}; do
+        _hit=$( obs_records "${_obs}" "${_n}" |
+            awk -F'\t' -v g="${_g}" -v h="${_new}" -v re="${_re}" \
+                'NF == 5 && $1 == g && $3 == h && $5 ~ re { print "y" }' )
+        [ -n "${_hit}" ] && break
+    done
+
+    [ -n "${_hit}" ] && return 0
+
+    inv_fire 2 "guest ${_g} $*"
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# Invariant 3 -- lineage is monotonic
+#
+# A replica that regresses is a replica that has been rolled back, received
+# out of order, or destroyed and remade from an older base; each is a way to
+# lose the writes a promotion would otherwise have carried. Two clauses: the
+# world never goes backwards between two observations, and the model's belief
+# never exceeds what the world can show.
+# ---------------------------------------------------------------------------
+
+inv_3()
+{
+    inv_begin 3
+    inv_3_body "$1" "$2" "${3:-}"
+    inv_verdict 3
+}
+
+inv_3_body()
+{
+    local _model _obs _prev _nodes _guests _lf _g _n _cur _was _mt
+
+    _model=$1
+    _obs=$2
+    _prev=${3:-}
+
+    _nodes=$( inv_nodes "${_model}" ) || {
+        inv_fire 3 "cannot read the node roster"
+        return 0
+    }
+    _guests=$( inv_guests "${_model}" ) || {
+        inv_fire 3 "cannot read the guest roster"
+        return 0
+    }
+    _lf=$( inv_state_file "${_model}" lineage ) || {
+        inv_fire 3 "cannot read the model lineage"
+        return 0
+    }
+
+    # shellcheck disable=SC2086
+    #   Deliberate word splitting over the newline-separated rosters.
+    for _g in ${_guests}; do
+        # shellcheck disable=SC2086
+        for _n in ${_nodes}; do
+            _cur=$( obs_snapshots "${_obs}" "${_n}" "${_g}" | inv_newest_ts ) || {
+                inv_fire 3 "cannot observe snapshots of ${_g} on ${_n}"
+                continue
+            }
+
+            if [ -n "${_prev}" ]; then
+                _was=$( obs_snapshots "${_prev}" "${_n}" "${_g}" | inv_newest_ts ) || {
+                    inv_fire 3 "cannot observe the previous snapshots of ${_g} on ${_n}"
+                    continue
+                }
+                if [ -n "${_was}" ] && [ -z "${_cur}" ]; then
+                    inv_fire 3 "lineage of ${_g} on ${_n} regressed:" \
+                        "newest was ${_was}, now there is none"
+                elif [ -n "${_was}" ] && inv_ts_lt "${_cur}" "${_was}"; then
+                    inv_fire 3 "lineage of ${_g} on ${_n} regressed:" \
+                        "newest was ${_was}, now ${_cur}"
+                fi
+            fi
+
+            _mt=$( awk -F'\t' -v g="${_g}" -v n="${_n}" \
+                '$1 == g && $2 == n { print $3; exit }' "${_lf}" )
+            [ -n "${_mt}" ] || continue
+            [ "${_mt}" = "-" ] && continue
+
+            if ! inv_ts_ok "${_mt}"; then
+                inv_fire 3 "the model lineage of ${_g} on ${_n} is not a" \
+                    "seance timestamp: [${_mt}]"
+                continue
+            fi
+
+            if [ -z "${_cur}" ]; then
+                inv_fire 3 "the model believes ${_g} on ${_n} has ${_mt}," \
+                    "but no seance snapshot is there at all"
+            elif inv_ts_lt "${_cur}" "${_mt}"; then
+                inv_fire 3 "the model believes ${_g} on ${_n} has ${_mt}," \
+                    "but the newest observed is ${_cur}"
+            fi
+        done
+    done
+
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# Invariant 4 -- no data-bearing dataset is ever destroyed by seance
+#
+# A transition invariant: it needs a previous observation, and at the first
+# step there is nothing that could yet have been destroyed. v1 has no
+# destructive test action, so any dataset that was there and is not is a
+# violation with no exemption -- deliberately, because the day an exemption
+# list exists is the day this invariant stops meaning anything.
+# ---------------------------------------------------------------------------
+
+inv_4()
+{
+    inv_begin 4
+    inv_4_body "$1" "$2" "${3:-}"
+    inv_verdict 4
+}
+
+inv_4_body()
+{
+    local _model _obs _prev _tmp _nodes _n _gone
+
+    _model=$1
+    _obs=$2
+    _prev=${3:-}
+
+    if [ -z "${_prev}" ]; then
+        return 0
+    fi
+
+    _nodes=$( inv_nodes "${_model}" ) || {
+        inv_fire 4 "cannot read the node roster"
+        return 0
+    }
+
+    _tmp=$( mktemp -d "${TMPDIR:-/tmp}/seance-inv.XXXXXX" ) || {
+        inv_fire 4 "cannot create a scratch directory"
+        return 0
+    }
+
+    # shellcheck disable=SC2086
+    #   Deliberate word splitting over the newline-separated roster.
+    for _n in ${_nodes}; do
+        if ! obs_datasets "${_prev}" "${_n}" | sort -u > "${_tmp}/was"; then
+            inv_fire 4 "cannot observe the previous datasets of ${_n}"
+            continue
+        fi
+        if ! obs_datasets "${_obs}" "${_n}" | sort -u > "${_tmp}/now"; then
+            inv_fire 4 "cannot observe the datasets of ${_n}"
+            continue
+        fi
+
+        _gone=$( comm -23 "${_tmp}/was" "${_tmp}/now" | inv_join )
+        if [ -n "${_gone}" ]; then
+            inv_fire 4 "dataset(s) held by ${_n} have been destroyed:" "${_gone}"
+        fi
+    done
+
+    rm -rf "${_tmp}"
+
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# Invariant 4a -- no replica is ever mounted
+#
+# The shadow-mount law (design §4): a replica is received with -x mountpoint
+# -x canmount -u, so it can never mount itself over live data on the node
+# holding it. DESIGN §6 allows one and only one alternative to repairing a
+# hand-mounted replica: refusing that pair with a FAIL line, recorded in the
+# model's 'refused' file. Silent acceptance is not among the choices.
+# ---------------------------------------------------------------------------
+
+inv_4a()
+{
+    inv_begin 4a
+    inv_4a_body "$1" "$2"
+    inv_verdict 4a
+}
+
+inv_4a_body()
+{
+    local _model _obs _nodes _guests _g _n _home _place _props _rf _cm _mp
+
+    _model=$1
+    _obs=$2
+
+    _nodes=$( inv_nodes "${_model}" ) || {
+        inv_fire 4a "cannot read the node roster"
+        return 0
+    }
+    _guests=$( inv_guests "${_model}" ) || {
+        inv_fire 4a "cannot read the guest roster"
+        return 0
+    }
+    _rf="${_model}/refused"
+
+    # shellcheck disable=SC2086
+    #   Deliberate word splitting over the newline-separated rosters.
+    for _g in ${_guests}; do
+        _home=$( inv_home "${_model}" "${_g}" )
+        _place=$( inv_effective_placement "${_obs}" "${_nodes}" "${_g}" "${_home}" )
+
+        # shellcheck disable=SC2086
+        for _n in ${_nodes}; do
+            [ "${_n}" = "${_place}" ] && continue
+
+            if [ -f "${_rf}" ] && awk -F'\t' -v g="${_g}" -v n="${_n}" \
+                '$1 == g && $2 == n { found = 1 } END { exit found ? 0 : 1 }' \
+                "${_rf}"; then
+                continue
+            fi
+
+            _props=$( obs_props "${_obs}" "${_n}" "${_g}" ) || {
+                inv_fire 4a "cannot observe the properties of ${_g} on ${_n}"
+                continue
+            }
+            [ -n "${_props}" ] || continue
+
+            _cm=$( printf '%s\n' "${_props}" |
+                awk -F'\t' '$1 == "canmount" { print $2; exit }' )
+            _mp=$( printf '%s\n' "${_props}" |
+                awk -F'\t' '$1 == "mountpoint" { print $2; exit }' )
+
+            if [ -n "${_cm}" ] && ! inv_in_list "${_cm}" "${INV_REPLICA_CANMOUNT}"; then
+                inv_fire 4a "replica of ${_g} on ${_n} has canmount=${_cm}:" \
+                    "a replica that can mount itself is a shadow mount waiting" \
+                    "for a reboot"
+            fi
+            if [ -n "${_mp}" ] && ! inv_in_list "${_mp}" "${INV_REPLICA_MOUNTPOINT}"; then
+                inv_fire 4a "replica of ${_g} on ${_n} has mountpoint=${_mp}:" \
+                    "a replica with a real mountpoint is a shadow mount over" \
+                    "whatever lives at that path"
+            fi
+        done
+    done
+
+    return 0
+}
+
+# inv_ts_ok <ts> -- rc 0 if <ts> has seance's fixed-width UTC shape.
+inv_ts_ok()
+{
+    case "$1" in
+        [0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]T[0-9][0-9][0-9][0-9][0-9][0-9]Z)
+            return 0
+            ;;
+    esac
+
+    return 1
+}
+
+# inv_ts_lt <a> <b> -- rc 0 if timestamp a is strictly earlier than b.
+#
+# Both arguments must already have passed inv_ts_ok. Dropping the 'T' and 'Z'
+# from a fixed-width UTC timestamp leaves a 14-digit integer that orders
+# chronologically, which is compared with test's -lt rather than with '<':
+# '<' is a FreeBSD extension to test(1), and the comparison that decides
+# whether a replica has regressed is not the place to depend on one.
+inv_ts_lt()
+{
+    local _ad _at _bd _bt
+
+    _ad=${1%T*}
+    _at=${1#*T}
+    _at=${_at%Z}
+    _bd=${2%T*}
+    _bt=${2#*T}
+    _bt=${_bt%Z}
+
+    [ "${_ad}${_at}" -lt "${_bd}${_bt}" ]
+}
+
+# inv_in_list <word> <list> -- rc 0 if the word is in the space-separated list.
+inv_in_list()
+{
+    local _w _i
+
+    _w=$1
+
+    for _i in $2; do
+        [ "${_i}" = "${_w}" ] && return 0
+    done
+
+    return 1
+}
+
+# ---------------------------------------------------------------------------
+# Invariant 5 -- the cheap oracle on every action
+#
+# The predicate itself lives in oracle.subr, which is also what wraps every
+# live invocation; this is the same check wearing the invariant's clothes, so
+# there is exactly one definition of "a verb behaved like a verb".
+# ---------------------------------------------------------------------------
+
+inv_5()
+{
+    local _dir _faults _rc _label
+
+    inv_begin 5
+    _dir=$1
+
+    if ! command -v oracle_faults > /dev/null 2>&1; then
+        inv_fire 5 "oracle.subr is not sourced: inv_5 needs oracle_faults"
+        inv_verdict 5
+        return
+    fi
+
+    _label=$( awk 'NR == 1 { print }' "${_dir}/label" 2> /dev/null )
+    [ -n "${_label}" ] || _label=${_dir}
+
+    _faults=$( oracle_faults "${_dir}" )
+    _rc=$?
+
+    if [ "${_rc}" -ne 0 ]; then
+        printf '%s\n' "${_faults}" | while read -r _f; do
+            [ -n "${_f}" ] || continue
+            printf 'invariant 5 FIRED: %s: %s\n' "${_label}" "${_f}"
+        done
+        return 1
+    fi
+
+    inv_verdict 5
+}
+
+# ---------------------------------------------------------------------------
+# inv_check_all <model> <obs> [<prev-obs>]
+#
+# Every invariant, in order, all of them run even when an earlier one fired --
+# the first failure is rarely the informative one. rc 1 if any fired.
+# ---------------------------------------------------------------------------
+
+inv_check_all()
+{
+    local _model _obs _prev _rc _invs _d _n
+
+    _model=$1
+    _obs=$2
+    _prev=${3:-}
+    _rc=0
+
+    inv_1 "${_model}" "${_obs}" || _rc=1
+    inv_2 "${_model}" "${_obs}" "${_prev}" || _rc=1
+    inv_3 "${_model}" "${_obs}" "${_prev}" || _rc=1
+    inv_4 "${_model}" "${_obs}" "${_prev}" || _rc=1
+    inv_4a "${_model}" "${_obs}" || _rc=1
+
+    _invs=$( obs_invocations "${_obs}" ) || {
+        inv_begin 5
+        inv_fire 5 "cannot read the invocation list of this step"
+        inv_verdict 5 || _rc=1
+        return "${_rc}"
+    }
+
+    _n=$( printf '%s\n' "${_invs}" | inv_count )
+    if [ "${_n}" -eq 0 ]; then
+        printf 'invariant 5 ok (no seance invocation in this step)\n'
+        return "${_rc}"
+    fi
+
+    # shellcheck disable=SC2086
+    #   Deliberate word splitting: capture directories never contain spaces
+    #   (oracle_run makes them with mktemp under a caller-chosen root).
+    for _d in ${_invs}; do
+        inv_5 "${_d}" || _rc=1
+    done
+
+    return "${_rc}"
+}

@@ -10,3 +10,8 @@ assertion is reported as "not ok" and exits non-zero.
 
 Files named t_*.sh are tests. Anything else here (this README, future fixture
 data) is ignored by tests/run.sh.
+
+Since M3 this tier also holds the tier-7 simulator's own units, which need no
+cluster: t_sim_gen.sh (the seeded PRNG and weighted chooser -- determinism,
+weights, and drawing only from what was offered) and t_sim_shrink.sh (prefix
+bisection and event-kind removal, driven by an injected fake rerun function).

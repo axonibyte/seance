@@ -1,0 +1,304 @@
+# seance tier 7 -- the cheap oracle.
+#
+# Wraps every seance invocation the simulator makes (TESTING.md §7 invariant
+# 5, DESIGN.md §6.5). It knows nothing about what the verb was supposed to do;
+# it knows only what *any* verb of this program must do, which is why it costs
+# nothing and why nothing can escape it.
+#
+#     oracle_run <label> <cmd> [args...]
+#         run the command under an enforced timeout, capture everything, check
+#         it, print 'oracle ok <label>' or one 'oracle FIRED <label>: <why>'
+#         per fault. rc 0 clean, 1 fired, 2 the oracle itself could not run.
+#
+#     oracle_faults <capture-dir>
+#         the predicate on its own: one fault per line on stdout, rc 0 clean,
+#         1 faults, 2 the capture is malformed. invariants.subr's inv_5 calls
+#         exactly this, so "a verb behaved like a verb" has one definition.
+#
+# The capture directory is the unit of evidence. It survives the run, so a
+# failing seed leaves something a person can read:
+#
+# format: <capture>/label     one line: the label oracle_run was given
+# format: <capture>/cmd       one line: the command, arguments space-joined
+# format: <capture>/rc        one line: the decimal exit status
+# format: <capture>/elapsed   one line: whole seconds of wall time
+# format: <capture>/timeout   one line: the timeout in seconds that was enforced
+# format: <capture>/stdout    verbatim stdout
+# format: <capture>/stderr    verbatim stderr
+#
+# All seven are mandatory: oracle_faults treats a missing one as a contract
+# error rather than as an absence of evidence.
+#
+# ---------------------------------------------------------------------------
+# WHAT IS CHECKED, AND WHY EACH LINE OF IT
+# ---------------------------------------------------------------------------
+#
+# 1. It finished. The command runs under timeout(1), so a hung verb costs one
+#    step's budget rather than the session. Both timeout's own 124 and an
+#    elapsed time at or past the limit are reported as a hang, and the exit
+#    code check is not repeated for that invocation -- one fault, one cause.
+#
+# 2. The exit status is 0, 1 or 2 (handoff §100: 0 success, 1 operation
+#    failed, 2 usage or contract error). Anything else is a shell or an
+#    interpreter speaking, not seance.
+#
+# 3. The last line of stdout is a verdict line. See ORACLE_VERDICT_RE below;
+#    the grammar was read off the shipped verbs, not assumed.
+#
+# 4. stderr carries no interpreter failure. See ORACLE_STDERR_FATAL_RE below.
+#
+# DESIGN §6.5 also lists "logs under SEANCE_STATE_DIR parse" under invariant
+# 5. That check lives in invariants.subr, in invariant 2's clause A, because
+# it is a property of a *state* and not of an invocation: a verb that writes a
+# malformed record has usually already exited 0 by the time anyone looks.
+#
+# shellcheck shell=sh
+# shellcheck disable=SC3043
+#   'local' is not in POSIX sh but is implemented by FreeBSD /bin/sh (sh(1),
+#   "local"); seance targets FreeBSD sh and nothing else (handoff §5).
+
+# The verdict-line grammar.
+#
+# DESIGN §6.5 writes '^[a-z]+: '. No verb seance ships satisfies it:
+# 'seance config' ends in 'PASS' or 'FAIL: <n> problems (...)' (bin/seance:146-151,
+# lib/conf.subr:811-816) and 'seance version' ends in 'seance <version>'
+# (bin/seance:68). Pinning the narrower regex would make invariant 5 fire on
+# every correct run, which is not a stricter oracle but a disabled one, so the
+# grammar below is the one the shipped verbs actually speak (D-55):
+#
+#     an all-capitals disposition token, alone or followed by ': <detail>'
+#         PASS
+#         FAIL: 3 problems (run "seance config --check" for the list)
+#     or a lowercase word followed by ':' or a space and then detail
+#         problem: cadence 30 is below the minimum 60
+#         seance 0.2.0
+#
+# What it rejects is what a half-dead verb produces: no stdout at all, a line
+# that begins with whitespace (a truncated listing or an indented usage
+# block), a line beginning with punctuation (a shell trace, a diff, a stray
+# '+'), and a bare lowercase word with nothing after it (a line cut off
+# mid-write). 'seance help' is deliberately not covered -- its last line is
+# 'Exit codes: ...', help is not an action, and the simulator never runs it.
+ORACLE_VERDICT_RE='^([A-Z][A-Z0-9]*(:[[:space:]].*)?|[a-z][a-z0-9-]*[:[:space:]].*)$'
+
+# Interpreter failures on stderr. Every pattern here is a message FreeBSD
+# /bin/sh itself emits, verified on FreeBSD 15.0-RELEASE:
+#
+#     <file>: <name>: parameter not set              set -u tripped
+#     <file>: <cmd>: not found                       a command seance needs is absent
+#     <file>: <n>: Syntax error: ...                 the script does not parse
+#     <file>: ${...}: Bad substitution               an expansion does not parse
+#     <file>: arithmetic expression: expecting ...   $(( )) does not parse
+#
+# 'not found' is anchored to ': not found' at end of line so that a verb's own
+# diagnostic -- seance's style is '<level>: <sentence>' (lib/common.subr:32) --
+# cannot trip it by ending a sentence with those two words.
+#
+# 'Permission denied' is deliberately NOT here. It is an operational failure a
+# verb should catch, report and exit 1 for, and check 2 already asks whether
+# the verb survived it; making it fatal would fire this oracle on a correctly
+# handled failure, and an oracle that cries wolf is an oracle somebody turns
+# off. A driver that wants it may assign ORACLE_STDERR_FATAL_RE before use;
+# it is not read from the environment, because a check this tier depends on
+# should not be loosenable by exporting a variable.
+ORACLE_STDERR_FATAL_RE='(parameter not set|: not found$|Syntax error|Bad substitution|arithmetic expression)'
+
+# The step timeout, in whole seconds (DESIGN §6.5).
+ORACLE_TIMEOUT_DEFAULT=120
+
+# Set by oracle_run: the capture directory of the most recent invocation.
+ORACLE_LAST_DIR=""
+
+# oracle_diag <message...>
+oracle_diag()
+{
+    printf '# oracle: %s\n' "$*" >&2
+}
+
+# oracle_timeout -- the enforced step timeout; rc 2 if it is not a positive
+# integer, because a timeout of 'abc' silently becoming zero or infinity is
+# the sort of thing that makes a hang look like a pass.
+oracle_timeout()
+{
+    local _t
+
+    _t=${SEANCE_SIM_STEP_TIMEOUT:-${ORACLE_TIMEOUT_DEFAULT}}
+
+    case "${_t}" in
+        ''|*[!0-9]*)
+            oracle_diag "SEANCE_SIM_STEP_TIMEOUT is not a whole number: [${_t}]"
+            return 2
+            ;;
+    esac
+
+    if [ "${_t}" -lt 1 ]; then
+        oracle_diag "SEANCE_SIM_STEP_TIMEOUT must be at least 1: [${_t}]"
+        return 2
+    fi
+
+    printf '%s\n' "${_t}"
+}
+
+# oracle_capture_dir -- a fresh capture directory.
+#
+# Under $ORACLE_CAPTURE_ROOT when the caller set one (the driver points it at
+# $REAPER_OUT/sim/<seed>/ so the evidence is pulled out of the guest even if
+# the run dies), otherwise a temporary directory.
+oracle_capture_dir()
+{
+    local _root
+
+    _root=${ORACLE_CAPTURE_ROOT:-${TMPDIR:-/tmp}}
+
+    if [ ! -d "${_root}" ] && ! mkdir -p "${_root}"; then
+        oracle_diag "cannot create the capture root: ${_root}"
+        return 2
+    fi
+
+    mktemp -d "${_root}/seance-orc.XXXXXX"
+}
+
+# oracle_run <label> <cmd> [args...]
+oracle_run()
+{
+    local _label _dir _to _t0 _t1 _rc _faults _frc _f
+
+    if [ $# -lt 2 ]; then
+        oracle_diag "oracle_run needs a label and a command"
+        return 2
+    fi
+
+    _label=$1
+    shift
+
+    if ! command -v timeout > /dev/null 2>&1; then
+        printf 'oracle FIRED %s: timeout(1) is not installed, so a hung verb\n' \
+            "${_label}"
+        printf 'oracle FIRED %s: could not be bounded and this check would lie\n' \
+            "${_label}"
+        return 2
+    fi
+
+    _to=$( oracle_timeout ) || {
+        printf 'oracle FIRED %s: the step timeout is not usable\n' "${_label}"
+        return 2
+    }
+
+    _dir=$( oracle_capture_dir ) || {
+        printf 'oracle FIRED %s: no capture directory\n' "${_label}"
+        return 2
+    }
+    # shellcheck disable=SC2034
+    #   Not unused: ORACLE_LAST_DIR is this file's documented output for the
+    #   caller that wants the capture it just made (the self-test reads it to
+    #   feed inv_5, the driver reads it to build <obs>/invocations). A sourced
+    #   library's exports look unused from inside the library.
+    ORACLE_LAST_DIR=${_dir}
+
+    printf '%s\n' "${_label}" > "${_dir}/label"
+    printf '%s\n' "$*" > "${_dir}/cmd"
+    printf '%s\n' "${_to}" > "${_dir}/timeout"
+
+    _t0=$( date +%s )
+    # SIGKILL five seconds after SIGTERM: a verb wedged in an uninterruptible
+    # send would otherwise ignore the timeout and take the session with it.
+    timeout -k 5 "${_to}" "$@" > "${_dir}/stdout" 2> "${_dir}/stderr"
+    _rc=$?
+    _t1=$( date +%s )
+
+    printf '%s\n' "${_rc}" > "${_dir}/rc"
+    printf '%s\n' "$(( _t1 - _t0 ))" > "${_dir}/elapsed"
+
+    if [ -n "${ORACLE_INVOCATIONS_FILE:-}" ]; then
+        printf '%s\n' "${_dir}" >> "${ORACLE_INVOCATIONS_FILE}"
+    fi
+
+    _faults=$( oracle_faults "${_dir}" )
+    _frc=$?
+
+    if [ "${_frc}" -eq 0 ]; then
+        printf 'oracle ok %s\n' "${_label}"
+        return 0
+    fi
+
+    printf '%s\n' "${_faults}" | while read -r _f; do
+        [ -n "${_f}" ] || continue
+        printf 'oracle FIRED %s: %s\n' "${_label}" "${_f}"
+    done
+
+    return "${_frc}"
+}
+
+# oracle_faults <capture-dir>
+oracle_faults()
+{
+    local _dir _f _rc _el _to _last _bad _hung _faults
+
+    _dir=$1
+    _faults=0
+
+    for _f in label cmd rc elapsed timeout stdout stderr; do
+        if [ ! -f "${_dir}/${_f}" ]; then
+            printf 'capture is incomplete: %s/%s is missing\n' "${_dir}" "${_f}"
+            return 2
+        fi
+    done
+
+    _rc=$( awk 'NR == 1 { print }' "${_dir}/rc" )
+    _el=$( awk 'NR == 1 { print }' "${_dir}/elapsed" )
+    _to=$( awk 'NR == 1 { print }' "${_dir}/timeout" )
+
+    case "${_rc}${_el}${_to}" in
+        ''|*[!0-9]*)
+            printf 'capture is malformed: rc=[%s] elapsed=[%s] timeout=[%s]\n' \
+                "${_rc}" "${_el}" "${_to}"
+            return 2
+            ;;
+    esac
+
+    # 1. It finished.
+    _hung=0
+    if [ "${_rc}" -eq 124 ] || [ "${_el}" -ge "${_to}" ]; then
+        _hung=1
+        printf 'hung: no verdict within %ss (elapsed %ss, exit %s)\n' \
+            "${_to}" "${_el}" "${_rc}"
+        _faults=$(( _faults + 1 ))
+    fi
+
+    # 2. The exit status is one of seance's three.
+    if [ "${_hung}" -eq 0 ]; then
+        case "${_rc}" in
+            0|1|2)
+                ;;
+            *)
+                printf 'exit status %s is not 0 (ok), 1 (failed) or 2 (contract)\n' \
+                    "${_rc}"
+                _faults=$(( _faults + 1 ))
+                ;;
+        esac
+    fi
+
+    # 3. The last line of stdout is a verdict line.
+    if [ ! -s "${_dir}/stdout" ]; then
+        printf 'no verdict: the verb wrote nothing to stdout\n'
+        _faults=$(( _faults + 1 ))
+    else
+        _last=$( awk 'END { print }' "${_dir}/stdout" )
+        if ! printf '%s\n' "${_last}" | grep -Eq -- "${ORACLE_VERDICT_RE}"; then
+            printf 'no verdict: the last line of stdout is [%s]\n' "${_last}"
+            _faults=$(( _faults + 1 ))
+        fi
+    fi
+
+    # 4. stderr carries no interpreter failure.
+    _bad=$( grep -E -- "${ORACLE_STDERR_FATAL_RE}" "${_dir}/stderr" |
+        awk 'NR == 1 { print }' )
+    if [ -n "${_bad}" ]; then
+        printf 'stderr carries an interpreter failure: %s\n' "${_bad}"
+        _faults=$(( _faults + 1 ))
+    fi
+
+    [ "${_faults}" -eq 0 ] && return 0
+
+    return 1
+}
