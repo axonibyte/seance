@@ -1,0 +1,11 @@
+Tier 4 -- policy against a fault-injecting mock adapter (workstation).
+
+The full promotion ladder driven against a scripted mock that can return, per
+call: success, failure, timeout, garbage, and empty output with a success
+status -- the crashed-verifier lesson encoded as a test class. Every rung x
+every outcome has an expected disposition, asserted as a truth table. See
+TESTING.md §5.
+
+Empty at M0: there is no ladder yet (M2) and no policy (M1).
+
+Files named t_*.sh are tests; anything else here is ignored.

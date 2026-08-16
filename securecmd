@@ -1,0 +1,10 @@
+# List of the allowed cbsd commands
+#
+# Sourced by 'cbsd initenv' phase 8 (sudoexec/initenv:1386-1396), which then
+# symlinks ${CIX_DISTDIR}/modules/seance.d/<verb> to ${workdir}/modules/<verb>
+# for every word in SECCMD. One verb only: sub-commands are arguments, not
+# separate entries (decision D-2).
+SECCMD="\
+${SECCMD}
+seance \
+"

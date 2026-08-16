@@ -1,0 +1,13 @@
+Tier 5 -- adapter conformance, shape B (reaper guest, real CBSD).
+
+One conformance suite run against both the mock adapter and the real one,
+asserting identical contracts: same fields, same error shapes, same exit-code
+discipline. The real side drives an actual jail through its lifecycle. This is
+the tier that breaks first when CBSD changes an invocation convention.
+See TESTING.md §6.
+
+Empty at M0. The guest prologue (tests/lib/guest-prologue.sh) that installs and
+pins CBSD already runs, so the substrate this tier needs is proven before the
+tier exists.
+
+Files named t_*.sh are tests; anything else here is ignored.

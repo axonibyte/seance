@@ -1,0 +1,84 @@
+#!/usr/local/bin/cbsd
+#v0.0.0-m0
+# seance -- CBSD verb wrapper (decision D-2).
+#
+# This is the only file in the project that runs under cbsdsh. It does no
+# seance work: it copies the facts CBSD knows about this node into the
+# SEANCE_CBSD_* environment and execs the plain /bin/sh dispatcher, which is
+# what every test tier and the pseudo-cluster drive directly.
+#
+# shellcheck shell=sh
+# shellcheck disable=SC1090,SC1091,SC2034,SC2154
+#   SC1090/SC1091: ${subrdir} and ${tools} are cbsdsh runtime paths supplied by
+#     /usr/local/cbsd/cbsd.conf:39,43. There is no constant path to follow and
+#     nothing for shellcheck to read; the sourced files are CBSD's, not ours.
+#   SC2034: CBSDMODULE, CIXARG, CIXOPTARG, MYDESC and ADDHELP are read by
+#     cbsdsh's own cixinit, not by this script. They are the verb's registration
+#     header (modules/pkg.d/pkg:3-7), and unused-looking is what they look like.
+#   SC2154: workdir, nodename, jailsysdir, jaildatadir, dbdir, etcdir,
+#     CIX_DISTDIR, myversion, mode, CIX_OTHER_ARGS and *_CMD are supplied by the
+#     cbsdsh environment (cbsd.conf:21-99) -- reading them is this file's whole
+#     purpose. Nothing here assigns them, and nothing here should.
+CBSDMODULE="seance"
+CIXARG=""
+CIXOPTARG="mode"
+MYDESC="Guest succession: replication, death detection, fencing, promotion"
+ADDHELP="
+${H3_COLOR}Description${N0_COLOR}:
+
+ seance gives a CBSD cluster crash-consistent guest succession. This node's
+ CBSD facts are passed to the dispatcher in the environment; every verb prints
+ a verdict line and exits 0 (ok), 1 (operation failed) or 2 (usage error).
+
+${H3_COLOR}Options${N0_COLOR}:
+
+ ${N2_COLOR}mode=${N0_COLOR} - verb to run. The verb may also be given bare. Verbs:
+   version - print the seance version;
+   help    - print dispatcher usage;
+
+${H3_COLOR}Examples${N0_COLOR}:
+
+ # cbsd seance version
+ # cbsd seance mode=version
+ # cbsd seance help
+
+"
+
+. "${subrdir}/nc.subr"
+. "${tools}"
+cixinit
+
+# This file is reached through ${workdir}/modules/seance, a symlink planted by
+# 'cbsd initenv' stage 8 (sudoexec/initenv:1386-1396), so $0 is the symlink and
+# its directory is not the module directory. Resolve it -- the idiom is
+# modules/zfsinstall.d/zfsinstall:28.
+_MYSELF=$( ${REALPATH_CMD} "$0" )
+_MYDIR=${_MYSELF%/*}
+
+# CBSD facts, from /usr/local/cbsd/cbsd.conf: workdir (line 28-36),
+# jailsysdir (71), jaildatadir (65), dbdir (92), etcdir (73), CIX_DISTDIR (24),
+# myversion (21); nodename is read by CBSD from ${workdir}/nodename (52).
+SEANCE_CBSD_WORKDIR="${workdir}"
+SEANCE_CBSD_NODENAME="${nodename}"
+SEANCE_CBSD_JAILSYSDIR="${jailsysdir}"
+SEANCE_CBSD_JAILDATADIR="${jaildatadir}"
+SEANCE_CBSD_DBDIR="${dbdir}"
+SEANCE_CBSD_ETCDIR="${etcdir}"
+SEANCE_CBSD_DISTDIR="${CIX_DISTDIR}"
+SEANCE_CBSD_VERSION="${myversion}"
+export SEANCE_CBSD_WORKDIR SEANCE_CBSD_NODENAME SEANCE_CBSD_JAILSYSDIR
+export SEANCE_CBSD_JAILDATADIR SEANCE_CBSD_DBDIR SEANCE_CBSD_ETCDIR
+export SEANCE_CBSD_DISTDIR SEANCE_CBSD_VERSION
+
+# 'cbsd seance mode=version' and 'cbsd seance version' must both work: CBSD has
+# no two-level dispatch (PATH only, cbsd.conf:122), so a bare verb arrives in
+# CIX_OTHER_ARGS.
+# shellcheck disable=SC2086
+#   Deliberate word splitting: ${mode} is one word and ${CIX_OTHER_ARGS} is the
+#   whole bare argument list, which must reach the dispatcher as separate
+#   arguments rather than as one.
+if [ -n "${mode}" ]; then
+    exec ${_MYDIR}/bin/seance ${mode}
+else
+    exec ${_MYDIR}/bin/seance ${CIX_OTHER_ARGS}
+fi

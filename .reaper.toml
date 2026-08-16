@@ -1,0 +1,41 @@
+# seance under reaper.
+#
+# One guest, host execution: the suite is FreeBSD /bin/sh, ZFS, jails and CBSD,
+# and there is nothing a container could stand in for. The template supplies
+# the toolchain, so [build] carries no image -- a host build may not.
+#
+# Tiers 1-4 are the build (they are cheap enough), tiers 5-7 are the run.
+
+schema = 1
+project = "seance"
+guests = ["freebsd-15.1"]
+exec = "host"
+
+[build]
+cmd = "sh tools/lint.sh"
+# CBSD arrives by pkg in the run's prologue; the cache is what keeps the second
+# and every later session from re-fetching it over the network.
+cache = ["pkg"]
+
+[run]
+cmd = "sh tests/run.sh"
+
+[run.env]
+# The workstation runs 1-4 in milliseconds after every edit; the session exists
+# for the tiers that need root, ZFS and jails.
+SEANCE_TIERS = "5,6,7"
+
+[sync]
+exclude = ["/out/"]
+
+[reset]
+datasets = ["state"]
+
+[resources]
+cores = 4
+ram_gb = 8
+
+# Long tier-7 hunts: opt-in, and given a TTL that outlives them.
+[profiles.hunt]
+ttl = "6h"
+env = { SEANCE_HUNT = "1" }

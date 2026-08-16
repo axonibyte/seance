@@ -1,0 +1,236 @@
+# seance test harness.
+#
+# Sourced by every tests/tier<N>/t_*.sh. Output is TAP-ish (decision D-10):
+# one "ok N - name" or "not ok N - name" per assertion, diagnostics on lines
+# starting with '#', and a machine-readable "# result <ok> <notok> <planned>"
+# line emitted by t_done, which tests/run.sh counts.
+#
+# The harness owns its own exit status: t_done exits non-zero if anything is
+# not ok, if the plan does not match, or if no assertion ran at all. A test
+# file that crashes before t_done therefore also fails, because run.sh treats a
+# non-zero file status as a failure regardless of what was printed.
+#
+# shellcheck shell=sh
+# shellcheck disable=SC3043
+#   'local' is not in POSIX sh but is implemented by FreeBSD /bin/sh (sh(1),
+#   "local"); seance targets FreeBSD sh and nothing else (handoff §5).
+
+T_COUNT=0
+T_FAIL=0
+T_PLANNED=-1
+
+# The repository root. tests/run.sh exports SEANCE_ROOT; a test file run by
+# hand from anywhere falls back to its own location (tests/tier<N>/t_*.sh, so
+# two levels up), which is why tests are always invoked by path and never by
+# 'cd tier1 && sh t_x.sh'.
+T_TESTDIR=$( dirname "$( realpath "$0" )" )
+T_ROOT=${SEANCE_ROOT:-$( cd "${T_TESTDIR}/../.." && pwd )}
+export T_ROOT
+
+# Temporary directories are registered in a file, not a variable, so that one
+# made inside a subshell is still removed by this shell's EXIT trap.
+T_REGISTRY=$( mktemp "${TMPDIR:-/tmp}/seance-treg.XXXXXX" ) || exit 1
+export T_REGISTRY
+
+t_cleanup()
+{
+    local _d
+
+    [ -r "${T_REGISTRY}" ] || return 0
+
+    while read -r _d; do
+        case "${_d}" in
+            /*/seance-t.*) rm -rf "${_d}" ;;
+        esac
+    done < "${T_REGISTRY}"
+
+    rm -f "${T_REGISTRY}"
+    return 0
+}
+
+trap 't_cleanup' EXIT
+trap 't_cleanup; exit 1' HUP INT TERM
+
+# t_plan <n>   -- declare how many assertions are expected.
+t_plan()
+{
+    T_PLANNED=$1
+    echo "1..$1"
+}
+
+# t_diag <message...>  -- a TAP comment on stdout.
+t_diag()
+{
+    printf '# %s\n' "$*"
+}
+
+# t_ok <name>      -- record a passing assertion.
+t_ok()
+{
+    T_COUNT=$(( T_COUNT + 1 ))
+    printf 'ok %d - %s\n' "${T_COUNT}" "$*"
+}
+
+# t_not_ok <name>  -- record a failing assertion.
+t_not_ok()
+{
+    T_COUNT=$(( T_COUNT + 1 ))
+    T_FAIL=$(( T_FAIL + 1 ))
+    printf 'not ok %d - %s\n' "${T_COUNT}" "$*"
+}
+
+# t_is <got> <want> <name>
+t_is()
+{
+    if [ "$1" = "$2" ]; then
+        t_ok "$3"
+    else
+        t_not_ok "$3"
+        t_diag "got:  [$1]"
+        t_diag "want: [$2]"
+    fi
+}
+
+# t_isnt <got> <unwanted> <name>
+t_isnt()
+{
+    if [ "$1" != "$2" ]; then
+        t_ok "$3"
+    else
+        t_not_ok "$3"
+        t_diag "got the value it must not have: [$1]"
+    fi
+}
+
+# t_like <got> <extended-regex> <name>
+t_like()
+{
+    if printf '%s\n' "$1" | grep -Eq -- "$2"; then
+        t_ok "$3"
+    else
+        t_not_ok "$3"
+        t_diag "got:    [$1]"
+        t_diag "no match for: [$2]"
+    fi
+}
+
+# t_unlike <got> <extended-regex> <name>
+t_unlike()
+{
+    if printf '%s\n' "$1" | grep -Eq -- "$2"; then
+        t_not_ok "$3"
+        t_diag "got:    [$1]"
+        t_diag "matched what it must not: [$2]"
+    else
+        t_ok "$3"
+    fi
+}
+
+# t_rc <expected-rc> <name> -- <command> [args...]
+#
+# Asserts the command's exit status. Its output is captured rather than
+# discarded, and shown as diagnostics when the assertion fails -- a suppressed
+# error message is how a broken command comes to look like a wrong exit code.
+t_rc()
+{
+    local _want _name _out _got
+
+    _want=$1
+    shift
+    _name=$1
+    shift
+    if [ "${1:-}" = "--" ]; then
+        shift
+    else
+        t_not_ok "${_name}"
+        t_diag "t_rc: missing '--' before the command"
+        return 0
+    fi
+
+    _out=$( t_tmpdir )/out
+    "$@" > "${_out}" 2>&1
+    _got=$?
+
+    if [ "${_got}" -eq "${_want}" ]; then
+        t_ok "${_name}"
+    else
+        t_not_ok "${_name}"
+        t_diag "command: $*"
+        t_diag "exit: got ${_got}, want ${_want}"
+        sed -e 's/^/# output: /' "${_out}"
+    fi
+
+    return 0
+}
+
+# t_stdout_is <expected-stdout> <name> -- <command> [args...]
+#
+# stdout is data, so it is compared exactly; stderr is diagnostics and is shown
+# only when the assertion fails.
+t_stdout_is()
+{
+    local _want _name _dir _got
+
+    _want=$1
+    shift
+    _name=$1
+    shift
+    if [ "${1:-}" = "--" ]; then
+        shift
+    else
+        t_not_ok "${_name}"
+        t_diag "t_stdout_is: missing '--' before the command"
+        return 0
+    fi
+
+    _dir=$( t_tmpdir )
+    "$@" > "${_dir}/out" 2> "${_dir}/err"
+    _got=$( cat "${_dir}/out" )
+
+    if [ "${_got}" = "${_want}" ]; then
+        t_ok "${_name}"
+    else
+        t_not_ok "${_name}"
+        t_diag "command: $*"
+        t_diag "stdout got:  [${_got}]"
+        t_diag "stdout want: [${_want}]"
+        sed -e 's/^/# stderr: /' "${_dir}/err"
+    fi
+
+    return 0
+}
+
+# t_tmpdir  -- print a fresh temporary directory, removed at exit.
+t_tmpdir()
+{
+    local _d
+
+    _d=$( mktemp -d "${TMPDIR:-/tmp}/seance-t.XXXXXX" ) || exit 1
+    printf '%s\n' "${_d}" >> "${T_REGISTRY}"
+    printf '%s\n' "${_d}"
+}
+
+# t_done  -- summary line, then exit with the verdict.
+t_done()
+{
+    local _rc
+
+    _rc=0
+
+    if [ "${T_PLANNED}" -ge 0 ] && [ "${T_PLANNED}" -ne "${T_COUNT}" ]; then
+        t_diag "plan mismatch: planned ${T_PLANNED}, ran ${T_COUNT}"
+        _rc=1
+    fi
+
+    if [ "${T_COUNT}" -eq 0 ]; then
+        t_diag "no assertions ran"
+        _rc=1
+    fi
+
+    [ "${T_FAIL}" -gt 0 ] && _rc=1
+
+    printf '# result %d %d %d\n' \
+        "$(( T_COUNT - T_FAIL ))" "${T_FAIL}" "${T_COUNT}"
+
+    exit "${_rc}"
+}

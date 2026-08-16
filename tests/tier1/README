@@ -1,0 +1,12 @@
+Tier 1 -- pure unit tests (workstation, milliseconds).
+
+The policy functions, kept out of the verbs so they are testable without a
+system: snapshot-name parse/format/compare, staleness arithmetic, succession
+resolution, quorum evaluation, retention-ladder selection. Table-driven, no
+ZFS, no jails, no CBSD. See TESTING.md §2.
+
+At M0 this tier holds only the harness's own self-test: proof that a failing
+assertion is reported as "not ok" and exits non-zero.
+
+Files named t_*.sh are tests. Anything else here (this README, future fixture
+data) is ignored by tests/run.sh.

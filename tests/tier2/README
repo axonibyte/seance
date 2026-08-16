@@ -1,0 +1,12 @@
+Tier 2 -- golden vectors (workstation, milliseconds).
+
+The snapshot name is the wire protocol and two implementations consume it, so
+neither is the oracle: a committed vector file is. Config parsing gets the same
+treatment. Run twice, under LC_ALL=C and a UTF-8 locale, and under a non-UTC
+TZ, because timestamps are UTC-always by spec. See TESTING.md §3.
+
+Empty at M0 -- the milestone fence is scaffolding only, and the parsers this
+tier tests are M1. tests/run.sh reports "tier 2: no tests", which is not a
+failure.
+
+Files named t_*.sh are tests; anything else here is ignored.

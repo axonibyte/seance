@@ -1,0 +1,13 @@
+Tier 3 -- source-as-data (workstation, milliseconds).
+
+The rot-catchers, cheapest tier per defect: the seam guard (nothing outside
+lib/adapter.subr invokes CBSD or the host's guest tooling), the tenant guard
+(no site strings in framework code), and -- as they become possible -- config
+completeness both ways, verb-vs-README completeness, and doc liveness.
+See TESTING.md §4.
+
+The two guards exist from M0 because handoff §0.4 puts the tenant guard among
+the first tests written, and because a guard added after the code it guards is
+a guard written to the code's shape.
+
+Files named t_*.sh are tests; anything else here is ignored.

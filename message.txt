@@ -1,0 +1,31 @@
+seance is installed but not yet enabled. Two steps remain, and neither is
+automatic.
+
+  1. Add the module directory to this node's enabled list:
+
+       echo seance.d >> ~cbsd/etc/modules.conf
+
+  2. Re-run the environment initialisation, so that its stage 8 links the
+     verb into ~cbsd/modules/ and records the module in the inventory.
+
+     Interactively (answer yes to the confirmation):
+
+       cbsd initenv
+
+     Unattended, as root -- and it must be this form. "cbsd initenv inter=0"
+     exits 0 having done nothing, and "cbsd initenv" with no terminal never
+     returns at all; see docs/cbsd-module-notes.md for why:
+
+       env NOINTER=1 ALWAYS_YES=1 /usr/local/cbsd/sudoexec/initenv
+
+  3. Check:
+
+       cbsd seance version
+       cbsd help | grep seance
+
+To undo: remove the "seance.d" line from ~cbsd/etc/modules.conf and re-run the
+initialisation. Stage 8 removes the symlink and clears the inventory flag.
+
+Note: if this directory is a symlink rather than a real directory, every verb
+still works, but "cbsd module mode=list" will not show seance -- it enumerates
+with "find ... -type d".

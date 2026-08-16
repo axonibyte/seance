@@ -1,0 +1,81 @@
+#!/bin/sh
+# seance -- dispatcher.
+#
+# Plain sh on purpose: everything below the CBSD verb wrapper must run without
+# cbsd, because tiers 1-4 and the pseudo-cluster drive it directly (D-2).
+#
+# stdout is data, stderr is diagnostics, and the exit code is the verdict:
+#   0  ok
+#   1  operation failed
+#   2  usage or contract error
+#
+# shellcheck disable=SC3043
+#   'local' is not in POSIX sh but is implemented by FreeBSD /bin/sh (sh(1),
+#   "local"); seance targets FreeBSD sh and nothing else (handoff §5).
+set -u
+
+# Resolve through symlinks: ${workdir}/modules/seance points at the module
+# directory, and lib/ and VERSION are siblings of bin/.
+_self=$( realpath "$0" ) || exit 1
+_bindir=${_self%/*}
+SEANCE_ROOT=${_bindir%/*}
+readonly SEANCE_ROOT
+
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=../lib/common.subr
+. "${SEANCE_ROOT}/lib/common.subr"
+
+seance_usage()
+{
+    cat <<EOF
+usage: seance <verb> [args]
+
+Verbs:
+  version            print the seance version
+  help, --help, -h   print this usage
+
+Exit codes: 0 ok, 1 operation failed, 2 usage or contract error.
+EOF
+}
+
+seance_version()
+{
+    local _v
+
+    [ -r "${SEANCE_ROOT}/VERSION" ] ||
+        seance_die 1 "no readable VERSION file at ${SEANCE_ROOT}/VERSION"
+
+    # read(1) returns non-zero on a final line without a newline yet still
+    # assigns, so emptiness is the verdict here, not read's exit status.
+    _v=""
+    read -r _v < "${SEANCE_ROOT}/VERSION"
+
+    [ -n "${_v}" ] ||
+        seance_die 1 "empty VERSION file at ${SEANCE_ROOT}/VERSION"
+
+    echo "seance ${_v}"
+}
+
+if [ $# -eq 0 ]; then
+    seance_usage >&2
+    exit 2
+fi
+
+_verb=$1
+shift
+
+case "${_verb}" in
+    version)
+        seance_version
+        ;;
+    help|--help|-h)
+        seance_usage
+        ;;
+    *)
+        echo "seance: unknown verb: ${_verb}" >&2
+        seance_usage >&2
+        exit 2
+        ;;
+esac
+
+exit 0

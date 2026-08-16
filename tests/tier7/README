@@ -1,0 +1,11 @@
+Tier 7 -- simulated cluster life, seeded (reaper guest, shape A).
+
+A generator dealing weighted events from a fixed seed against a shadow model of
+expected placement and lineage, with five invariants diffed continuously. The
+oracle self-test is written before the generator: invariants fed hand-built
+broken states must each complain, and that runs at tier-4 cost with no cluster
+at all. See TESTING.md §7.
+
+Empty at M0.
+
+Files named t_*.sh are tests; anything else here is ignored.
