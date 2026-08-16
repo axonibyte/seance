@@ -490,9 +490,21 @@ adapter_kernel_version()
 
 # contract: adapter_carp_state(vhid) -> MASTER|BACKUP|INIT|absent [promises output]
 #
-# rc 0 with output always; 2 if <vhid> is not a number. Parsed from ifconfig(8),
-# whose carp line reads "carp: MASTER vhid 1 advbase 1 advskew 0" (observed in
-# the guest, recorded by the substrate stage's CARP probe, D-27).
+# rc 0 with output always; 2 if <vhid> is not a CARP vhid. Parsed from
+# ifconfig(8), whose carp line reads "carp: MASTER vhid 1 advbase 1 advskew 0"
+# (observed in the guest, recorded by the substrate stage's CARP probe, D-27).
+#
+# THE RANGE IS PART OF THE CONTRACT, not only the digits: ifconfig(8) says
+# "Acceptable values for vhid are 1 to 255", which lib/adapter.subr enforces in
+# _adapter_vhid_ok and the vectors pin with the 0 and 256 rows. This adapter
+# used to accept both and answer "absent" -- a caller asking about a vhid that
+# cannot exist got a confident no rather than a refusal, and the two adapters
+# disagreed about the same question. Found by running tests/conformance against
+# this adapter for the first time (tier 5).
+#
+# A leading zero is refused rather than normalised for the reason the real
+# adapter gives: $(( )) would read it as octal, and a vhid is written by a
+# human in a configuration file.
 adapter_carp_state()
 {
     local _vhid _s
@@ -500,7 +512,13 @@ adapter_carp_state()
     _vhid=${1:-}
     case "${_vhid}" in
         ''|*[!0123456789]*) pseudo_diag "carp: vhid must be a number: ${_vhid}"; return 2 ;;
+        0*) pseudo_diag "carp: vhid must not have a leading zero: ${_vhid}"; return 2 ;;
     esac
+
+    if [ "${_vhid}" -lt 1 ] || [ "${_vhid}" -gt 255 ]; then
+        pseudo_diag "carp: vhid must be 1-255 (ifconfig(8)): ${_vhid}"
+        return 2
+    fi
 
     _s=$( ifconfig 2>/dev/null |
         awk -v v="${_vhid}" '

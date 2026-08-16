@@ -5,8 +5,7 @@ contracts: same fields, same error shapes, same exit-code discipline. The real
 side drives an actual jail through its lifecycle. This is the tier that breaks
 first when CBSD changes an invocation convention. See TESTING.md §6.
 
-THE SUITE ALREADY EXISTS AND ALREADY RUNS -- against the mock, in tier 4
-(tests/tier4/t_conformance_mock.sh). It is:
+THE SUITE ITSELF is tests/conformance/:
 
   tests/conformance/vectors.tsv   function, args, stdout shape, exit status
   tests/conformance/run.subr      the runner: three assertions per vector --
@@ -14,65 +13,88 @@ THE SUITE ALREADY EXISTS AND ALREADY RUNS -- against the mock, in tier 4
                                   that a function which promised output
                                   produced some
 
-Wiring this tier is therefore a small file, not a project. It differs from the
-tier-4 one in exactly two ways:
+and it is run against three adapters, in three places:
 
-  1. the adapter it sources
-         SEANCE_ADAPTER=lib/adapter.subr
-  2. the world the vectors are written against, declared in the environment
-     because the vector file names it with placeholders rather than with
-     fixture names:
-         SEANCE_CONF_JAIL     a jail-type guest that exists on the node
-         SEANCE_CONF_VM       a bhyve guest that exists (or omit its rows)
-         SEANCE_CONF_HELD     a guest put into slave mode by the stage
-         SEANCE_CONF_ABSENT   a name no guest has
-         SEANCE_CONF_BADNAME  a name no guest may have (default UPPER)
+  tests/tier4/t_conformance_mock.sh    the mock, on the workstation
+  tests/tier5/t_conformance_pseudo.sh  the pseudo-cluster adapter, in the guest
+  tests/tier5/t_conformance_real.sh    lib/adapter.subr, against real CBSD
 
-The vectors are read-only by construction: the mutating verbs appear in them
-only with a name their contract requires them to refuse before touching
-anything. The lifecycle proper -- create a minimal jail, register, start,
-probe, hold, release, stop, unregister -- is a staged test of its own and is
-what M2 adds here, together with the two live assertions M0 and M1 left
-UNVERIFIED:
+The world the vectors assume is named with placeholders rather than fixture
+names, and each file declares its own:
 
-  * a real jail in slave mode refuses `cbsd jstart` (decision D-21);
-  * `cbsd jstatus jname=<n> invert=1` (what `adapter_guest_running` actually
-    calls, D-47) for a guest that EXISTS exits 0 and prints its jid
-    (docs/cbsd-module-notes.md §6 has the source-level argument for this and
-    marks it UNVERIFIED live until this tier; M0 had no guest to run it
-    against).
+  SEANCE_CONF_JAIL     a jail-type guest that exists          web01
+  SEANCE_CONF_VM       a bhyve guest that exists              db01
+  SEANCE_CONF_HELD     a guest in slave mode                  arc01
+  SEANCE_CONF_ABSENT   a name no guest has              nosuchguest
+  SEANCE_CONF_BADNAME  a name no guest may have               UPPER
 
-M2 NOTE -- adapter_guest_datasets now resolves the MOUNTED PATH first.
+THE FILES
 
-A guest promoted in place keeps its dataset under <standby_root>/<dead>/<name>
-and is given the mountpoint CBSD expects (D-44 item 4), so a derivation from
-the pool that carries jails-data can no longer name it. lib/adapter.subr
-therefore asks `zfs list -H -o name <mountpoint>` first and falls back to the
-pool derivation. Two live assertions belong to this tier and are UNVERIFIED
-until it runs:
+  t_conformance_pseudo.sh   the vectors against tests/cluster/adapter-pseudo.subr.
+                            No cluster: the pseudo adapter's guests are ZFS
+                            datasets, so all it needs is a pool, which is why
+                            this runs in the guest and not on the workstation.
+  t_conformance_real.sh     the vectors against lib/adapter.subr on a real
+                            CBSD node, plus the layout claims the shared
+                            vectors cannot carry (which path a fact is, where
+                            CBSD put the datasets, which way the sysdir
+                            symlink points).
+  t_lifecycle_real.sh       one real jail through start, hold, refuse,
+                            release, stop, unregister, register, start -- and
+                            the dataset resolution against a real replica.
+  t_promote_real.sh         one `seance repl` tick on a real node, then the
+                            successor's half of a promotion: a real jail
+                            registers and starts out of the configuration
+                            mirror and nothing else.
 
-  * against a real CBSD jail at home, `adapter_guest_datasets <jail>` names the
-    same dataset CBSD created (`<pool>/<jname>`, sudoexec/mkdatadir:20-21), and
-    against a real bhyve guest it names the one mounted at ${workdir}/vm/<name>
-    (sudoexec/bcreate:579) -- resolution 1, on the real thing;
-  * with the guest's dataset UNMOUNTED, the same call falls back rather than
-    resolving to CBSD's whole workdir dataset. `zfs list <path>` answers with
-    the dataset CONTAINING the path (observed on the workstation:
-    `zfs list -H -o name,mountpoint /data/jails` prints the parent and /data),
-    which is why the adapter checks that the answer's own mountpoint is exactly
-    the path asked about. tests/tier4/t_adapter_parse.sh pins this against a
-    scripted zfs; this tier is where it meets a real pool.
+Each of the three real files builds and destroys its own CBSD node
+(tests/shapeb/lib/shapeb.subr, about 19 seconds), for the reason tier 6's
+stages each build their own cluster: a file that inherited a world another file
+left behind would be asserting against a world nobody described.
 
-Also UNVERIFIED here, and it matters more than it looks: a JAIL's registerable
-configuration lives at ${jailsysdir}/<name>/rc.conf_<name>, which is NOT inside
-the guest's replicated dataset, while a VM's is (jails-system/<name> is a
-symlink to ${workdir}/vm/<name>, sudoexec/bcreate:599). See the open problem
-noted in lib/promote.subr's header: a promoted VM finds its configuration, and
-a promoted jail on real CBSD may not.
+THE SUBSTRATE, and the one thing that must not be got wrong: `cbsd initenv`
+starts cbsdd and cbsdrsyncd, both of which hold files open under the reset
+dataset, and `reaper reset` refuses to roll a dataset back while anything has
+files open under it. shapeb_up therefore arms shapeb_down through t_at_exit
+BEFORE it creates anything, and t_lifecycle_real.sh and t_promote_real.sh end
+with shapeb_down_and_check, which tears the node down and then asserts that no
+dataset, no mount and no process is left. Tier 6 runs next, in the same
+session, on the same dataset.
 
-Substrate note from M0, binding on this tier: `cbsd initenv` starts cbsdd,
-which holds files open under the reset dataset, so a stage here must stop
-cbsdd (and cbsdrsyncd) before `reaper reset` -- or keep the CBSD workdir out
-of the reset dataset entirely.
+WHAT THIS TIER SETTLED (it was written as a list of UNVERIFIED items; they are
+now assertions, and docs/cbsd-module-notes.md §6, §8 and §10 carry the
+captures):
+
+  * a real jail in slave mode refuses `cbsd jstart` -- D-21's lever, watched
+    happening, including that the jail is still not running afterwards;
+  * `cbsd jstatus jname=<n> invert=1` for a guest that EXISTS exits 0 and
+    prints its jid, non-zero while it runs (D-47);
+  * the dataset layout for both guest types on a zfsfeat=1 node, and both
+    symlinks a VM gets;
+  * adapter_guest_datasets resolves the MOUNTED PATH first, against a replica
+    really received under a standby tree and given CBSD's expected mountpoint
+    (D-71) -- and falls back rather than resolving to the whole workdir
+    dataset when nothing is mounted there;
+  * a JAIL's configuration is not inside its dataset and a VM's is (D-77/D-82),
+    measured rather than assumed by type;
+  * and the mirror: a real jail registers and starts from a
+    promote_sys_restore out of a replica of `<pool>/seance-sys` (D-82, D-84).
+
+WHAT IT FOUND, which is what the tier is for. Three CBSD defects and three
+adapter fixes; every one is written up in docs/cbsd-module-notes.md §8 and
+pinned by a tier-4 row so it cannot come back at workstation speed:
+
+  * `cbsd emulator <name>` cannot answer on FreeBSD 15.1 -- SQLite 3.53.3
+    rejects its double-quoted literal and CBSD's builtin swallows the parse
+    error. adapter_guest_type reads the listing row instead;
+  * `cbsd jls jname=<x>` answers with OTHER guests' rows from its unregistered
+    area. The adapter filters by name before parsing;
+  * CBSD's mutating verbs print on stdout, refusals included. The [no output]
+    adapter functions send that to stderr.
+
+STILL UNVERIFIED, and it needs hardware rather than another test: everything in
+docs/DRILLS.md -- the fencing drills against a real BMC, and a real two-node
+failover. Also a bhyve guest that has ever BOOTED (see notes §10); tier 5
+creates one and asserts its layout, which is all seance's own paths read.
 
 Files named t_*.sh are tests; anything else here is ignored.

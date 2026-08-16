@@ -36,7 +36,17 @@ adapter_guest_held	%HELD%	^1$	0
 adapter_guest_held	%JAIL%	^0$	0
 adapter_guest_held	%ABSENT%	-	1
 adapter_guest_held	%BADNAME%	-	2
-adapter_guest_sysdir	%JAIL%	^/.+/%JAIL%$	0
+# An ABSOLUTE PATH is all the shared contract says (the '# contract:' line
+# reads "-> path"). It used to read ^/.+/%JAIL%$ here, which is CBSD's layout
+# -- ${jailsysdir}/<name> -- written into an oracle three adapters answer:
+# a pseudo-cluster guest keeps its configuration in a dataset CHILD, at
+# <mount>/<name>/sys, precisely so that it travels with the guest (D-84 item 3),
+# and it failed this row the first time the suite was pointed at it (tier 5).
+# The layout each platform actually promises is pinned per adapter, harder than
+# a suffix match was: tests/tier5/t_conformance_real.sh asserts the exact
+# ${jailsysdir}/<name> AND that rc.conf_<name> is in it, and
+# tests/tier5/t_conformance_pseudo.sh asserts the exact <mount>/<name>/sys.
+adapter_guest_sysdir	%JAIL%	^/.+$	0
 adapter_guest_sysdir	%BADNAME%	-	2
 adapter_guest_datasets	%JAIL%	^[a-z0-9][a-z0-9._:/-]*$	0
 adapter_guest_datasets	%ABSENT%	-	1
