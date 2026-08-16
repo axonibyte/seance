@@ -1,0 +1,171 @@
+#!/bin/sh
+# A scripted stand-in for ipmitool(1), for testing drivers/fence_ipmi.
+#
+# The tests put this directory first on PATH, so `ipmitool` resolves here and
+# no BMC, no network and no credentials are involved. Every mode below encodes
+# real ipmitool 1.8.19 behaviour, cited so that the assumption is visible and
+# falsifiable rather than folded invisibly into a test:
+#
+#   * `chassis power status` prints "Chassis Power is on|off" on stdout
+#     (lib/ipmi_chassis.c:206).
+#   * `chassis power off` prints "Chassis Power Control: Down/Off" on stdout
+#     (lib/ipmi_chassis.c:236, lib/ipmi_strings.c:1259), or on a completion
+#     code failure prints "Set Chassis Power Control to Down/Off failed: ..."
+#     and exits 1 (lib/ipmi_chassis.c:228-232, src/ipmitool.c:138).
+#   * A session that cannot be established prints
+#     "Error: Unable to establish IPMI v2 / RMCP+ session" and exits 1
+#     (src/plugins/lanplus/lanplus.c:3572).
+#   * Diagnostics are on stderr, data on stdout (lib/log.c:73).
+#
+# Environment:
+#   FENCE_SHIM_MODE   required. One of:
+#       off-immediately  power reads off from the first poll
+#       off-after-N      N status reads say on, then off (N: FENCE_SHIM_N)
+#       stays-on         power never goes off; the command is accepted
+#       refused          the BMC rejects the command (exit 1, no session error)
+#       unreachable      exit 1 with the RMCP+ session error
+#       garbage          exit 0 with output that parses as neither on nor off
+#       empty0           exit 0 with no output at all
+#       hang             sleep past any sane timeout
+#   FENCE_SHIM_LOG    required. Every invocation appends its argv here, one
+#                     line, so a test can assert on what was passed -- that the
+#                     password went as `-f <passfile>` and never as `-P`.
+#   FENCE_SHIM_N      poll count for off-after-N (default 2).
+#   FENCE_SHIM_HANG   seconds to sleep in hang mode (default 60).
+#   FENCE_SHIM_STATE  counter file (default: $FENCE_SHIM_LOG.state).
+#
+# The shim also echoes its argv to stderr in every mode. That is not what
+# ipmitool does; it is here so that the leak test has something to catch. If
+# fence_ipmi ever passed the password on the command line, it would land in
+# this shim's stderr and in FENCE_SHIM_LOG, and t_fence_ipmi.sh greps both.
+#
+# shellcheck disable=SC3043
+#   'local' is not in POSIX sh but is implemented by FreeBSD /bin/sh (sh(1),
+#   "local"); seance targets FreeBSD sh and nothing else (HANDOFF.md §5).
+set -u
+
+mode=${FENCE_SHIM_MODE:-}
+log=${FENCE_SHIM_LOG:-}
+hang=${FENCE_SHIM_HANG:-60}
+n=${FENCE_SHIM_N:-2}
+
+# 125 is out of ipmitool's own range (0 or 1), so a misconfigured shim can
+# never be mistaken by the driver for a BMC saying something.
+if [ -z "${mode}" ] || [ -z "${log}" ]; then
+    echo "ipmitool shim: FENCE_SHIM_MODE and FENCE_SHIM_LOG must be set" >&2
+    exit 125
+fi
+
+state=${FENCE_SHIM_STATE:-${log}.state}
+
+printf '%s\n' "$*" >> "${log}"
+printf 'ipmitool shim argv: %s\n' "$*" >&2
+
+# The chassis subcommand is the tail of the argument list: everything before it
+# is options this shim does not interpret. "chassis power off" -> "off".
+subcmd=""
+prev=""
+prev2=""
+for a in "$@"; do
+    prev2=${prev}
+    prev=${subcmd}
+    subcmd=${a}
+done
+
+case "${prev2}/${prev}/${subcmd}" in
+    chassis/power/off)    action=off ;;
+    chassis/power/status) action=status ;;
+    *)
+        echo "ipmitool shim: unsupported command: $*" >&2
+        exit 125
+        ;;
+esac
+
+# poll_number -- how many status reads have been made, this one included.
+poll_number()
+{
+    local _c
+
+    _c=0
+    [ -r "${state}" ] && read -r _c < "${state}"
+
+    case "${_c}" in
+        ''|*[!0123456789]*) _c=0 ;;
+    esac
+
+    _c=$(( _c + 1 ))
+    printf '%s\n' "${_c}" > "${state}"
+    printf '%s\n' "${_c}"
+}
+
+case "${mode}" in
+    hang)
+        # exec so that the sleep *is* the process timeout(1) is bounding.
+        exec sleep "${hang}"
+        ;;
+    unreachable)
+        echo "Error: Unable to establish IPMI v2 / RMCP+ session" >&2
+        exit 1
+        ;;
+    refused)
+        echo "Set Chassis Power Control to Down/Off failed: Insufficient privilege level" >&2
+        exit 1
+        ;;
+    garbage)
+        echo "Chassis Power is quantum"
+        exit 0
+        ;;
+    empty0)
+        exit 0
+        ;;
+esac
+
+if [ "${action}" = off ]; then
+    case "${mode}" in
+        off-immediately|off-after-*|stays-on)
+            echo "Chassis Power Control: Down/Off"
+            exit 0
+            ;;
+        *)
+            echo "ipmitool shim: unknown FENCE_SHIM_MODE: ${mode}" >&2
+            exit 125
+            ;;
+    esac
+fi
+
+case "${mode}" in
+    off-immediately)
+        echo "Chassis Power is off"
+        exit 0
+        ;;
+    stays-on)
+        echo "Chassis Power is on"
+        exit 0
+        ;;
+    off-after-*)
+        # The N may be written into the mode name (off-after-3) or given in
+        # FENCE_SHIM_N; the name wins, because that is what the test reads.
+        case "${mode#off-after-}" in
+            ''|*[!0123456789]*) ;;
+            *) n=${mode#off-after-} ;;
+        esac
+
+        case "${n}" in
+            ''|*[!0123456789]*)
+                echo "ipmitool shim: FENCE_SHIM_N must be a number: ${n}" >&2
+                exit 125
+                ;;
+        esac
+
+        if [ "$( poll_number )" -le "${n}" ]; then
+            echo "Chassis Power is on"
+        else
+            echo "Chassis Power is off"
+        fi
+        exit 0
+        ;;
+    *)
+        echo "ipmitool shim: unknown FENCE_SHIM_MODE: ${mode}" >&2
+        exit 125
+        ;;
+esac
