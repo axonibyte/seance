@@ -107,8 +107,20 @@ CONF_TAB=${CONF_TAB%.}
 # ---------------------------------------------------------------------------
 
 # _conf_in_list <word> <space-separated list>  -- rc 0 if present.
+#
+# The needle must be ONE word, and a needle that is not is refused rather than
+# looked for. A space-separated list contains every run of its own words as a
+# substring -- " alpha bravo charlie " contains " bravo charlie " -- so without
+# this guard `node_alpha_heir=bravo charlie` is a "configured node",
+# `config --check` says PASS, and pol_heirs then prints two node keys on one
+# line for every caller to word-split into a peer nobody named. A membership
+# test that answers for two members at once is not a membership test.
 _conf_in_list()
 {
+    case "${1:-}" in
+        ''|*' '*|*"${CONF_TAB}"*) return 1 ;;
+    esac
+
     case " $2 " in
         *" $1 "*) return 0 ;;
     esac

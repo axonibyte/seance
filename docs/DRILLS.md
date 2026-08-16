@@ -82,10 +82,12 @@ below is read-only with respect to the running estate.
    done
    ```
 
-   **Every line must read `none inherited... noauto`.** A `local` or `received`
-   mountpoint on any of them is a drill failure and a stop-everything finding:
-   it is the August defect, live, and the replica is one boot away from
-   shadowing the guest's own mount.
+   Each line is `<dataset> <mountpoint> <source-of-mountpoint> <canmount>`, and
+   **every one of them must read `none inherited noauto`** after the dataset
+   name. A `local` or `received` in the third column is a drill failure and a
+   stop-everything finding: it is the August defect, live, and the replica is
+   one boot away from shadowing the guest's own mount. Save the listing —
+   step 5 compares against it byte for byte.
 
 4. **Mount the replica read-only and diff it.** This is the part that cannot be
    skipped: the point of the drill is to read the bytes. On the heir, working
@@ -96,17 +98,25 @@ below is read-only with respect to the running estate.
        <standby_root>/<home>/<guest>@seance-<home>-<TS> <pool>/drill-<guest>
    ```
 
-   Repeat for each child dataset of the guest, cloning the same snapshot name.
-   Then, on the home node, mount the *source's* snapshot of the same instant
-   read-only in the same way, and diff the critical paths — the guest's config
-   directory, its database directory, whatever the guest's owner names as the
-   thing that must be right:
+   Repeat for each child dataset of the guest, cloning the **same snapshot
+   name** and giving each clone the mountpoint that puts it back where it
+   belongs under `/mnt/drill` — a child whose tail below the guest root is
+   `data` gets `-o mountpoint=/mnt/drill/data`. A clone that inherits its
+   parent's mountpoint lands on top of it and the diff below then compares a
+   directory with itself.
+
+   Then, on the home node, clone the *source's* snapshot of the same instant in
+   the same way (`-o mountpoint=/mnt/source-snap -o readonly=on`) and diff the
+   critical paths — the guest's config directory, its database directory,
+   whatever the guest's owner names as the thing that must be right:
 
    ```sh
    diff -r /mnt/source-snap/etc /mnt/drill/etc
    ```
 
-   Record the diff output. Empty is the pass.
+   Record the diff output. Empty is the pass. The two ends are different
+   machines, so run the diff where both are visible — either copy one side
+   over, or run `diff` across `ssh` — and record which you did.
 
 5. **Undo, and prove you did.**
 
@@ -127,6 +137,29 @@ below is read-only with respect to the running estate.
    `status` must still exit 0, and the replica's timestamp for that guest must
    be `TS` or newer. `verify` must still exit 0.
 
+### Timing
+
+Drills are gates and gates are timed (design §10). Note the wall clock at the
+start of each step and record the elapsed time; the targets below are for one
+guest of a few hundred gigabytes on a LAN, and are a starting point for the
+fleet's own numbers rather than a specification.
+
+| Step | What is being timed | Target | Record |
+| --- | --- | --- | --- |
+| 1 | `status --tsv` + `verify` on the home node | < 30 s | elapsed |
+| 2 | `seance repl --guest <guest> --now` | < 1 cadence | elapsed, and `TS` |
+| 3 | the property listing on the heir | < 10 s | elapsed |
+| 4 | clone, mount and `diff -r` of the critical paths | operator's call | elapsed, and how much was diffed |
+| 5 | destroy the clones, re-read the properties | < 30 s | elapsed |
+| 6 | `status --tsv` + `verify` again | < 30 s | elapsed |
+| 2→6 | the whole drill | — | elapsed |
+
+A step that overruns its target is not by itself a failure — it is the number
+the next drill is compared against, and the first one to move is the one worth
+asking about. Step 2 is the exception: a tick that does not finish inside the
+guest's cadence means the next tick is queueing behind it, which is a finding
+whether or not the drill passes.
+
 ### Evidence a passing drill leaves
 
 - `/tmp/drill-repl-before.tsv` and `/tmp/drill-repl-after.tsv`, both from a
@@ -134,8 +167,10 @@ below is read-only with respect to the running estate.
 - The step-3 property listing, before and after, identical, every line
   `none inherited noauto`.
 - The step-4 diff, empty.
-- A note of `TS`, the guest, the heir, and the wall-clock time the drill took
-  from step 2 to step 6.
+- A note of `TS`, the guest, the heir, and the timing table above filled in,
+  including the step 2→6 total.
+- The `seance version` of the node the drill was run from, so that a later
+  drill can be compared against the code this one exercised.
 
 ### What a failure means
 

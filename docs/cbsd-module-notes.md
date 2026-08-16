@@ -172,10 +172,63 @@ $ cbsd seance one two three     ->  argv: [one two three]
 ```
 — `out/m0/04c-module-environment.txt`
 
-seance takes `mode` if set and `CIX_OTHER_ARGS` otherwise, so both spellings
-work (D-2). Note that `CIXARG` (required args) makes `cixinit` fail when the
-argument is absent, so `mode` is a *CIXOPTARG*: `cbsd seance version` must not
-be a usage error.
+**A verb's own flags go to `CIX_OTHER_ARGS` in BOTH spellings, and that is the
+whole of the trap.** M0 only ever ran verbs with no flags of their own, so it
+saw `mode` and `CIX_OTHER_ARGS` as alternatives. They are not. Observed in the
+guest with the wrapper's exec line replaced by a `printf` of the two variables
+(`out/m1/h-cbsd-args.txt`, CBSD 15.0.9):
+
+```
+$ cbsd seance version                       mode=[]        CIX_OTHER_ARGS=[version]
+$ cbsd seance mode=version                  mode=[version] CIX_OTHER_ARGS=[]
+$ cbsd seance config --check                mode=[]        CIX_OTHER_ARGS=[config --check]
+$ cbsd seance mode=config --check           mode=[config]  CIX_OTHER_ARGS=[--check]
+$ cbsd seance repl --guest web01 --now      mode=[]        CIX_OTHER_ARGS=[repl --guest web01 --now]
+$ cbsd seance mode=repl --guest web01 --now mode=[repl]    CIX_OTHER_ARGS=[--guest web01 --now]
+$ cbsd seance verify --render cron          mode=[]        CIX_OTHER_ARGS=[verify --render cron]
+$ cbsd seance mode=verify --render cron     mode=[verify]  CIX_OTHER_ARGS=[--render cron]
+```
+
+So a wrapper that reads `mode` **if set and `CIX_OTHER_ARGS` otherwise** loses
+every flag of a `mode=`-spelled verb. seance's did, until this was run.
+Measured with the dispatcher replaced by a script that prints its own argv,
+against the same installed module, before and after:
+
+```
+                                       before the fix        after
+$ cbsd seance config --check           argv=[config --check] argv=[config --check]
+$ cbsd seance mode=config --check      argv=[config]         argv=[config --check]
+$ cbsd seance mode=repl --guest web01 --now
+                                       argv=[repl]           argv=[repl --guest web01 --now]
+```
+
+`cbsd seance mode=config --check` therefore used to print the configuration
+dump and exit 0 where the operator had asked for a validation — no message, no
+non-zero status, nothing anywhere saying the flag had gone nowhere. The wrapper
+now passes **both**, in order:
+
+```sh
+exec ${_MYDIR}/bin/seance ${mode} ${CIX_OTHER_ARGS}
+```
+
+which makes the two spellings identical, as its ADDHELP now says. End to end on
+the installed module, with the real dispatcher:
+
+```
+$ cbsd seance version           seance 0.1.0   $ cbsd seance mode=version        seance 0.1.0
+$ cbsd seance config --check    PASS           $ cbsd seance mode=config --check PASS
+$ cbsd seance --desc            Guest succession: replication, death detection, fencing, promotion
+```
+
+Pinned by `tests/tier1/t_verb_wrapper.sh`, which drives the wrapper under a
+faked cbsdsh environment (the two sourced files replaced by empty ones,
+`cixinit` defined as a function in the second, `bin/seance` replaced by a
+script that prints its argv) — so the regression is caught on the workstation,
+on every edit, without CBSD.
+
+Note that `CIXARG` (required args) makes `cixinit` fail when the argument is
+absent, so `mode` is a *CIXOPTARG*: `cbsd seance version` must not be a usage
+error.
 
 Verdict, end to end (`out/m0/04-verb-dispatch.txt`):
 

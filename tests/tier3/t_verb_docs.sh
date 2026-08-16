@@ -171,7 +171,25 @@ dead_invocations()
             "$( dispatcher_alternatives "$1/bin/seance" | tr '\n' ' ' )"
 }
 
-t_plan 9
+# dead_invocations_in <tree> <doc>  -- the same, for any document.
+#
+# README is not the only file that tells an operator what to type. A drill is
+# followed at three in the morning by somebody who did not write it, and
+# docs/repl-wire.md is what M2's promotion path is built against; a verb
+# renamed out from under either of them is the same rot in a place nobody
+# greps.
+dead_invocations_in()
+{
+    missing "$( readme_invocations "$2" | tr '\n' ' ' )" \
+            "$( dispatcher_alternatives "$1/bin/seance" | tr '\n' ' ' )"
+}
+
+# The documents scanned for liveness beyond README. A file added here and not
+# to the repository is caught by the "shows seance being invoked" assertion,
+# which is why that assertion is per-document rather than over the union.
+DOC_SET="docs/repl-wire.md docs/DRILLS.md"
+
+t_plan 16
 
 verbs=$( dispatcher_verbs "${T_ROOT}/bin/seance" | tr '\n' ' ' )
 t_isnt "${verbs}" "" "the dispatcher's verbs can be read out of bin/seance"
@@ -226,5 +244,30 @@ printf '\n### seance exorcise\n\nGone, but still written up.\n' \
 
 t_is "$( sections_without_verbs "${scratch}" )" "exorcise" \
     "a README section for a verb the dispatcher does not have is caught"
+
+# ---------------------------------------------------------------------------
+# The other documents an operator types out of
+# ---------------------------------------------------------------------------
+
+for doc in ${DOC_SET}; do
+    t_rc 0 "${doc} is in the repository" -- test -r "${T_ROOT}/${doc}"
+
+    inv=$( readme_invocations "${T_ROOT}/${doc}" | tr '\n' ' ' )
+    t_isnt "${inv}" "" "${doc} shows seance being invoked"
+
+    t_is "$( dead_invocations_in "${T_ROOT}" "${T_ROOT}/${doc}" )" "" \
+        "every seance invocation ${doc} shows exists in the dispatcher"
+done
+
+# The same mutation, in the same place it would really happen: a document that
+# goes on telling an operator to run a verb that has been renamed.
+cp "${T_ROOT}/docs/DRILLS.md" "${scratch}/DRILLS.md"
+# shellcheck disable=SC2016
+#   The single quotes are the point: the backticks are Markdown being written
+#   into a document, not a command substitution to expand.
+printf '\n```sh\nseance exorcise --guest web01\n```\n' >> "${scratch}/DRILLS.md"
+
+t_is "$( dead_invocations_in "${T_ROOT}" "${scratch}/DRILLS.md" )" "exorcise" \
+    "a drill step naming a verb that does not exist is caught"
 
 t_done

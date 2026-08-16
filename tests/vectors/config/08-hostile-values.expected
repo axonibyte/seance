@@ -1,0 +1,29 @@
+fleet set cadence 3600
+fleet default retention_recent 14400
+fleet default retention_hourly 172800
+fleet derived staleness_max 10800
+fleet default skew_tolerance 120
+fleet set debounce 45
+fleet set fence_timeout 90
+fleet default ssh_user root
+fleet default ssh_port 22
+fleet set ssh_extra_opts -o ProxyCommand=ssh -W %h:%p bastion.example.net
+fleet set standby_root poolname/standby/%n
+fleet set notify_cmd /usr/bin/env MAILRC=/dev/null mail -s seance#1 ops@example.net
+fleet unset witness
+names alpha α-01.example.net
+node alpha nodename alpha.example.net
+node alpha mgmt alpha-mgmt.example.net
+node alpha heir bravo
+node alpha heir2 n012345678901234567890123456789012345678901234567890123456789ab
+node bravo nodename bravo.example.net
+node bravo mgmt bravo-mgmt.example.net
+node bravo heir n012345678901234567890123456789012345678901234567890123456789ab
+node bravo standby_root poolname/verylongsegmentverylongsegmentverylongsegmentverylongsegmentverylongsegmentverylongsegmentverylongsegmentverylongsegmentverylongsegmentverylongsegmentverylongsegmentverylongsegmentverylongsegmentverylongsegmentverylongsegmentverylongsegmentverylongsegmentverylongsegmentverylongsegmentverylongsegmentverylongsegmentverylongsegmentverylongsegmentverylongsegmentverylongsegmentverylongsegmentverylongsegmentverylongsegmentverylongsegmentverylongsegment/standby
+node n012345678901234567890123456789012345678901234567890123456789ab nodename charlie.example.net
+node n012345678901234567890123456789012345678901234567890123456789ab mgmt charlie-mgmt.example.net
+node n012345678901234567890123456789012345678901234567890123456789ab heir alpha
+guest web01 override cadence 7200
+guest web01 override staleness_max 21600
+guest web01 override heir bravo
+guest web01 unset heir2

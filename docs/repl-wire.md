@@ -188,6 +188,25 @@ replica by legitimate means. It is left alone at both ends either way.
   tick. There is no way to make an incremental of something the peer has never
   seen, and this is the honest cost of walking the tree.
 
+- **A stream cut by the network cannot be resumed until the peer's half has
+  ended.** Removing a node's port from the bridge drops packets; it does not
+  tell the peer, and the peer's `zfs recv` goes on waiting on a TCP connection
+  that has no way to know. Ticking again the moment the partition heals meets:
+
+      cannot receive resume stream: destination <replica> contains
+      partially-complete state from "zfs receive -s"
+
+  — the ORPHANED receive still owns the dataset and the new one cannot take it
+  over. Observed in `tests/tier6/t_replfail.sh`, which is why that stage ends
+  the orphan explicitly rather than waiting on a retransmit timer. The tick
+  reports the pair as failed and keeps the timestamp the peer was last known to
+  hold, which is correct; the pair recovers by itself on the first tick after
+  the peer's receive dies (a TCP timeout, or the reboot that usually comes with
+  a real partition). **Nothing in seance kills a peer's process**, and nothing
+  should: a receive that is still running may still be making progress, and a
+  replication engine that reaps processes on a machine it does not own is a
+  larger weapon than this one is allowed to be.
+
 ## 9. Where replicas live
 
     <standby_root>/<homenodekey>/<basename of the guest's dataset root>/<tail>

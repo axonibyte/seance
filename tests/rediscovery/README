@@ -16,6 +16,19 @@ touched, so there is no restore step and nothing to forget to undo.
 takes minutes per row. Nothing runs this automatically. It is the check you run
 before you believe the suite, not the one you run after every edit.
 
+Run it from inside the reaper guest, and give it the same environment `reaper
+run` gives the suite. The pseudo-cluster refuses to guess where it may write
+(D-22), so an ssh session that has not inherited reaper's environment must say
+so itself:
+
+    env REAPER_STATE=/tank/state sh tests/rediscovery/run.sh --tier 6
+
+Without it every row fails with "neither SEANCE_CLUSTER_BASE nor REAPER_STATE
+is set" — correctly, and confusingly, since the row that could not run reads
+much like the row that ran and found nothing. run.sh distinguishes them (it
+refuses to call a run with zero assertions a rediscovery), which is what makes
+the mistake recoverable rather than a false pass.
+
 The rows, and what each is about:
 
   recv-no-x-mountpoint.patch

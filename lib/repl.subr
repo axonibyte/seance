@@ -238,6 +238,33 @@ repl_lag_fail()
     repl_lag_write "$1" "$2" "${_ts}" "$3" "$4"
 }
 
+# repl_snapshot_complete <dataset-list-file> <shortname>
+#
+# rc 0 when EVERY dataset named in the file carries <shortname>. Used only when
+# a recursive snapshot failed, to tell "somebody else took this instant" from
+# "the snapshot did not happen": the first is a race a concurrent tick won and
+# is safe to replicate, the second is a failure.
+#
+# Every dataset, not just the root, because a tree in which only some datasets
+# carry the instant is not a point in time -- and a mixed-time tree is exactly
+# what replication must never put on a peer.
+repl_snapshot_complete()
+{
+    local _file _short _ds
+
+    _file=${1:?}
+    _short=${2:?}
+
+    [ -s "${_file}" ] || return 1
+
+    while IFS= read -r _ds || [ -n "${_ds}" ]; do
+        [ -n "${_ds}" ] || continue
+        zfs_exists "${_ds}@${_short}" || return 1
+    done < "${_file}"
+
+    return 0
+}
+
 # repl_lock_file <guest> <peerkey>
 repl_lock_file()
 {
@@ -411,6 +438,26 @@ fi
 exit 0"
 
     seance_ssh "${_addr}" "${_cmd}"
+}
+
+# repl_probe_has_dataset <probe-file> <dataset>
+#
+# rc 0 if the peer's probe listed <dataset> as existing -- an "E" record. This
+# is the difference between "the peer has never seen this dataset" and "the
+# peer has it and told us nothing about its snapshots", which are the two ways
+# to arrive at an empty snapshot list and which call for opposite actions.
+repl_probe_has_dataset()
+{
+    local _file _ds
+
+    _file=${1:?}
+    _ds=${2:?}
+
+    [ -r "${_file}" ] || return 1
+
+    awk -F "${REPL_TAB}" -v d="${_ds}" \
+        'BEGIN { found = 1 } $1 == "E" && $2 == d { found = 0; exit } END { exit found }' \
+        "${_file}"
 }
 
 # repl_remote_ensure_parent <address> <dataset>
@@ -802,6 +849,32 @@ repl_pair()
                 seance_log err "repl ${_guest}->${_peer}: incremental send of ${_ds} failed"
                 _rc=1
             fi
+        elif repl_probe_has_dataset "${_probe}" "${_rds}"; then
+            # No snapshot in common, and the peer SAYS IT HAS THE DATASET. Those
+            # two facts do not add up to "the peer has nothing", and the
+            # difference between an empty replica and an unreadable one is the
+            # whole of this branch.
+            #
+            # A replica dataset exists only because a receive created it, and a
+            # receive always leaves the snapshot it carried. So a dataset that
+            # is present with no snapshot of our lineage on it is evidence we
+            # could not read -- a listing that came back empty with a success
+            # status, the crashed-verifier class this project has met before --
+            # or a replica somebody has been editing by hand. Neither is a
+            # licence to send in full: a full send onto an existing dataset is
+            # refused by zfs-receive(8) anyway, and the only way to make it
+            # succeed would be `-F`, which destroys whatever is there. seance
+            # does not hold that authority over a peer's pool (D-64).
+            #
+            # So the pair fails, loudly, naming the dataset and what to look
+            # at. The operator's repair is to destroy the replica (a full send
+            # then rebuilds it) or to find out what emptied the listing.
+            seance_log err "repl ${_guest}->${_peer}: ${_peer} holds ${_rds} but reported" \
+                "no ${POL_SNAP_PREFIX}${_home}-* snapshot on it, and no resume token;" \
+                "refusing to decide what to send on evidence this thin." \
+                "Look at ${_peer}: 'zfs list -t snapshot -r ${_rds}'"
+            _rc=1
+            continue
         else
             seance_log notice "repl ${_guest}->${_peer}: no snapshot in common for ${_ds}; sending it in full"
             if repl_pipe "${_rcf}" "${_to}" "${_addr}" "$( repl_recv_cmd "${_rds}" )" \
@@ -893,9 +966,22 @@ repl_pair()
     done
 
     # --- the record status reads ------------------------------------------
-    [ -n "${_acked}" ] || _acked="-"
-    repl_lag_write "${_guest}" "${_peer}" "${_acked}" "${_now}" "${_rc}" ||
-        seance_log err "repl ${_guest}->${_peer}: could not write the lag record"
+    #
+    # "Nothing in common" and "we could not find out what is in common" arrive
+    # here as the same empty string, and writing "-" for the second is how a
+    # fleet loses the one number that says what a promotion onto this peer
+    # would cost. So an empty answer takes the failure path, which keeps the
+    # timestamp the peer was last known to hold and moves the tick epoch and
+    # the exit status on -- the same reasoning as repl_lag_fail's, applied at
+    # the other end of the pair.
+    if [ -n "${_acked}" ]; then
+        repl_lag_write "${_guest}" "${_peer}" "${_acked}" "${_now}" "${_rc}" ||
+            seance_log err "repl ${_guest}->${_peer}: could not write the lag record"
+    else
+        repl_lag_fail "${_guest}" "${_peer}" "${_now}" "${_rc}" ||
+            seance_log err "repl ${_guest}->${_peer}: could not write the lag record"
+        _acked="-"
+    fi
 
     seance_log info "repl ${_guest}->${_peer}: ${_sent} stream(s), newest common ${_acked}, rc ${_rc}"
 
@@ -1076,9 +1162,26 @@ repl_tick()
                 continue
             fi
             if ! zfs_snapshot_r "${_droot}" "${_short}"; then
-                seance_log err "repl ${_guest}: zfs snapshot -r ${_droot}@${_short} failed"
-                _failed=$(( _failed + 1 ))
-                continue
+                # Two ticks in the same second compute the same name, and
+                # 'zfs snapshot -r' is atomic: one of them loses. The loser has
+                # not failed at anything -- the snapshot this tick needed
+                # exists, at exactly the instant it asked for, taken by its
+                # twin -- so it goes on and replicates it. A cron line and an
+                # operator's `repl --now` do not take turns, and a tick that
+                # exits 1 because somebody else did its work teaches an
+                # operator that repl's exit code does not mean much.
+                #
+                # "Exists" means the whole tree carries it, not just the root:
+                # a partial recursive snapshot is not a point in time, and
+                # replicating one would put a mixed-time tree on the peer.
+                if repl_snapshot_complete "${_tmp}/ds" "${_short}"; then
+                    seance_log notice "repl ${_guest}: ${_droot}@${_short} already exists;" \
+                        "another tick took this instant. Replicating it."
+                else
+                    seance_log err "repl ${_guest}: zfs snapshot -r ${_droot}@${_short} failed"
+                    _failed=$(( _failed + 1 ))
+                    continue
+                fi
             fi
         fi
 
