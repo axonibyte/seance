@@ -1,19 +1,27 @@
-# CBSD module notes (M0)
+# CBSD module notes (M0, extended by tier 5)
 
 What a CBSD external module is, how it is discovered, dispatched, configured
 and packaged — established by reading CBSD 15.0.9's own sh source and by
 running it, not from memory.
 
 **Every claim below cites either `/usr/local/cbsd/<file>:<line>` (CBSD 15.0.9,
-byte-identical on the workstation and in the guest) or a capture in `out/m0/`
-from the M0 spike.** `out/` is a reaper results directory and is not committed;
-the quotations here are the parts that matter. Anything not observed is marked
-**UNVERIFIED** and nothing in seance's design depends on it.
+byte-identical on the workstation and in the guest) or a capture: `out/m0/`
+from the M0 spike, `$REAPER_OUT/shapeb/` from any tier-5 run.** `out/` is a
+reaper results directory and is not committed; the quotations here are the
+parts that matter. Anything not observed is marked **UNVERIFIED** and nothing
+in seance's design depends on it.
+
+M0 had no guest, so everything about the lifecycle and the dataset layout was
+source-only. **Tier 5 (`tests/tier5/`, shape B) now builds a real node with a
+jail, a bhyve VM and a held jail on it**, and the paragraphs those sentences
+used to sit in have been replaced by what was watched happen — §6, §8 defects
+7-9, and §10.
 
 Spike substrate: a reaper `freebsd-15.1` session, FreeBSD 15.1-RELEASE-p2
 (`releng/15.1-n283596-aadd58dddcbc`), OpenZFS `zfs-2.4.2-1`, `cbsd-15.0.9` from
 pkg, run as root, workdir `/tank/state/cbsd`, nodename `alpha`
-(`out/m0/00-environment.txt`).
+(`out/m0/00-environment.txt`). Tier 5 builds the same substrate from
+`tests/shapeb/lib/shapeb.subr` on every run.
 
 ---
 
@@ -427,11 +435,22 @@ This is what `adapter_guest_running` relies on (D-47; `lib/adapter.subr`,
 `adapter_guest_running`): a non-zero jid means running, a jid of `0` means
 present but stopped, and `invert=1`'s own `NOT_EXIST=1` means absent.
 
-**The absent case is observed live, above. The exists case is UNVERIFIED live
-until tier 5** — M0 had no guest to run it against, so everything above about
-that branch is read from source, not watched happen. `tests/tier5/README`
-names it as a required shape-B assertion: `cbsd jstatus jname=<n> invert=1`
-for a guest that EXISTS must exit 0 and print its jid.
+**Both cases are now observed live.** M0 had no guest, so the "exists" branch
+was source-only; tier 5 built one (`tests/tier5/t_lifecycle_real.sh`) and ran
+it:
+
+```
+$ cbsd jstatus jname=web01                (stopped)   0     exit 1
+$ cbsd jstatus jname=web01 invert=1       (stopped)   0     exit 0
+$ cbsd jstart jname=web01 inter=0 ; cbsd jstatus jname=web01 invert=1
+                                          (running)   1     exit 0
+$ cbsd junregister jname=web01 ; cbsd jstatus jname=web01 invert=1
+                                          (absent)  (none)  exit 1
+```
+
+— which is exactly what `adapter_guest_running` reads: under `invert=1`, rc 0
+means the guest exists and stdout is its jid, `0` for present-but-stopped and
+non-zero for running; rc 1 means this node does not have it.
 
 `cbsd version` prints the bare version once a workdir exists, and fails
 loudly before that:
@@ -444,16 +463,40 @@ $ cbsd version            (after initenv)
 ```
 — `out/cbsd-version.txt`, `out/m0/11-adapter-surface.txt`
 
-Dataset conventions, from source only (**UNVERIFIED live** — creating a guest
-was out of M0's scope): a jail's dataset is `<pool>/<jname>` mounted at
-`${workdir}/jails-data/<jname>-data` (`sudoexec/mkdatadir:14-23`); a VM's is
-`<pool>/<jname>` mounted at `${workdir}/vm/<jname>` with `jails-system` and
-`jails-data` symlinks and zvols `<pool>/<jname>/dskN.vhd`
-(`sudoexec/bcreate:573-600`, `sudoexec/zfs-recv:60-93`).
+Dataset conventions. M0 read these out of the source and could not run them;
+tier 5 created both guest types on a `zfsfeat=1` node with
+`workdir=/tank/state/cbsd` and watched CBSD lay them out
+(`tests/tier5/t_conformance_real.sh`, and `$REAPER_OUT/shapeb/substrate.txt`
+in any run):
+
+```
+$ zfs list -r -o name,mountpoint tank/state/cbsd
+tank/state/cbsd                 /tank/state/cbsd
+tank/state/cbsd/db01            /tank/state/cbsd/vm/db01
+tank/state/cbsd/db01/dsk1.vhd   -
+tank/state/cbsd/web01           /tank/state/cbsd/jails-data/web01-data
+$ ls -l /tank/state/cbsd/jails-system/db01 /tank/state/cbsd/jails-data/db01-data
+jails-system/db01     -> /tank/state/cbsd/vm/db01
+jails-data/db01-data  -> /tank/state/cbsd/vm/db01
+```
+
+A jail's dataset is `<pool>/<jname>` mounted at `${jaildatadir}/<jname>-data`
+(`sudoexec/mkdatadir:14-23`); a VM's is `<pool>/<jname>` mounted at
+`${workdir}/vm/<jname>` with the two symlinks `sudoexec/bcreate:598-599` makes
+and one zvol per disk (`sudoexec/bcreate:573-600`,
+`sudoexec/zfs-recv:60-93`). `<pool>` is whatever dataset holds `jails-data`
+(`mkdatadir:20`), which for a workdir that is its own dataset is the workdir's
+own — so a `zfsfeat=1` node's guests are children of the workdir dataset, and
+the whole node is one recursive destroy.
 
 Making a replicated guest startable is `cbsd jregister jname=<n>
 rcfile=${workdir}/jails-system/<n>/rc.conf_<n>` (`sudoexec/jregister:134-191`),
-reversed by `cbsd junregister`. **UNVERIFIED live.**
+reversed by `cbsd junregister`. **Observed live**, both directions, including
+the jail starting again afterwards; the round trip leaves a phantom listing row
+behind — see §8 defect 8. `junregister` does NOT touch
+`${jailsysdir}/<n>/rc.conf_<n>`: it dumps its own copy to
+`${jailrcconfdir}/rc.conf_<n>` and leaves the sysdir byte-identical, which is
+what lets seance go on reading the sysdir's copy.
 
 ## 7. Hook directories and their exit semantics (D-8)
 
@@ -612,6 +655,82 @@ the jail comes up.
    Observed running all stages, including stage 8
    (`out/m0/03b-initenv-non-interactive.txt`).
 
+7. **`cbsd emulator <name>` answers "No such instance" about every guest on a
+   modern SQLite, and the seam under it fails SILENTLY.** `tools/emulator:13`
+   is
+
+   ```
+   emulator=$(cbsdsqlro local SELECT emulator FROM jails WHERE jname=\"${jname}\")
+   ```
+
+   SQLite has been narrowing double-quoted string literals since 3.29 and
+   FreeBSD 15.1 ships 3.53.3, where `jname="web01"` is a parse error. Measured
+   in the reaper guest against a jail CBSD had just created and which
+   `cbsd jls` listed happily:
+
+   ```
+   $ cbsd emulator web01                                  exit 1
+   No such instance
+   $ sqlite3 $workdir/var/db/local.sqlite 'select jname,emulator from jails;'
+   web01|jail
+   $ sqlite3 ... "SELECT emulator FROM jails WHERE jname=\"web01\";"
+   Parse error: no such column: "web01" - should this be a string
+                literal in single-quotes?
+   ```
+
+   Through CBSD's own `cbsdsqlro` builtin the parse error is not reported at
+   all: the call returns **empty output with exit 0**, which `tools/emulator`
+   reads as "no row" and turns into `err 1 "No such instance"`. Fifty-five files
+   under `/usr/local/cbsd` contain `jname=\"`, forty-six of them inside a
+   `cbsdsql*` call (`grep -rl` in the guest); of the ones seance touches, only
+   `tools/emulator` does. `jls`, `bls`, `jstatus`, `jswmode`, `jstart`, `jstop`,
+   `jregister` and `junregister` all quote their SQL literals with single
+   quotes and are unaffected — checked one by one before the fix below was
+   chosen.
+
+   **Consequence for seance, and the fix.** `adapter_guest_type` used this
+   command, so on a real node it answered rc 1 "no such guest" for every guest
+   — and `adapter_guest_held`, `adapter_guest_start`, `adapter_guest_stop` and
+   the mounted-path-first branch of `adapter_guest_datasets` all go through it.
+   The adapter now reads the emulator out of the guest's own `jls`/`bls` row
+   (`_adapter_guest_row`). Caught by tier 5's first run against a real jail.
+
+8. **`cbsd jls`'s `jname=` predicate does not reach its unregistered area, and
+   `jregister` does not remove what `junregister` wrote.** `jailctl/jls:281-296`
+   walks every readable file in `${jailrcconfdir}` and prints a row for each,
+   after the SQL area and outside every predicate. `cbsd junregister` writes
+   exactly such a file — `${workdir}/jails-rcconf/rc.conf_<n>` is its default
+   `rcfile=` — and a later `cbsd jregister` from a different rcfile leaves it
+   there. Both observed in the guest:
+
+   ```
+   $ cbsd junregister jname=web01
+   $ cbsd jregister jname=web01 rcfile=$workdir/jails-system/web01/rc.conf_web01
+   $ cbsd jls header=0 display=jname,emulator,astart,status
+   web01  jail  0  Off
+   web01  jail  0  Unregister
+   $ cbsd jls jname=nosuchguest header=0 display=jname,emulator,astart,status
+   web01  jail  0  Unregister
+   ```
+
+   So a per-guest query can be answered with **another guest's row**, and a
+   node that has been through one unregister/register round trip lists one
+   guest twice for ever. seance's answer is in `_adapter_guest_row`: filter the
+   raw listing by name before parsing it, and let `_adapter_list_rows` drop the
+   `Unregister` rows it already drops. `tests/tier5/t_lifecycle_real.sh`
+   asserts both the doubled listing and that the adapter is not fooled by it.
+
+9. **CBSD's mutating verbs talk on stdout, refusals included.** `cbsd jstart`
+   on a jail in slave mode prints its refusal through `err()`
+   (`sudoexec/jstart:367`) and start, stop, register and unregister each print
+   progress lines there too. seance's `[no output]` adapter functions therefore
+   run CBSD through `_adapter_cbsd_act`, which sends its stdout to stderr and
+   keeps only the exit status: before that, `adapter_guest_start <held>` exited
+   1 having printed "Jail in slave mode..." on the channel this project
+   reserves for data. Observed by `tests/tier5/t_lifecycle_real.sh` on its
+   first run; pinned at workstation speed by `tests/tier4/t_adapter_parse.sh`.
+
+
 ## 9. Packaging and distribution
 
 CBSD's own channel is `cbsd module mode=install <name>`, which clones
@@ -641,13 +760,47 @@ Two smaller conventions worth keeping:
   the admin the two remaining steps, because nothing about enabling a module is
   automatic.
 
-## 10. What M0 did not establish
+## 10. What M0 did not establish, and what tier 5 has since settled
 
-- Live `jstart`/`bstart` behaviour with a failing `master_prestart.d` hook
-  (§7). Source-only, plus a faithful reproduction of the shell construct.
-- Anything requiring a real guest: `jregister`, `jstart`, `jstop`, dataset
-  layout, `jstatus` against an existing guest, `cbsd emulator`. Tier 5 (shape
-  B) is where these get proven, in M2.
+**Settled, by running it.** Tier 5 (shape B) builds a real CBSD 15.0.9 node on
+the reaper guest with three guests on it — a jail, a bhyve VM and a held jail —
+and every claim below is now an assertion in `tests/tier5/` rather than a note:
+
+- the dataset layout for both guest types, and the two symlinks a VM gets (§6);
+- `cbsd jstatus jname=<n> invert=1` for a guest that EXISTS: exit 0, jid on
+  stdout, non-zero while it runs (§6);
+- the unregister/register round trip out of `${jailsysdir}/<n>/rc.conf_<n>`,
+  and the jail starting again afterwards (§6);
+- **D-21's lever**: a jail at `status=2` refuses `cbsd jstart` with "Jail in
+  slave mode. Please cbsd jswmode mode=master first", exit 1, and is still not
+  running afterwards. The whole boot gate rests on this and nobody had watched
+  it happen;
+- **D-71's resolution order**, on a real pool: a replica received under a
+  standby tree and given CBSD's expected mountpoint is what
+  `adapter_guest_datasets` names, and with nothing mounted there
+  `zfs list -H -o name <path>` really does answer with the dataset CONTAINING
+  the path — on this node, the entire workdir dataset — which is what the
+  exact-mountpoint guard is for;
+- **D-82's configuration mirror, end to end**: one `seance repl` tick creates
+  `<pool>/seance-sys`, mounts it in the state directory, copies the jail's
+  sysdir into it and snapshots it with the tick's own name; a real jail then
+  registers and STARTS from a `promote_sys_restore` out of a replica of that
+  snapshot (`tests/tier5/t_promote_real.sh`);
+- three upstream defects that were invisible from the source alone: `cbsd
+  emulator` (§8.7), jls's unfiltered unregistered area (§8.8) and CBSD's
+  refusals arriving on stdout (§8.9).
+
+**Still not established, and why.**
+
+- Live `jstart` behaviour with a failing `master_prestart.d` hook (§7).
+  Source-only, plus a faithful reproduction of the shell construct. The jail to
+  run it against now exists in tier 5, so this is cheap to add and simply has
+  not been.
+- A bhyve guest that has ever RUN. Tier 5 creates one and asserts its layout;
+  booting it needs an OS image (`cbsd get-profiles src=iso` plus an ISO
+  download) on top of nested bhyve, and nothing in seance's own paths depends
+  on a VM being up rather than existing — `adapter_guest_running` reads
+  `/dev/vmm/<name>` through the same `jstatus` this tier does exercise.
 - `cbsd module mode=install` end to end (needs network and a published
   `cbsd/modules-seance` repository).
 - Whether `cixinit` differs from `init` in any way that matters beyond the

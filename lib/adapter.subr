@@ -244,6 +244,28 @@ _adapter_cbsd()
     )
 }
 
+# _adapter_cbsd_act <verb> [args...]
+#
+# _adapter_cbsd for the functions whose contract marker is [no output]: CBSD's
+# own stdout becomes THIS process's stderr, and only the exit status is kept.
+#
+# WHY IT EXISTS, measured rather than reasoned. CBSD's scripts talk on stdout,
+# including when they refuse: `cbsd jstart` on a jail in slave mode prints
+# "Jail in slave mode. Please cbsd jswmode mode=master first" through err()
+# (sudoexec/jstart:367), and a start, a stop and a register each print progress
+# lines there too. Observed in the guest (tests/tier5/t_lifecycle_real.sh):
+# before this, `adapter_guest_start <held>` exited 1 having printed CBSD's
+# refusal on STDOUT -- a function that promises no output, putting a sentence
+# on the channel this project reserves for data. Any caller that captured it
+# got CBSD's chatter as its answer (docs/cbsd-module-notes.md §8.9).
+#
+# The output is not discarded. A refusal an operator cannot read is worse than
+# one on the wrong descriptor, and stderr is where diagnostics belong.
+_adapter_cbsd_act()
+{
+    _adapter_cbsd "$@" 1>&2
+}
+
 # ---------------------------------------------------------------------------
 # Node identity
 # ---------------------------------------------------------------------------
@@ -500,15 +522,78 @@ ${_out}"
     return 0
 }
 
+# _adapter_guest_row <name>
+#
+# CBSD's own listing row for ONE guest -- "name<TAB>type<TAB>astart<TAB>status"
+# -- or nothing. rc 0 with the row, 1 this node has no such usable guest, 2 the
+# listing could not be read.
+#
+# `cbsd jls` and `cbsd bls` are asked in turn for the same reason
+# adapter_guest_list asks both: each shows only its own emulators
+# (jailctl/jls:244, bhyvectl/bls:367), so a VM is invisible to the first and a
+# jail to the second.
+#
+# THE ANSWER IS FILTERED BY NAME HERE, not only by `jname=`, and that is not
+# belt and braces. jls's `jname=` predicate reaches its SQL area only: the
+# unregistered area (jailctl/jls:281-296) walks every readable file in
+# ${jailrcconfdir} and prints a row for each, whatever was asked for. Observed
+# live on CBSD 15.0.9 (tests/tier5, docs/cbsd-module-notes.md §8.8): with a
+# jails-rcconf/rc.conf_web01 left behind by an earlier junregister,
+# `cbsd jls jname=nosuchguest` prints web01's row. Filtering the raw listing
+# before it is parsed also means _adapter_list_rows' contract errors are about
+# the guest that was asked about and not about some other guest's leftovers.
+_adapter_guest_row()
+{
+    local _name _cmd _out _row _n
+
+    _name=$1
+
+    for _cmd in jls bls; do
+        _out=$( _adapter_cbsd "${_cmd}" header=0 \
+            display=jname,emulator,astart,status jname="${_name}" ) || _out=""
+
+        [ -n "${_out}" ] || continue
+
+        # The listing is whitespace-aligned, so the first field is the jname.
+        _out=$( printf '%s\n' "${_out}" | awk -v n="${_name}" '$1 == n' )
+        [ -n "${_out}" ] || continue
+
+        _row=$( printf '%s\n' "${_out}" | _adapter_list_rows ) || return 2
+        [ -n "${_row}" ] || continue
+
+        _n=$( printf '%s\n' "${_row}" | wc -l | tr -d ' ' )
+        if [ "${_n}" -ne 1 ]; then
+            _adapter_diag "cbsd ${_cmd} listed ${_n} usable rows for ${_name}"
+            return 2
+        fi
+
+        printf '%s\n' "${_row}"
+        return 0
+    done
+
+    return 1
+}
+
 # contract: adapter_guest_type(name) -> bhyve|jail [promises output]
 #
-# `cbsd emulator <name>` reads the emulator column and prints it, or fails with
-# "No such instance" (tools/emulator:10-19). rc 1 both for a guest this node
-# does not have and for a guest running under an emulator seance does not
-# support -- in either case there is nothing here for seance to promote.
+# The emulator column of the guest's own listing row. rc 1 both for a guest
+# this node does not have and for a guest running under an emulator seance does
+# not support -- in either case there is nothing here for seance to promote,
+# and _adapter_list_rows has already named the unsupported one on stderr.
+#
+# NOT `cbsd emulator <name>`, which cannot answer at all on a modern SQLite.
+# tools/emulator:13 asks `SELECT emulator FROM jails WHERE jname=\"${jname}\"`,
+# and SQLite has rejected double-quoted string literals since the DQS default
+# changed: FreeBSD 15.1 ships sqlite 3.53.3, where that query is "no such
+# column: web01". Through CBSD's own cbsdsqlro builtin the parse error is
+# swallowed and the result is EMPTY WITH rc 0, so `cbsd emulator web01` prints
+# "No such instance" and exits 1 for a jail that exists. Measured in the guest
+# (docs/cbsd-module-notes.md §8.7, tests/tier5). Every listing seance uses --
+# jls, bls, jstatus, jswmode -- quotes its literals with single quotes and is
+# unaffected, which is why the row is read from the listing instead.
 adapter_guest_type()
 {
-    local _name _emu
+    local _name _row _rc
 
     _adapter_ready || return 2
 
@@ -518,22 +603,21 @@ adapter_guest_type()
         return 2
     fi
 
-    _emu=$( _adapter_cbsd emulator "${_name}" 2>/dev/null ) || _emu=""
+    _row=$( _adapter_guest_row "${_name}" )
+    _rc=$?
 
-    case "${_emu}" in
-        jail|bhyve)
-            printf '%s\n' "${_emu}"
-            return 0
-            ;;
-        '')
-            _adapter_diag "no such guest on this node: ${_name}"
-            return 1
-            ;;
-        *)
-            _adapter_diag "${_name}: emulator ${_emu} is not supported by seance"
-            return 1
-            ;;
-    esac
+    if [ "${_rc}" -eq 1 ]; then
+        _adapter_diag "no such guest on this node: ${_name}"
+        return 1
+    fi
+
+    [ "${_rc}" -eq 0 ] || return 2
+
+    # Field 2 of the parsed row, which _adapter_list_rows has already limited
+    # to jail or bhyve.
+    _row=${_row#*"${ADAPTER_TAB}"}
+
+    printf '%s\n' "${_row%%"${ADAPTER_TAB}"*}"
 }
 
 # contract: adapter_guest_running(name) -> 1|0 [promises output]
@@ -630,7 +714,7 @@ _adapter_lifecycle()
             ;;
     esac
 
-    _adapter_cbsd "${_verb}" jname="${_name}" inter=0
+    _adapter_cbsd_act "${_verb}" jname="${_name}" inter=0
     _rc=$?
 
     if [ "${_rc}" -ne 0 ]; then
@@ -695,7 +779,7 @@ adapter_guest_register()
         return 1
     fi
 
-    _adapter_cbsd jregister jname="${_name}" rcfile="${_rcfile}"
+    _adapter_cbsd_act jregister jname="${_name}" rcfile="${_rcfile}"
     _rc=$?
 
     if [ "${_rc}" -ne 0 ]; then
@@ -719,7 +803,7 @@ adapter_guest_unregister()
         return 2
     fi
 
-    _adapter_cbsd junregister jname="${_name}"
+    _adapter_cbsd_act junregister jname="${_name}"
     _rc=$?
 
     if [ "${_rc}" -ne 0 ]; then
@@ -754,7 +838,7 @@ _adapter_swmode()
         return 2
     fi
 
-    _adapter_cbsd jswmode jname="${_name}" mode="${_mode}" inter=0
+    _adapter_cbsd_act jswmode jname="${_name}" mode="${_mode}" inter=0
     _rc=$?
 
     if [ "${_rc}" -ne 0 ]; then
@@ -785,10 +869,12 @@ adapter_guest_release()
 #
 # Held means status 2, which is what mode=slave writes. The status is read back
 # through `cbsd jls`/`cbsd bls` rather than from the database directly, so that
-# there is exactly one place in seance that knows how CBSD spells a status.
+# there is exactly one place in seance that knows how CBSD spells a status --
+# _adapter_guest_row, which is also the one place that knows a per-guest
+# listing has to be filtered by name.
 adapter_guest_held()
 {
-    local _name _type _cmd _out _status
+    local _name _row _rc _status
 
     _adapter_ready || return 2
 
@@ -798,29 +884,17 @@ adapter_guest_held()
         return 2
     fi
 
-    _type=$( adapter_guest_type "${_name}" ) || return 1
+    _row=$( _adapter_guest_row "${_name}" )
+    _rc=$?
 
-    case "${_type}" in
-        bhyve) _cmd=bls ;;
-        *)     _cmd=jls ;;
-    esac
-
-    _out=$( _adapter_cbsd "${_cmd}" header=0 \
-        display=jname,emulator,astart,status jname="${_name}" ) || _out=""
-
-    if [ -z "${_out}" ]; then
-        _adapter_diag "cbsd ${_cmd} said nothing about ${_name}"
-        return 2
+    if [ "${_rc}" -eq 1 ]; then
+        _adapter_diag "no such guest on this node: ${_name}"
+        return 1
     fi
 
-    _out=$( printf '%s\n' "${_out}" | _adapter_list_rows ) || return 2
+    [ "${_rc}" -eq 0 ] || return 2
 
-    if [ -z "${_out}" ]; then
-        _adapter_diag "cbsd ${_cmd} listed no usable row for ${_name}"
-        return 2
-    fi
-
-    _status=${_out##*"${ADAPTER_TAB}"}
+    _status=${_row##*"${ADAPTER_TAB}"}
 
     if [ "${_status}" = "2" ]; then
         printf '1\n'

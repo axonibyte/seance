@@ -43,7 +43,7 @@ rows()
     RRC=$?
 }
 
-t_plan 29
+t_plan 47
 
 # --- a listing of the shape CBSD prints --------------------------------------
 rows 'web01  jail   1  On
@@ -197,15 +197,51 @@ export ZFS_WORLD
 PATH="${ZBIN}:${PATH}"
 export PATH
 
+# The listings _adapter_guest_row reads, in the shape CBSD prints them, with
+# the two traps tier 5 found in the real thing built in:
+#
+#   * `cbsd jls jname=<x>` also prints the WHOLE unregistered area, which its
+#     jname= predicate does not reach (jailctl/jls:281-296) -- so every jls
+#     answer below carries old01's leftover row, whatever was asked for;
+#   * a VM is invisible to jls and a jail to bls (jailctl/jls:244,
+#     bhyvectl/bls:367), so the caller has to ask both.
+#
 # shellcheck disable=SC2329
 #   Called by lib/adapter.subr, which shellcheck checks as a separate file.
 _adapter_cbsd()
 {
-    case "$1 ${2:-}" in
-        "emulator web01") printf 'jail\n' ;;
-        "emulator arc01") printf 'jail\n' ;;
-        "emulator off01") printf 'jail\n' ;;
-        "emulator db01")  printf 'bhyve\n' ;;
+    local _jname
+
+    _jname=""
+    for _a in "$@"; do
+        case "${_a}" in jname=*) _jname=${_a#jname=} ;; esac
+    done
+
+    case "$1" in
+        jls)
+            case "${_jname}" in
+                web01) printf 'web01  jail   1  On\n' ;;
+                arc01) printf 'arc01  jail   0  Slave\n' ;;
+                off01) printf 'off01  jail   1  Off\n' ;;
+            esac
+            printf 'old01  jail   1  Unregister\n'
+            printf 'OLD02  jail   1  Unregister\n'
+            ;;
+        bls)
+            case "${_jname}" in
+                db01) printf 'db01   bhyve  1  Off\n' ;;
+            esac
+            ;;
+        # CBSD's mutating verbs talk on STDOUT, refusals included -- `cbsd
+        # jstart` on a jail in slave mode prints "Jail in slave mode..."
+        # through err() (sudoexec/jstart:367). Reproduced here so that a
+        # [no output] function which let that through would fail at
+        # workstation speed rather than in tier 5.
+        jstart|jstop|jswmode|jregister|junregister)
+            printf 'cbsd says something on stdout\n'
+            [ "$1" = "jstart" ] && [ "${_jname}" = "arc01" ] && return 1
+            return 0
+            ;;
         *) return 1 ;;
     esac
 }
@@ -220,6 +256,74 @@ t_is "$( zfs list -H -o name /wd/jails-data/web01-data )" "pool0/web01" \
     "the fixture resolves an exact mountpoint to its own dataset"
 t_is "$( zfs list -H -o name /wd/jails-data/off01-data )" "pool0/cbsd" \
     "and a path with no dataset of its own to the dataset CONTAINING it, as zfs does"
+
+# --- the guest's own listing row: type and held ------------------------------
+#
+# Both of these used to go through `cbsd emulator <name>`, which cannot answer
+# on FreeBSD 15.1: tools/emulator:13 quotes its SQL literal with double quotes,
+# and SQLite 3.53.3 rejects those, so CBSD's builtin returns empty with rc 0 and
+# the command says "No such instance" about a jail that exists. Found by tier 5
+# against a real jail; these rows are what would have caught it here.
+
+t_stdout_is "jail" "a jail's type is read from its own listing row" \
+    -- adapter_guest_type web01
+t_stdout_is "bhyve" "a VM's type is found in bls, which is asked after jls" \
+    -- adapter_guest_type db01
+t_stdout_is "jail" "a held guest still has a type" \
+    -- adapter_guest_type arc01
+
+t_rc 1 "an unregistered guest is not a guest this node can be asked about" \
+    -- adapter_guest_type old01
+t_rc 1 "a name no listing carries is rc 1" -- adapter_guest_type gone01
+t_rc 2 "a name seance will not put on a command line is rc 2" \
+    -- adapter_guest_type WEB01
+
+# The name filter, on its own. jls answers every query with the whole
+# unregistered area (jailctl/jls:281-296), so a question about one guest
+# arrives carrying other guests' rows -- including, on a real node, rows for
+# names CBSD allows and seance does not, since validate_jname accepts upper
+# case (subr/nc.subr:733-737) and junregister leaves a file behind for every
+# guest ever unregistered. OLD02 above is such a row.
+#
+# Both halves matter. Without the filter the second one FAILS: _adapter_list_rows
+# calls an unusable name a contract error, so one stale rc.conf for a guest
+# seance cannot name would make every question about every OTHER guest answer
+# rc 2.
+t_rc 1 "a per-guest listing is filtered by name, not trusted to be" \
+    -- _adapter_guest_row nosuchguest
+t_stdout_is "jail" \
+    "and another guest's unusable leftover row does not break this guest's answer" \
+    -- adapter_guest_type web01
+
+t_stdout_is "1" "a guest in slave mode is held" -- adapter_guest_held arc01
+t_stdout_is "0" "a guest at status 0 is not held" -- adapter_guest_held web01
+
+# --- the [no output] verbs really produce none ------------------------------
+#
+# Every one of these runs a CBSD command that writes to stdout, and their
+# contract marker is [no output]: stdout is data, and a caller that captured
+# CBSD's progress chatter or its refusal would be reading a sentence as an
+# answer. Found in tier 5, where adapter_guest_start on a held jail exited 1
+# having printed "Jail in slave mode. Please cbsd jswmode mode=master first"
+# on stdout.
+t_stdout_is "" "adapter_guest_start prints nothing on stdout" \
+    -- adapter_guest_start web01
+t_stdout_is "" "adapter_guest_stop prints nothing on stdout" \
+    -- adapter_guest_stop web01
+t_stdout_is "" "adapter_guest_hold prints nothing on stdout" \
+    -- adapter_guest_hold web01
+t_stdout_is "" "adapter_guest_release prints nothing on stdout" \
+    -- adapter_guest_release web01
+t_stdout_is "" "adapter_guest_unregister prints nothing on stdout" \
+    -- adapter_guest_unregister web01
+t_stdout_is "" "adapter_guest_register prints nothing on stdout" \
+    -- adapter_guest_register web01 "${DIR}/err"
+
+# And a REFUSAL is still silent on stdout: the branch that matters, because it
+# is the one whose message a caller is most likely to capture and act on.
+t_stdout_is "" "a refused start prints nothing on stdout either" \
+    -- adapter_guest_start arc01
+t_rc 1 "and it is a refusal" -- adapter_guest_start arc01
 
 # --- the paths the platform expects ------------------------------------------
 t_is "$( adapter_guest_mountpoint web01 jail )" "/wd/jails-data/web01-data" \

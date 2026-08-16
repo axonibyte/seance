@@ -1,0 +1,515 @@
+# seance -- the shape-B substrate: one reaper guest, one REAL CBSD node.
+#
+# Sourced by tests/tier5/t_*.sh. Nothing of seance runs in here: this file's
+# whole job is to put a genuine CBSD 15.0.9 node on the reset dataset, with one
+# jail and one bhyve guest on it, and to take it away again so completely that
+# `reaper reset` afterwards succeeds.
+#
+# WHY IT IS BUILT AND NOT MOCKED. Tier 4 already runs the conformance suite
+# against the mock at workstation speed. What tier 5 exists for is the
+# sentence tier 4 cannot say: that lib/adapter.subr's reading of CBSD is
+# CBSD's own behaviour and not a memory of it. Every command below was run by
+# hand in the guest first and its output is recorded in
+# docs/cbsd-module-notes.md; nothing here is a guess.
+#
+# THE WORLD, in the fictional vocabulary the tenant guard requires (D-6):
+#
+#   node        alpha                        $workdir/nodename
+#   workdir     $REAPER_STATE/cbsd           its own dataset, so teardown is
+#                                            one `zfs destroy -r`
+#   jail        web01                        <pool>/web01 at jails-data/web01-data
+#   bhyve       db01                         <pool>/db01  at vm/db01
+#   jail        arc01                        the same, held in slave mode
+#
+# Three guests and not one, because the conformance vectors describe a world
+# with a jail, a VM and a HELD guest in it, and the same three names the mock's
+# fixtures use (web01, db01, arc01) so that two tiers' logs are comparable.
+#
+# HOLDERS, and why the teardown is armed before anything is built: `cbsd
+# initenv` starts cbsdd and cbsdrsyncd (sudoexec/initenv stage 9), both of
+# which hold files open under the workdir. reaper refuses to roll a dataset
+# back while anything has files open under it (runner.sh:834-843), so a stage
+# that died half way through with cbsdd running would break every later
+# session's reset. shapeb_up therefore registers shapeb_down through
+# t_at_exit BEFORE the first thing that can fail.
+#
+# shellcheck shell=sh
+# shellcheck disable=SC3043
+#   'local' is not in POSIX sh but is implemented by FreeBSD /bin/sh (sh(1),
+#   "local"); seance targets FreeBSD sh and nothing else (handoff §5).
+
+SHAPEB_NODE="alpha"
+SHAPEB_JAIL="web01"
+SHAPEB_VM="db01"
+SHAPEB_HELD="arc01"
+
+# The base the jail is built from. `cbsd install-pkg-world` fetches FreeBSD's
+# base-in-packages and registers it as a CBSD base, which is the cheapest legal
+# way to get a jail root on this guest: no base.txz mirror, no buildworld, and
+# the two packages named below are 14 MB rather than the ~200 MB a full base
+# would be. FreeBSD-runtime alone gives /bin/sh but no /etc/rc, and CBSD starts
+# a jail with `exec.start=/bin/sh /etc/rc`, so FreeBSD-rc is not optional.
+SHAPEB_BASE_PACKAGES="FreeBSD-runtime FreeBSD-rc"
+SHAPEB_BASE_VER="15.1"
+
+
+# shapeb_diag <message...>  -- a TAP comment, independent of the harness so
+# that the order in which a test file sources the two does not matter.
+shapeb_diag()
+{
+    printf '# %s\n' "$*"
+}
+
+# shapeb_workdir  -- where CBSD keeps its things, on the reset dataset.
+#
+# $REAPER_STATE is the only dataset reaper rolls back, so a CBSD node built
+# anywhere else would survive a reset and make the next session's first run
+# differ from its second.
+shapeb_workdir()
+{
+    printf '%s/cbsd\n' "${REAPER_STATE:-/tank/state}"
+}
+
+# shapeb_state_dataset  -- the dataset reaper rolls back, by name.
+#
+# The exact-mountpoint check is the one D-71 is about: `zfs list <path>`
+# answers with the dataset CONTAINING the path, so without it a $REAPER_STATE
+# that was not a mountpoint would resolve to its parent -- and everything below
+# names datasets to CREATE and DESTROY from this answer.
+shapeb_state_dataset()
+{
+    local _p _ds
+
+    _p=${REAPER_STATE:-/tank/state}
+
+    _ds=$( zfs list -H -o name "${_p}" 2>/dev/null ) || return 1
+    [ -n "${_ds}" ] || return 1
+    [ "$( zfs get -H -o value mountpoint "${_ds}" 2>/dev/null )" = "${_p}" ] ||
+        return 1
+
+    printf '%s\n' "${_ds}"
+}
+
+# shapeb_dataset  -- the workdir's own dataset, BY NAME, if it exists.
+#
+# Derived from the state dataset's name rather than resolved from the workdir
+# PATH, and the difference is a teardown that works: shapeb_down unmounts
+# everything under the workdir before it destroys anything, and after that
+# `zfs list -H -o name ${workdir}` no longer answers with this dataset at all
+# -- it answers with the reset dataset that contains the now-empty directory.
+# Destroying THAT would take the session's whole state with it. Observed while
+# writing this file: the path form left the dataset behind, which is the
+# harmless half of the same mistake.
+shapeb_dataset()
+{
+    local _ds
+
+    _ds=$( shapeb_state_dataset ) || return 1
+    _ds="${_ds}/cbsd"
+
+    zfs list -H -o name "${_ds}" > /dev/null 2>&1 || return 1
+
+    printf '%s\n' "${_ds}"
+}
+
+# shapeb_logdir  -- where the build steps' output goes.
+#
+# $REAPER_OUT when there is one, because that is the directory reaper pulls
+# back: a jcreate that failed in a session nobody was watching is only useful
+# if its output survives the session.
+shapeb_logdir()
+{
+    local _d
+
+    _d="${REAPER_OUT:-${REAPER_STATE:-/tank/state}}/shapeb"
+    mkdir -p "${_d}" 2>/dev/null || return 1
+
+    printf '%s\n' "${_d}"
+}
+
+# shapeb_cbsd <args...>  -- run cbsd(8) the way the adapter does.
+#
+# NOCOLOR=1 and a working directory with no CBSDfile in it, for the two reasons
+# lib/adapter.subr gives (cbsd.conf:159-163; sudoexec/jstop:38-40). The stage
+# reaches around the adapter deliberately: a substrate that used the code under
+# test to build the world it is tested against would prove nothing.
+shapeb_cbsd()
+{
+    ( cd /var/empty || exit 2; NOCOLOR=1 export NOCOLOR; exec cbsd "$@" )
+}
+
+# shapeb_preseed <file>  -- write initenv's answer file.
+#
+# initenv reads a preseed as its first file argument and takes each `key=value`
+# after it as an override (sudoexec/initenv:52-73); with NOINTER set it asks
+# nothing (:50-52). Every key below is one initenv would otherwise ask about
+# (the `read answ` arms at sudoexec/initenv:270-410) or one of the
+# `initenv_modify_*` switches share/initenv.conf documents. The values chosen
+# for this substrate, and why:
+#
+#   nodename=alpha           the fictional node key (D-6). Written to
+#                            $workdir/nodename, which is what adapter_init
+#                            reads (cbsd.conf:52).
+#   workdir                  passed on the command line as well, because it is
+#                            what decides where everything else goes.
+#   zfsfeat=1                guests become datasets. init_zfs_feat
+#                            (sudoexec/initenv:104-165) sets this itself when
+#                            the workdir is on ZFS; it is stated anyway so a
+#                            future guest whose /tank went away fails loudly
+#                            instead of quietly making directories.
+#   ipfw_enable=0            the sample says 1. An ipfw that comes up
+#                            default-deny would take the session's own ssh with
+#                            it, and seance has no firewall of its own.
+#   nat_enable=0             likewise pf: nothing here needs a NAT.
+#   default_vs=0             no virtual switch; the guests have no addresses.
+#   jnameserver=0            no resolver in a jail that never talks to anything.
+#   initenv_modify_rcconf_hostname=0
+#                            leave the guest's own hostname alone. reaper's
+#                            session and this node's identity are different
+#                            facts and only one of them is ours.
+#   the other initenv_modify_* left at 1 so that cbsd_workdir lands in
+#   /etc/rc.conf, which is where adapter_init looks for it (sysrc, cbsd.conf:28-36).
+shapeb_preseed()
+{
+    cat > "$1" <<EOF
+nodename="${SHAPEB_NODE}"
+nodeip="auto"
+nodeip6="0"
+jnameserver="0"
+nodeippool="auto"
+nodeip6pool="0"
+natip="auto"
+nat_enable="0"
+mdtmp="0"
+ipfw_enable="0"
+zfsfeat="1"
+hammerfeat="0"
+fbsdrepo="1"
+workdir="$( shapeb_workdir )"
+jail_interface="auto"
+parallel="0"
+stable="0"
+bridge="auto"
+default_vs="0"
+statsd_bhyve_enable="0"
+statsd_jail_enable="0"
+statsd_hoster_enable="0"
+sqlreplica="0"
+clustering="0"
+initenv_modify_sudoers="1"
+initenv_modify_rcconf_hostname="0"
+initenv_modify_rcconf_cbsd_workdir="1"
+initenv_modify_rcconf_cbsd_enable="1"
+initenv_modify_rcconf_rcshutdown_timeout="0"
+initenv_modify_syctl_rcshutdown_timeout="0"
+initenv_modify_rcconf_cbsdrsyncd_enable="1"
+initenv_modify_rcconf_cbsdrsyncd_flags="1"
+initenv_modify_cbsd_homedir="1"
+EOF
+}
+
+# shapeb_record  -- the versions this tier's verdicts are about.
+#
+# Written to $REAPER_OUT so that a suite that passed against one CBSD and fails
+# against the next says which two versions those were, in the results reaper
+# pulls back rather than only in a log.
+shapeb_record()
+{
+    local _d
+
+    _d=$( shapeb_logdir ) || return 1
+
+    {
+        echo "# seance shape-B substrate, recorded by tests/shapeb/lib/shapeb.subr"
+        echo "# date: $( date -u +%Y-%m-%dT%H:%M:%SZ )"
+        echo
+        echo "== pkg query %n-%v cbsd"
+        pkg query '%n-%v' cbsd 2>&1
+        echo
+        echo "== cbsd version"
+        shapeb_cbsd version 2>&1
+        echo "# exit: $?"
+        echo
+        echo "== freebsd-version -kru"
+        freebsd-version -k 2>&1
+        freebsd-version -r 2>&1
+        freebsd-version -u 2>&1
+        echo
+        echo "== uname -a"
+        uname -a 2>&1
+        echo
+        echo "== sqlite3 -version  (see docs/cbsd-module-notes.md 8.7)"
+        sqlite3 -version 2>&1
+        echo
+        echo "== nodename"
+        cat "$( shapeb_workdir )/nodename" 2>&1
+        echo
+        echo "== zfs list -r  (the dataset layout this tier asserts)"
+        zfs list -r -o name,mountpoint "$( shapeb_dataset )" 2>&1
+        echo
+        echo "== cbsd jls"
+        shapeb_cbsd jls 2>&1
+        echo
+        echo "== cbsd bls"
+        shapeb_cbsd bls 2>&1
+    } > "${_d}/substrate.txt" 2>&1
+
+    return 0
+}
+
+# shapeb_stop_daemons  -- cbsdd and cbsdrsyncd, and the rc.conf keys that would
+# start them again.
+#
+# Both are started by initenv and both keep files open under the workdir; the
+# reset that follows this tier refuses while they do. `service ... stop` is
+# tried before the rc.conf keys go, because a service whose _enable is already
+# missing refuses to stop.
+shapeb_stop_daemons()
+{
+    service cbsdd stop > /dev/null 2>&1
+    service cbsdrsyncd stop > /dev/null 2>&1
+
+    sysrc -x cbsdd_enable > /dev/null 2>&1
+    sysrc -x cbsdrsyncd_enable > /dev/null 2>&1
+    sysrc -x cbsdrsyncd_flags > /dev/null 2>&1
+    sysrc -x cbsd_workdir > /dev/null 2>&1
+
+    return 0
+}
+
+# shapeb_down  -- take the node away, leaving the guest as it was found.
+#
+# Ordered so that each step removes what the next one would otherwise be
+# blocked by: guests stopped, guests removed (which is what unmounts the dozen
+# nullfs mounts jstart makes under $workdir/jails/<name>), daemons stopped,
+# anything still mounted under the workdir unmounted deepest first, and only
+# then the dataset destroyed.
+#
+# Never fails the calling test file by itself -- t_at_exit diagnoses a failing
+# teardown and the cleanliness assertions are what turn it into a verdict.
+shapeb_down()
+{
+    local _ds _wd _m
+
+    _wd=$( shapeb_workdir )
+
+    if [ -d "${_wd}" ]; then
+        for _m in "${SHAPEB_VM}" "${SHAPEB_JAIL}" "${SHAPEB_HELD}"; do
+            shapeb_cbsd jstop jname="${_m}" inter=0 > /dev/null 2>&1
+            shapeb_cbsd bstop jname="${_m}" inter=0 > /dev/null 2>&1
+        done
+        for _m in "${SHAPEB_JAIL}" "${SHAPEB_HELD}"; do
+            shapeb_cbsd jremove jname="${_m}" inter=0 > /dev/null 2>&1
+        done
+        shapeb_cbsd bremove jname="${SHAPEB_VM}" inter=0 > /dev/null 2>&1
+    fi
+
+    shapeb_stop_daemons
+
+    # Deepest first: a nullfs mount inside a jail root sits under the mount of
+    # the root itself, and unmounting the shallow one first fails.
+    mount -p | awk -v d="${_wd}" '
+        $2 == d || index($2, d "/") == 1 { print length($2), $2 }
+    ' | sort -rn | while read -r _ _m; do
+        umount -f "${_m}" > /dev/null 2>&1
+    done
+
+    _ds=$( shapeb_dataset ) || _ds=""
+    if [ -n "${_ds}" ]; then
+        zfs destroy -r -f "${_ds}" > /dev/null 2>&1
+    fi
+
+    rm -rf "${_wd}" > /dev/null 2>&1
+
+
+    return 0
+}
+
+# shapeb_holders  -- pids with files open under the workdir, one per line.
+#
+# procstat(1) rather than reaper's /proc walk: this is the guest's own view of
+# the same question reaper will ask at reset time, and it is here so that the
+# stage can assert cleanliness rather than hope for it.
+shapeb_holders()
+{
+    local _wd
+
+    _wd=$( shapeb_workdir )
+
+    procstat -af 2>/dev/null | awk -v d="${_wd}/" '
+        index($0, d) { print $1 }
+    ' | sort -u
+}
+
+# shapeb_jcreate <name>  -- one minimal jail, non-interactively.
+#
+# ip4_addr=0 is CBSD's "no address": a jail that talks to nothing cannot
+# disturb the session's own ssh. baserw=0 takes the shared base by nullfs
+# rather than copying it (which is what makes a jail cost two seconds).
+# astart=0 and runasap=0 mean the stage decides when it starts, not CBSD, and
+# pkg_bootstrap=0 keeps the network out of it entirely.
+shapeb_jcreate()
+{
+    shapeb_cbsd jcreate jname="$1" ver="${SHAPEB_BASE_VER}" \
+        ip4_addr=0 host_hostname="$1" baserw=0 pkg_bootstrap=0 \
+        runasap=0 astart=0 inter=0 < /dev/null
+}
+
+# shapeb_down_and_check  -- tear the node down and say so in assertions.
+#
+# FOUR assertions, so a caller's plan can count them. t_at_exit's copy of
+# shapeb_down still runs afterwards and is a no-op; what this adds is a
+# VERDICT, because "the teardown ran" and "the guest is clean" are different
+# statements and only the second one is what `reaper reset` needs. Tier 6 runs
+# in the same session on the same dataset immediately after this tier.
+shapeb_down_and_check()
+{
+    local _wd _ds _left _held
+
+    _wd=$( shapeb_workdir )
+    _ds=$( shapeb_dataset ) || _ds=""
+
+    shapeb_down
+
+    if [ -n "${_ds}" ]; then
+        _left=$( zfs list -H -o name -r "${_ds}" 2>/dev/null | tr '\n' ' ' )
+    else
+        _left=""
+    fi
+    t_is "${_left}" "" "no dataset of the CBSD workdir remains"
+
+    _left=$( mount -p |
+        awk -v d="${_wd}" '$2 == d || index($2, d "/") == 1 { print $2 }' |
+        tr '\n' ' ' )
+    t_is "${_left}" "" "nothing is mounted under the CBSD workdir"
+
+    # The reason the daemons are stopped at all: reaper refuses to roll the
+    # state dataset back while any process has a file open under it
+    # (runner.sh:834-843), and cbsdd is exactly such a process.
+    _held=$( shapeb_holders | tr '\n' ' ' )
+    t_is "${_held}" "" "no process holds a file open under the CBSD workdir"
+
+    if [ -e "${_wd}" ]; then
+        t_not_ok "the CBSD workdir is gone"
+        t_diag "still present: ${_wd}"
+    else
+        t_ok "the CBSD workdir is gone"
+    fi
+
+    return 0
+}
+
+# shapeb_up  -- build the node. rc 0 ready, 1 something could not be built,
+# 2 this host cannot host the substrate at all.
+#
+# Idempotent only in the sense that it refuses a workdir that is already there:
+# a half-built node reused by the next test file is a test file asserting
+# against a world nobody described.
+shapeb_up()
+{
+    local _wd _pre _rc _state _log _j
+
+    if [ "$( id -u )" -ne 0 ]; then
+        shapeb_diag "shape B installs CBSD and builds jails; it needs root"
+        return 2
+    fi
+
+    if ! command -v cbsd > /dev/null 2>&1; then
+        shapeb_diag "no cbsd in PATH: tests/lib/guest-prologue.sh installs it"
+        return 2
+    fi
+
+    _wd=$( shapeb_workdir )
+    _log=$( shapeb_logdir ) ||
+        { shapeb_diag "no writable directory for the build logs"; return 1; }
+
+    # The dataset, not only the directory: a teardown unmounts before it
+    # destroys, so a workdir left behind by a killed run can be an existing
+    # dataset with nothing at its mountpoint at all.
+    if shapeb_dataset > /dev/null 2>&1 || [ -e "${_wd}" ]; then
+        shapeb_diag "a CBSD workdir is already at ${_wd}; removing it first"
+        shapeb_down
+    fi
+
+    # Armed before the first thing that can fail, for the holders reason in
+    # this file's header.
+    t_at_exit shapeb_down
+
+    # The workdir gets a dataset of its own so that teardown is one recursive
+    # destroy and so that guests land as its children: CBSD derives the pool
+    # for a new guest from whatever dataset holds $workdir/jails-data
+    # (sudoexec/mkdatadir:20), which is this one.
+    _state=$( zfs list -H -o name "${REAPER_STATE:-/tank/state}" 2>/dev/null ) ||
+        _state=""
+    if [ -z "${_state}" ] ||
+       [ "$( zfs get -H -o value mountpoint "${_state}" 2>/dev/null )" != \
+         "${REAPER_STATE:-/tank/state}" ]
+    then
+        shapeb_diag "${REAPER_STATE:-/tank/state} is not a dataset mountpoint;" \
+            "shape B has nothing to build on"
+        return 2
+    fi
+
+    zfs create -o "mountpoint=${_wd}" -o atime=off "${_state}/cbsd" ||
+        { shapeb_diag "could not create ${_state}/cbsd"; return 1; }
+
+    _pre="${_log}/initenv.conf"
+    shapeb_preseed "${_pre}" || return 1
+
+    # NOINTER=1 makes initenv non-interactive (sudoexec/initenv:50-52);
+    # ALWAYS_YES answers the getyesno arms. </dev/null so that a question this
+    # preseed does not cover ends the run instead of eating the caller's stdin.
+    env NOINTER=1 ALWAYS_YES=1 "workdir=${_wd}" \
+        /usr/local/cbsd/sudoexec/initenv inter=0 "${_pre}" "workdir=${_wd}" \
+        < /dev/null > "${_log}/initenv.log" 2>&1
+    _rc=$?
+    rm -f "${_pre}"
+
+    if [ "${_rc}" -ne 0 ]; then
+        shapeb_diag "cbsd initenv exited ${_rc}; see ${_log}/initenv.log"
+        return 1
+    fi
+
+    if [ ! -r "${_wd}/nodename" ]; then
+        shapeb_diag "initenv left no ${_wd}/nodename"
+        return 1
+    fi
+
+    # The base. Registered in CBSD's own base list, which is what ver= below
+    # selects.
+    shapeb_cbsd install-pkg-world ver="${SHAPEB_BASE_VER}" \
+        packages="${SHAPEB_BASE_PACKAGES}" < /dev/null \
+        > "${_log}/install-pkg-world.log" 2>&1 ||
+        { shapeb_diag "cbsd install-pkg-world failed; see ${_log}/install-pkg-world.log"; return 1; }
+
+    # The jails.
+    for _j in "${SHAPEB_JAIL}" "${SHAPEB_HELD}"; do
+        shapeb_jcreate "${_j}" > "${_log}/jcreate-${_j}.log" 2>&1 ||
+            { shapeb_diag "cbsd jcreate ${_j} failed; see ${_log}/jcreate-${_j}.log"
+              return 1; }
+    done
+
+    # One of them held, which is the world the conformance vectors' %HELD%
+    # placeholder names. Slave mode is CBSD's own "this guest lives elsewhere"
+    # flag and the lever the boot gate pulls (D-21).
+    shapeb_cbsd jswmode jname="${SHAPEB_HELD}" mode=slave inter=0 \
+        < /dev/null > "${_log}/jswmode-${SHAPEB_HELD}.log" 2>&1 ||
+        { shapeb_diag "cbsd jswmode ${SHAPEB_HELD} mode=slave failed"; return 1; }
+
+    # The VM. It is never started -- what tier 5 needs from it is its LAYOUT:
+    # the dataset at $workdir/vm/<name>, the zvol under it, and the two
+    # symlinks CBSD makes to it (sudoexec/bcreate:579,598-599), which are what
+    # adapter_guest_datasets and adapter_guest_links promise and what M0 could
+    # only read out of the source. vm_os_profile names a profile CBSD already
+    # ships (etc/defaults/vm-other-FreeDOS-x86_64.conf); no ISO is fetched at
+    # create time, and imgsize is clamped to CBSD's 1 GiB minimum, sparse.
+    shapeb_cbsd bcreate jname="${SHAPEB_VM}" vm_os_type=other \
+        vm_os_profile=FreeDOS-x86_64 imgsize=1g vm_ram=256m vm_cpus=1 \
+        ip4_addr=0 runasap=0 astart=0 inter=0 < /dev/null \
+        > "${_log}/bcreate.log" 2>&1 ||
+        { shapeb_diag "cbsd bcreate failed; see ${_log}/bcreate.log"; return 1; }
+
+    shapeb_record
+
+    return 0
+}
