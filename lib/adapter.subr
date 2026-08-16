@@ -860,27 +860,146 @@ adapter_guest_sysdir()
     printf '%s/%s\n' "${ADAPTER_JAILSYSDIR}" "${_name}"
 }
 
+# contract: adapter_guest_mountpoint(name,type) -> path [promises output]
+#
+# Where THIS platform expects the guest's root dataset to be mounted. It is the
+# one fact the promotion ceremony cannot work out for itself: a replica
+# promoted in place stays where replication put it and is given CBSD's expected
+# mountpoint (D-44 item 4), and only the adapter knows what CBSD expects.
+#
+# EVIDENCE, both cited to the scripts that create the datasets in the first
+# place, so that seance and CBSD cannot disagree about where a guest lives:
+#
+#   jail    ${jaildatadir}/<name>-data
+#           `zfs create ... -o mountpoint=${jaildatadir}/${jname}-data
+#            ${ZPOOL}/${jname}` -- sudoexec/mkdatadir:20-21, with the "-data"
+#           suffix being ${jaildatapref}, cbsd.conf:70 jaildatapref="data".
+#   bhyve   ${workdir}/vm/<name>
+#           `zfs create -o mountpoint=${workdir}/vm/${jname} ${DATA}/${jname}`
+#           -- sudoexec/bcreate:579, and :595-597 makes that path the guest's
+#           own `data=` field.
+#
+# rc 2 for a type this adapter does not support: a guess here would mount a
+# replica over something else's directory.
+adapter_guest_mountpoint()
+{
+    local _name _type
+
+    _adapter_ready || return 2
+
+    _name=${1:-}
+    _type=${2:-}
+
+    if ! _adapter_name_ok "${_name}"; then
+        _adapter_diag "adapter_guest_mountpoint: not a usable guest name: [${_name}]"
+        return 2
+    fi
+
+    case "${_type}" in
+        jail)  printf '%s/%s-data\n' "${ADAPTER_JAILDATADIR}" "${_name}" ;;
+        bhyve) printf '%s/vm/%s\n' "${ADAPTER_WORKDIR}" "${_name}" ;;
+        *)
+            _adapter_diag "adapter_guest_mountpoint: unsupported guest type: [${_type}]"
+            return 2
+            ;;
+    esac
+
+    return 0
+}
+
+# contract: adapter_guest_links(name,type) -> link<TAB>target per line [list: may be empty]
+#
+# The symlinks this platform needs in place before a guest whose data arrived
+# by replication can be registered and started here. One record per link, the
+# link first and what it must point at second; an empty list is a valid answer
+# and is what a jail produces.
+#
+# EVIDENCE. A bhyve guest's dataset is mounted at ${workdir}/vm/<name>, and
+# CBSD makes two symlinks to it at creation time -- sudoexec/bcreate:598-599,
+#
+#     ln -sf ${data} ${olddata}                 # jails-data/<name>-data
+#     ln -sf ${data} ${jailsysdir}/${jname}     # jails-system/<name>
+#
+# with data=${workdir}/vm/${jname} (:595) and olddata=${jaildatadir}/${jname}-data
+# (:593). CBSD's own receive path restores the second of them after a transfer
+# (sudoexec/zfs-recv:66-69), which is the same ceremony this list describes.
+# A jail needs neither: its dataset is mounted where CBSD looks for it.
+#
+# The per-disk /dev/zvol symlinks are NOT here: they are computed from the
+# replica's own volume list by whoever is doing the promoting, because their
+# names come from the datasets rather than from the platform
+# (sudoexec/zfs-recv:82-93).
+adapter_guest_links()
+{
+    local _name _type _mp
+
+    _adapter_ready || return 2
+
+    _name=${1:-}
+    _type=${2:-}
+
+    if ! _adapter_name_ok "${_name}"; then
+        _adapter_diag "adapter_guest_links: not a usable guest name: [${_name}]"
+        return 2
+    fi
+
+    case "${_type}" in
+        jail)
+            return 0
+            ;;
+        bhyve)
+            _mp=$( adapter_guest_mountpoint "${_name}" bhyve ) || return 2
+            printf '%s/%s\t%s\n' "${ADAPTER_JAILSYSDIR}" "${_name}" "${_mp}"
+            printf '%s/%s-data\t%s\n' "${ADAPTER_JAILDATADIR}" "${_name}" "${_mp}"
+            return 0
+            ;;
+        *)
+            _adapter_diag "adapter_guest_links: unsupported guest type: [${_type}]"
+            return 2
+            ;;
+    esac
+}
+
 # contract: adapter_guest_datasets(name) -> dataset per line, root first [promises output]
 #
 # Every ZFS dataset belonging to the guest -- filesystems and volumes, the
 # root of the tree first, then its children in ZFS's own order.
 #
-# The root is <parent>/<name> where <parent> is the dataset holding CBSD's
-# jails-data directory, which is precisely how CBSD derives it when it creates
-# a guest: `ZPOOL=$( zfs list -Ho name ${jaildatadir} )` then
-# `zfs create -o mountpoint=${jaildatadir}/${jname}-data ${ZPOOL}/${jname}`
-# for a jail (sudoexec/mkdatadir:14-23), and the same parent with
-# `-o mountpoint=${workdir}/vm/${jname}` for a VM, whose disks are zvols
-# underneath it (sudoexec/bcreate:573-590). Deriving it the same way means the
-# adapter cannot disagree with CBSD about where a guest lives, and no pool name
-# is ever written down (the tenant guard forbids one; decision D-6).
+# TWO RESOLUTIONS, IN THIS ORDER, and the order is the point.
 #
-# rc 1 when the guest has no dataset -- a zfsfeat=0 node (mkdatadir:15-18
-# makes a plain directory instead). seance requires ZFS-backed guests, and
-# saying so loudly is the entire response.
+#   1. THE MOUNTED PATH. `zfs list -H -o name <mountpoint>` names the dataset
+#      mounted where CBSD expects this guest's data to be -- the path its own
+#      `data=` field carries (sudoexec/bcreate:595-597). After a promotion in
+#      place that dataset is the REPLICA, living under
+#      <standby_root>/<deadkey>/<name> and mounted at CBSD's expected path
+#      (D-44 item 4), and no derivation from a pool name could ever name it.
+#      Asking the mount table is asking the same question CBSD asks.
+#
+#      WITH ONE GUARD, and it is load-bearing: `zfs list <path>` answers with
+#      the dataset CONTAINING the path, not only with one mounted exactly
+#      there. Observed on the workstation: `zfs list -H -o name,mountpoint
+#      /data/jails` prints `zdata /data`, which is precisely why CBSD itself
+#      uses that form to find the POOL from ${jaildatadir} (mkdatadir:20). So
+#      the answer is accepted only when its own mountpoint is exactly the path
+#      asked about. Without this, a guest whose dataset happened to be
+#      unmounted would resolve to the whole workdir dataset, and seance would
+#      then snapshot, send and -- at promotion -- remount CBSD's entire estate.
+#   2. <parent>/<name>, where <parent> is the dataset holding CBSD's jails-data
+#      directory -- precisely how CBSD derives it when it CREATES a guest:
+#      `ZPOOL=$( zfs list -Ho name ${jaildatadir} )` then
+#      `zfs create -o mountpoint=${jaildatadir}/${jname}-data ${ZPOOL}/${jname}`
+#      (sudoexec/mkdatadir:14-23), and the same parent with
+#      `-o mountpoint=${workdir}/vm/${jname}` for a VM (sudoexec/bcreate:579).
+#      This is the answer for a guest at home, and for one whose dataset is not
+#      mounted at the moment. No pool name is written down either way, which is
+#      what the tenant guard requires (D-6).
+#
+# rc 1 when the guest has no dataset at all -- a zfsfeat=0 node (mkdatadir:15-18
+# makes a plain directory instead), or a guest this node does not have. seance
+# requires ZFS-backed guests, and saying so loudly is the entire response.
 adapter_guest_datasets()
 {
-    local _name _parent _root _out
+    local _name _parent _root _out _type _mp _cand
 
     _adapter_ready || return 2
 
@@ -890,15 +1009,33 @@ adapter_guest_datasets()
         return 2
     fi
 
-    _parent=$( zfs list -H -o name "${ADAPTER_JAILDATADIR}" 2>/dev/null ) ||
-        _parent=""
-
-    if [ -z "${_parent}" ]; then
-        _adapter_diag "${ADAPTER_JAILDATADIR} is not on ZFS: this node cannot host seance guests"
-        return 1
+    # 1. the path CBSD's own data= field names.
+    _root=""
+    _type=$( adapter_guest_type "${_name}" 2>/dev/null ) || _type=""
+    if [ -n "${_type}" ]; then
+        _mp=$( adapter_guest_mountpoint "${_name}" "${_type}" 2>/dev/null ) || _mp=""
+        if [ -n "${_mp}" ]; then
+            _cand=$( zfs list -H -o name "${_mp}" 2>/dev/null ) || _cand=""
+            if [ -n "${_cand}" ] &&
+               [ "$( zfs get -H -o value mountpoint "${_cand}" 2>/dev/null )" = "${_mp}" ]
+            then
+                _root=${_cand}
+            fi
+        fi
     fi
 
-    _root="${_parent}/${_name}"
+    # 2. the pool CBSD would have created it in.
+    if [ -z "${_root}" ]; then
+        _parent=$( zfs list -H -o name "${ADAPTER_JAILDATADIR}" 2>/dev/null ) ||
+            _parent=""
+
+        if [ -z "${_parent}" ]; then
+            _adapter_diag "${ADAPTER_JAILDATADIR} is not on ZFS: this node cannot host seance guests"
+            return 1
+        fi
+
+        _root="${_parent}/${_name}"
+    fi
 
     _out=$( zfs list -H -r -o name -t filesystem,volume "${_root}" 2>/dev/null ) ||
         _out=""

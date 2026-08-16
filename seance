@@ -47,6 +47,32 @@ ${H3_COLOR}Options${N0_COLOR}:
              reality: the mesh matrix, the clock delta, one config file
              everywhere, the standby parents, the crontab line.
              'verify --render cron' prints that line. verify NEVER writes;
+   promote - walk the succession ladder for a dead node's estate. Seven
+             rungs, each logged and each able to stop it: debounce,
+             quorum, the death probes, fencing, lineage, promotion,
+             post. '--guest' narrows it to one guest.
+             '--force[=<rung>,...]' overrides only the rungs it names, and
+             may name only quorum, fence, lineage and kernel -- a host
+             that answers the death probes is never fenced by force, and
+             a fence driver that REFUSED is never overridden;
+   failback- bring a guest home. Run it on the guest's home node once that
+             node is back, gated, and not running the guest. The reverse
+             stream lands in the live dataset, so seance measures what
+             would be rolled back first and refuses unless
+             '--discard-origin-writes' says otherwise;
+   failback-assist
+           - INTERNAL: the interim host's half of a failback, invoked over
+             the mesh. 'stop', 'snapshot', 'unregister', 'release';
+   gate    - the resurrection gate. For every guest whose home is this
+             node, ask each LIVING peer whether it already claims that
+             guest; withhold any that is claimed, and the whole estate if
+             not one peer answers. '--check' says what it would do;
+             '--release <guest>' releases one, if nobody still claims it;
+   placement
+           - which guests this node hosts away from home. '--remote'
+             gathers the same from every living peer. This is the verb
+             every peer answers over ssh, so it must be runnable as the
+             ssh user on every node;
    config  - print the effective configuration and its verdict;
              'config --check' validates and lists every problem;
    version - print the seance version;
@@ -71,6 +97,11 @@ ${H3_COLOR}Examples${N0_COLOR}:
  # cbsd seance repl --guest web01 --dry-run
  # cbsd seance verify
  # cbsd seance verify --render cron
+ # cbsd seance promote alpha
+ # cbsd seance promote alpha --guest web01 --force=fence
+ # cbsd seance failback web01
+ # cbsd seance gate --check
+ # cbsd seance placement --remote
  # cbsd seance config
  # cbsd seance config --check
  # cbsd seance config --file /path/to/seance.conf

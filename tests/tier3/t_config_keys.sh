@@ -189,7 +189,7 @@ wrong_defaults()
 # So a token that lib/ defines as a function is not a key mention, and the
 # subtraction is computed from the source rather than written out here, so that
 # a new function cannot quietly become a new exception.
-DOC_SET="docs/repl-wire.md docs/DRILLS.md README.md"
+DOC_SET="docs/repl-wire.md docs/DRILLS.md docs/RUNBOOK-failback.md README.md"
 
 # doc_key_tokens <file>
 doc_key_tokens()
@@ -289,7 +289,7 @@ while IFS= read -r row; do
     esac
 done < "${WORK}/sample.rows"
 
-t_plan 27
+t_plan 28
 
 # --- the guard is scanning something ---------------------------------------
 

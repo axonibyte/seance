@@ -42,6 +42,135 @@ zfs_snapshots_r()
     zfs list -H -o name -t snapshot -r "${1:?}"
 }
 
+# zfs_children <dataset>  -- the immediate children of <dataset>, one per line,
+# filesystems and volumes, WITHOUT <dataset> itself.
+#
+# -d 1 is depth one and includes the dataset named, so it is filtered out here
+# rather than at every call site. This is how the promotion ladder discovers a
+# dead node's estate: the guest roots under <standby_root>/<deadkey>/ are
+# exactly its immediate children (D-44 item 3).
+# The listing is captured before it is filtered, rather than piped into the
+# filter: a pipeline's status is its last command's, and a `zfs list` that
+# failed into an awk that succeeded would read as "this node holds no estate"
+# -- which is the quiet answer a promotion must never get (common.subr, the
+# RC-capture pattern).
+zfs_children()
+{
+    local _ds _out
+
+    _ds=${1:?}
+
+    _out=$( zfs list -H -o name -t filesystem,volume -d 1 -r "${_ds}" ) || return 1
+
+    printf '%s\n' "${_out}" | awk -v self="${_ds}" 'NF > 0 && $0 != self'
+}
+
+# zfs_volumes_r <dataset>  -- every zvol at or under <dataset>, one per line.
+#
+# A guest's type is legible from this: CBSD gives a bhyve guest its disks as
+# zvols under the guest's own dataset (sudoexec/bcreate:573-590, and
+# sudoexec/zfs-recv:82-93 restores their /dev/zvol symlinks after a receive),
+# while a jail's dataset is a filesystem with no volumes at all
+# (sudoexec/mkdatadir:14-23).
+zfs_volumes_r()
+{
+    zfs list -H -o name -t volume -r "${1:?}"
+}
+
+# zfs_filesystems_r <dataset>  -- every filesystem at or under <dataset>.
+zfs_filesystems_r()
+{
+    zfs list -H -o name -t filesystem -r "${1:?}"
+}
+
+# zfs_mount <dataset> / zfs_unmount <dataset>
+#
+# An explicit mount, because every replica dataset is canmount=noauto and stays
+# that way: the promotion ceremony sets a mountpoint and then mounts, and
+# nothing else in seance ever mounts anything (design §7 rung 5).
+zfs_mount()
+{
+    zfs mount "${1:?}"
+}
+
+# zfs_mount_ro <dataset>
+#
+# Mount it read-only for this mount only -- `zfs mount -o` sets a temporary
+# property that lasts until the dataset is unmounted (zfs-mount(8), -o), so
+# nothing on disk is changed and nothing has to be put back. It is how the
+# promotion ceremony reads a replica of another node's configuration mirror
+# without giving itself the ability to write to it (D-82).
+zfs_mount_ro()
+{
+    zfs mount -o ro "${1:?}"
+}
+
+# zfs_create_at <dataset> <mountpoint>
+#
+# Create a dataset that IS meant to be mounted, at a named place, in one
+# operation -- so there is no instant in which it exists with an inherited
+# mountpoint. The hidden counterpart is zfs_create_hidden, and the difference
+# between them is the whole distinction between a replica and something this
+# node uses.
+zfs_create_at()
+{
+    zfs create -o "mountpoint=${2:?}" "${1:?}"
+}
+
+zfs_unmount()
+{
+    zfs unmount "${1:?}"
+}
+
+# zfs_mounted <dataset>  -- rc 0 if the dataset is mounted right now. Quiet:
+# it is a probe.
+zfs_mounted()
+{
+    [ "$( zfs get -H -o value mounted "${1:?}" 2>/dev/null )" = "yes" ]
+}
+
+# zfs_pool_sync <dataset>  -- force the dataset's pool to commit.
+#
+# WITHOUT THIS, `written@` LIES, AND IT LIES IN THE DIRECTION THAT DESTROYS
+# DATA. Space accounting is only exact once a transaction group has been
+# written out, so a write made seconds ago is not in `written@<snap>` yet.
+# Observed in the reaper guest, FreeBSD 15.1 / OpenZFS:
+#
+#     dd if=/dev/random of=/tmp/wtest/f bs=1m count=1
+#     zfs get -Hp -o value written@base tank/state/wtest   ->  0
+#     zpool sync tank
+#     zfs get -Hp -o value written@base tank/state/wtest   ->  1122304
+#
+# A failback that measured the first number would have reported "0 bytes
+# written" and then destroyed a megabyte of somebody's data with `recv -F`,
+# silently, having just told them there was nothing to lose. The whole value of
+# the written@base guard is that its number is true (D-44 item 5), so the
+# measurement forces the commit first.
+zfs_pool_sync()
+{
+    local _ds
+
+    _ds=${1:?}
+
+    zpool sync "${_ds%%/*}"
+}
+
+# zfs_written_since <dataset> <snapshot-shortname>
+#
+# Print the bytes written to <dataset> since <snapshot>, as an integer.
+# `zfs get -Hp` is the parsable form -- without -p the value arrives as "1.5M",
+# which is a number nobody may compare against zero.
+#
+# This is failback's safety interlock (D-44 item 5): a reverse incremental
+# lands in the origin's LIVE dataset with `recv -F`, which rolls back to the
+# base, and anything written here since that base is what the rollback
+# destroys. Refusing unless the operator says otherwise is the whole check, and
+# it is only as good as this number being exact.
+zfs_written_since()
+{
+    zfs get -Hp -o value "written@${2:?}" "${1:?}"
+}
+
 # zfs_snapshot_r <dataset> <shortname>
 #
 # One atomic recursive snapshot of the dataset tree. Atomicity is the reason
@@ -61,6 +190,25 @@ zfs_snapshot_r()
 zfs_destroy_snapshot()
 {
     zfs destroy "${1:?}@${2:?}"
+}
+
+# zfs_rollback_r <dataset> <shortname>
+#
+# Put a dataset back to a snapshot, destroying every snapshot after it. THE
+# ONLY IRREVERSIBLE THING seance DOES to a dataset it did not create, and it
+# does it in exactly one place: the promotion ceremony, when an interrupted
+# tick left one dataset of a guest ahead of the others and there is no coherent
+# instant to promote at otherwise (D-85).
+#
+# -r and not -R: -r destroys the snapshots after the named one, which is the
+# point; -R would additionally destroy clones and bookmarks, which are somebody
+# else's and are not in the way.
+#
+# The caller prints what is about to be destroyed BEFORE calling this, because
+# there is no undo to print afterwards.
+zfs_rollback_r()
+{
+    zfs rollback -r "${1:?}@${2:?}"
 }
 
 # zfs_get <property> <dataset>  -- the property's effective value.

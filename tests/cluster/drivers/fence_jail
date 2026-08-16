@@ -1,0 +1,133 @@
+#!/bin/sh
+# seance -- the pseudo-cluster's fence driver (TESTING.md §1, shape A).
+#
+#   fence_jail off    <node>
+#   fence_jail status <node>
+#
+# "Power off" here is stopping the target's jail on the guest host, and
+# "verified off" is the host's own `jls -d` no longer listing it. That is real
+# fence SEMANTICS with a fake power supply: the driver does not report success
+# because a command was accepted, it reports success because it looked
+# afterwards and the node was gone.
+#
+# It runs INSIDE a node -- promote invokes it on the surviving node, exactly as
+# a real driver would be invoked -- and reaches the guest host over ssh, with
+# the pseudo-cluster's own key, because that is where the jails live. `host`
+# resolves through the /etc/hosts the substrate writes into every node.
+#
+# THE HOST-SIDE HALF is a helper script the stage installs before the cluster
+# is used (tests/cluster/lib/fence.subr). Stopping a vnet jail properly is not
+# `jail -r`: a jail whose delegated dataset is still mounted stays in the
+# `dying` state indefinitely and never gives its epair back (decision D-23), so
+# the helper is the substrate's own cluster_stop, which unmounts and waits. A
+# fence that left the corpse dying would be a fence that had not fenced.
+#
+# THE CONTRACT, identical to every other driver (HANDOFF.md §2.4, D-44 item 2):
+#
+#   off     0 verified off, 1 refused / still on, 2 cannot determine
+#   status  0 off, 1 on, 2 unknown
+#
+# One verdict line on stdout, everything else on stderr.
+#
+#   FENCE_JAIL_HOST     the guest host's name in the node's /etc/hosts (host)
+#   FENCE_JAIL_KEY      the mesh key inside a node   (/root/.ssh/id_ed25519)
+#   FENCE_JAIL_HELPER   the host-side helper's path  (see fence.subr)
+#
+# shellcheck disable=SC3043
+#   'local' is not in POSIX sh but is implemented by FreeBSD /bin/sh (sh(1),
+#   "local"); seance targets FreeBSD sh and nothing else (HANDOFF.md §5).
+set -u
+
+PROG=fence_jail
+
+FENCE_JAIL_HOST=${FENCE_JAIL_HOST:-host}
+FENCE_JAIL_KEY=${FENCE_JAIL_KEY:-/root/.ssh/id_ed25519}
+FENCE_JAIL_HELPER=${FENCE_JAIL_HELPER:-/tmp/seance-fence-jail-host}
+
+usage()
+{
+    cat <<EOF
+usage: ${PROG} <off|status> <node>
+
+Stops (or reads the state of) a pseudo-cluster node's jail on the guest host.
+
+Exit: off -> 0 verified off, 1 refused/still on, 2 cannot determine
+      status -> 0 off, 1 on, 2 unknown
+EOF
+}
+
+ACTION=${1:-}
+TARGET=${2:-}
+
+case "${ACTION}" in
+    -h|--help) usage; exit 0 ;;
+esac
+
+if [ -z "${ACTION}" ] || [ -z "${TARGET}" ]; then
+    usage >&2
+    exit 2
+fi
+
+case "${ACTION}" in
+    off|status) ;;
+    *)
+        echo "${PROG}: no such action: ${ACTION}" >&2
+        usage >&2
+        exit 2
+        ;;
+esac
+
+case "${TARGET}" in
+    ''|*[!abcdefghijklmnopqrstuvwxyz0123456789]*)
+        echo "${PROG}: not a node name: ${TARGET}" >&2
+        exit 2
+        ;;
+esac
+
+if [ ! -r "${FENCE_JAIL_KEY}" ]; then
+    echo "${PROG}: no readable mesh key at ${FENCE_JAIL_KEY}" >&2
+    printf '%s: %s unknown no key to reach %s with\n' \
+        "${PROG}" "${TARGET}" "${FENCE_JAIL_HOST}"
+    exit 2
+fi
+
+OUT=$( ssh -i "${FENCE_JAIL_KEY}" \
+    -o BatchMode=yes \
+    -o StrictHostKeyChecking=no \
+    -o UserKnownHostsFile=/dev/null \
+    -o ConnectTimeout=5 \
+    -o LogLevel=ERROR \
+    "root@${FENCE_JAIL_HOST}" \
+    "${FENCE_JAIL_HELPER} ${ACTION} ${TARGET}" < /dev/null 2>&1 )
+RC=$?
+
+# ssh's own failures are "cannot determine", never "refused": a BMC that never
+# answered and a BMC that said no are not the same fact, and only one of them
+# is forceable (D-54 makes the same split for the shipped ipmi driver).
+if [ "${RC}" -eq 255 ]; then
+    printf '%s\n' "${OUT}" >&2
+    printf '%s: %s unknown could not reach %s\n' \
+        "${PROG}" "${TARGET}" "${FENCE_JAIL_HOST}"
+    exit 2
+fi
+
+case "${ACTION}" in
+    off)
+        case "${RC}" in
+            0) printf '%s: %s off verified: %s\n' "${PROG}" "${TARGET}" "${OUT}" ;;
+            1) printf '%s: %s on still listed by jls after the stop: %s\n' \
+                   "${PROG}" "${TARGET}" "${OUT}" ;;
+            *) printf '%s: %s unknown the host could not say: %s\n' \
+                   "${PROG}" "${TARGET}" "${OUT}" ;;
+        esac
+        ;;
+    status)
+        case "${RC}" in
+            0) printf '%s: %s off\n' "${PROG}" "${TARGET}" ;;
+            1) printf '%s: %s on\n' "${PROG}" "${TARGET}" ;;
+            *) printf '%s: %s unknown %s\n' "${PROG}" "${TARGET}" "${OUT}" ;;
+        esac
+        ;;
+esac
+
+exit "${RC}"

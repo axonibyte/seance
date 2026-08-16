@@ -517,6 +517,69 @@ adapter_guest_sysdir()
     printf '%s/jails-system/%s\n' "${SEANCE_MOCK_WORKDIR:-/nonexistent/mock}" "$1"
 }
 
+# contract: adapter_guest_mountpoint(name,type) -> path [promises output]
+adapter_guest_mountpoint()
+{
+    local _rc _wd
+
+    _mock_log adapter_guest_mountpoint "$@"
+    _mock_scripted adapter_guest_mountpoint "$@"
+    _rc=$?
+    [ "${_rc}" -ne 100 ] && return "${_rc}"
+
+    if ! _mock_name_ok "${1:-}"; then
+        _mock_diag "adapter_guest_mountpoint: not a usable guest name: [${1:-}]"
+        return 2
+    fi
+
+    _wd=${SEANCE_MOCK_WORKDIR:-/nonexistent/mock}
+
+    case "${2:-}" in
+        jail)  printf '%s/jails-data/%s-data\n' "${_wd}" "$1" ;;
+        bhyve) printf '%s/vm/%s\n' "${_wd}" "$1" ;;
+        *)
+            _mock_diag "adapter_guest_mountpoint: unsupported guest type: [${2:-}]"
+            return 2
+            ;;
+    esac
+
+    return 0
+}
+
+# contract: adapter_guest_links(name,type) -> link<TAB>target per line [list: may be empty]
+adapter_guest_links()
+{
+    local _rc _wd _mp
+
+    _mock_log adapter_guest_links "$@"
+    _mock_scripted adapter_guest_links "$@"
+    _rc=$?
+    [ "${_rc}" -ne 100 ] && return "${_rc}"
+
+    if ! _mock_name_ok "${1:-}"; then
+        _mock_diag "adapter_guest_links: not a usable guest name: [${1:-}]"
+        return 2
+    fi
+
+    _wd=${SEANCE_MOCK_WORKDIR:-/nonexistent/mock}
+
+    case "${2:-}" in
+        jail)
+            return 0
+            ;;
+        bhyve)
+            _mp=$( adapter_guest_mountpoint "$1" bhyve ) || return 2
+            printf '%s/jails-system/%s\t%s\n' "${_wd}" "$1" "${_mp}"
+            printf '%s/jails-data/%s-data\t%s\n' "${_wd}" "$1" "${_mp}"
+            return 0
+            ;;
+        *)
+            _mock_diag "adapter_guest_links: unsupported guest type: [${2:-}]"
+            return 2
+            ;;
+    esac
+}
+
 # contract: adapter_guest_datasets(name) -> dataset per line, root first [promises output]
 adapter_guest_datasets()
 {
@@ -537,6 +600,13 @@ adapter_guest_datasets()
         return 1
     }
 
+    # The mock's world has one layout: a guest lives at <pool>/<name>. The real
+    # adapter resolves the MOUNTED PATH first so that a guest promoted in place
+    # -- whose dataset is a replica under the standby tree -- is found where
+    # CBSD looks rather than where a pool derivation would guess (D-44 item 4).
+    # There is no mount table here to ask, so the mock states the layout it has
+    # and tests/tier4/t_adapter_parse.sh drives the real resolution against a
+    # scripted zfs instead.
     printf '%s/%s\n' "${MOCK_POOL:-pool0}" "$1"
     if [ "${_type}" = "bhyve" ]; then
         printf '%s/%s/dsk1.vhd\n' "${MOCK_POOL:-pool0}" "$1"

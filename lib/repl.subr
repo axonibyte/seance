@@ -74,6 +74,243 @@ REPL_TAB=${REPL_TAB%.}
 # used throughout this file but not replication concepts (status and verify
 # use them too) -- live in lib/common.subr, sourced before this file.
 
+# ---------------------------------------------------------------------------
+# The sys mirror (decision D-82)
+#
+# Design §5 counts "guest configs in jails-system" among the already-replicated
+# data. For a VM that is true by accident of layout: CBSD symlinks
+# ${jailsysdir}/<n> into ${workdir}/vm/<n>, which IS the guest's dataset
+# (sudoexec/bcreate:599). For a JAIL it is not true at all --
+# ${jailsysdir}/<n>/ is a plain directory on CBSD's workdir dataset, outside
+# <pool>/<jname>, so nothing replicates it and a survivor has the guest's data
+# and no way to register it.
+#
+# So seance carries it. Each node owns ONE extra dataset,
+# <pool-of-jails-data>/seance-sys, mounted inside the state directory (D-3).
+# Every tick mirrors ${jailsysdir}/<guest>/ into <sys>/<guest>/ for the guests
+# whose configuration does not already travel, and then replicates that dataset
+# exactly like a guest: same snapshot grammar, same heirs, same receive flags,
+# landing at <standby_root>/<home>/seance-sys.
+#
+# WHAT THIS DELIBERATELY IS NOT. It is not a dataset mounted over
+# jails-system/<n> (invasive on the source, and CBSD's own directories are not
+# seance's to move); it is not a tarball inside the guest's root (a compromised
+# guest could then rewrite the parameters of its own promotion); and it is not
+# an rsync to the peer outside ZFS (a second transport, with its own lineage to
+# keep in step). It is one more dataset on the wire that already exists.
+#
+# THE MIRROR USES BASE-SYSTEM TOOLS ONLY -- cp(1) and a prune -- rather than
+# rsync(1). rsync is present on a real CBSD node (it is a CBSD dependency:
+# rsync-3.4.4_1) but NOT inside a shape-A pseudo-cluster node, which nullfs
+# mounts only /bin /sbin /lib /libexec /usr/bin /usr/sbin /usr/lib /usr/libexec
+# /usr/share from the guest's userland. Two implementations of one mirror is a
+# worse answer than one, and what is being mirrored is a few kilobytes of
+# configuration, locally: rsync's delta algorithm buys nothing here.
+REPL_SYS_GUEST="seance-sys"
+
+# repl_sys_dataset  -- <pool-of-jails-data>/seance-sys.
+#
+# Derived the way CBSD derives where a guest's dataset goes:
+# `zfs list -Ho name ${jaildatadir}` names the dataset that CONTAINS the
+# jails-data directory (sudoexec/mkdatadir:20), and guests are created as its
+# children. The sys mirror is another child, beside them, so no pool name is
+# ever written down (D-6).
+repl_sys_dataset()
+{
+    local _jd _parent
+
+    _jd=$( adapter_fact jaildatadir ) || return 1
+    [ -n "${_jd}" ] || return 1
+
+    _parent=$( zfs list -H -o name "${_jd}" 2>/dev/null ) || return 1
+    [ -n "${_parent}" ] || return 1
+
+    printf '%s/%s\n' "${_parent}" "${REPL_SYS_GUEST}"
+}
+
+# repl_sys_mountpoint  -- inside the state directory (D-3), because this is
+# something seance remembers rather than something CBSD owns.
+repl_sys_mountpoint()
+{
+    local _d
+
+    _d=$( seance_state_dir ) || return 1
+    printf '%s/sys\n' "${_d}"
+}
+
+# repl_sys_ensure  -- the dataset exists, is where it should be, and is mounted.
+#
+# It is NOT canmount=noauto here: this one is meant to be mounted on the node
+# that owns it. On a PEER it arrives as a replica and the ordinary receive
+# flags plus repl_remote_enforce_law hide it exactly like any other replica --
+# which is why `-x mountpoint` is as load-bearing for this dataset as for a
+# guest's, and why it needs no special case anywhere on the receiving side.
+repl_sys_ensure()
+{
+    local _ds _mp
+
+    _ds=$( repl_sys_dataset ) || return 1
+    _mp=$( repl_sys_mountpoint ) || return 1
+
+    if ! zfs_exists "${_ds}"; then
+        zfs_create_at "${_ds}" "${_mp}" || return 1
+        seance_log info "repl: created the configuration mirror ${_ds} at ${_mp}"
+    fi
+
+    if [ "$( zfs_get mountpoint "${_ds}" )" != "${_mp}" ]; then
+        seance_log warning "repl: ${_ds} was not mounted at ${_mp}; putting it back"
+        zfs_set "mountpoint=${_mp}" "${_ds}" || return 1
+    fi
+
+    zfs_mounted "${_ds}" || zfs_mount "${_ds}" || return 1
+
+    return 0
+}
+
+# repl_sys_travels <guest>
+#
+# rc 0 when the guest's configuration directory is ALREADY inside the guest's
+# own replicated dataset tree, and so needs no mirroring: a VM on CBSD, whose
+# ${jailsysdir}/<n> is a symlink to the dataset mounted at ${workdir}/vm/<n>,
+# and the pseudo-cluster's guests, whose sys directory is a child dataset.
+#
+# The test is the only one that is true on every platform: resolve the symlink
+# and ask whether the result is at or under one of the guest's own dataset
+# mountpoints. Anything else would be this file knowing which platform it is
+# on, which is the seam it must not cross.
+repl_sys_travels()
+{
+    local _guest _sd _real _ds _mp _tmp
+
+    _guest=$1
+
+    _sd=$( adapter_guest_sysdir "${_guest}" 2>/dev/null ) || return 1
+    [ -n "${_sd}" ] || return 1
+
+    _real=$( realpath "${_sd}" 2>/dev/null ) || return 1
+
+    _tmp=$( seance_tmpdir ) || return 1
+    adapter_guest_datasets "${_guest}" > "${_tmp}/sysds" < /dev/null || return 1
+
+    while IFS= read -r _ds || [ -n "${_ds}" ]; do
+        [ -n "${_ds}" ] || continue
+
+        _mp=$( zfs_get mountpoint "${_ds}" 2>/dev/null ) || continue
+        case "${_mp}" in
+            /*) ;;
+            *) continue ;;
+        esac
+
+        [ "${_real}" = "${_mp}" ] && return 0
+        case "${_real}" in
+            "${_mp}/"*) return 0 ;;
+        esac
+    done < "${_tmp}/sysds"
+
+    return 1
+}
+
+# repl_sys_mirror <source-dir> <destination-dir>
+#
+# Make <destination> a copy of <source>: `rsync -a --delete` written with cp(1)
+# and a prune, for the reason given above. The prune runs FIRST and deepest
+# first, so that a file the source no longer has cannot survive under a
+# directory the copy is about to recreate.
+repl_sys_mirror()
+{
+    local _src _dst _rel _rc
+
+    _src=$1
+    _dst=$2
+
+    # Both named, both absolute, before anything here runs `rm -rf` under one
+    # of them. An empty destination would make the prune below a sweep of the
+    # root directory, and there is no message worth reading afterwards.
+    case "${_src}" in /*) ;; *) return 1 ;; esac
+    case "${_dst}" in /*) ;; *) return 1 ;; esac
+
+    [ -d "${_src}" ] || return 1
+
+    mkdir -p "${_dst}" || return 1
+
+    _rc=0
+
+    # --- prune: whatever the source no longer has ------------------------
+    ( cd "${_dst}" && find . -depth ! -name . ) > "${_dst}/.seance-mirror-list" 2>/dev/null ||
+        : > "${_dst}/.seance-mirror-list"
+
+    while IFS= read -r _rel || [ -n "${_rel}" ]; do
+        [ -n "${_rel}" ] || continue
+        [ "${_rel}" = "./.seance-mirror-list" ] && continue
+        [ -e "${_src}/${_rel}" ] && continue
+        [ -h "${_src}/${_rel}" ] && continue
+        rm -rf "${_dst:?}/${_rel:?}" || _rc=1
+    done < "${_dst}/.seance-mirror-list"
+
+    rm -f "${_dst}/.seance-mirror-list"
+
+    # --- copy: -a is -pPR, so modes, times, flags and symlinks all survive
+    cp -a "${_src}/." "${_dst}/" || _rc=1
+
+    return "${_rc}"
+}
+
+# repl_sys_sync <guest>  -- mirror one guest's configuration, if it needs it.
+#
+# rc 0 when the mirror is in step (including "there was nothing to do"), 1 when
+# it could not be made.
+repl_sys_sync()
+{
+    local _guest _sd _mp
+
+    _guest=$1
+
+    if repl_sys_travels "${_guest}"; then
+        return 0
+    fi
+
+    _sd=$( adapter_guest_sysdir "${_guest}" 2>/dev/null ) || {
+        seance_log warning "repl ${_guest}: the adapter cannot say where this guest's" \
+            "configuration lives, so none of it is being mirrored"
+        return 1
+    }
+
+    if [ ! -d "${_sd}" ]; then
+        seance_log warning "repl ${_guest}: no configuration directory at ${_sd};" \
+            "a survivor would have this guest's data and no way to register it"
+        return 1
+    fi
+
+    _mp=$( repl_sys_mountpoint ) || return 1
+
+    if ! repl_sys_mirror "${_sd}" "${_mp}/${_guest}"; then
+        seance_log err "repl ${_guest}: could not mirror ${_sd} into ${_mp}/${_guest}"
+        return 1
+    fi
+
+    return 0
+}
+
+# repl_guest_datasets <guest>
+#
+# The one place replication asks what a guest's datasets are. It is the adapter
+# for a real guest and the sys mirror for the pseudo-guest that carries the
+# configurations -- which is what lets the mirror ride the existing machinery
+# (lag records, locks, retention, the replica path) instead of growing a second
+# copy of it.
+repl_guest_datasets()
+{
+    local _ds
+
+    if [ "${1:-}" = "${REPL_SYS_GUEST}" ]; then
+        _ds=$( repl_sys_dataset ) || return 1
+        zfs_datasets_r "${_ds}"
+        return $?
+    fi
+
+    adapter_guest_datasets "$1"
+}
+
 # repl_ds_safe <name>  -- rc 0 if the name may be interpolated into a command
 # string destined for a peer's shell.
 repl_ds_safe()
@@ -689,8 +926,8 @@ repl_pair()
     _tmp=$( seance_tmpdir ) || return 2
 
     # --- the guest's datasets, root first ---------------------------------
-    if ! adapter_guest_datasets "${_guest}" > "${_tmp}/datasets" < /dev/null; then
-        seance_log err "repl ${_guest}->${_peer}: adapter_guest_datasets failed"
+    if ! repl_guest_datasets "${_guest}" > "${_tmp}/datasets" < /dev/null; then
+        seance_log err "repl ${_guest}->${_peer}: the dataset list could not be read"
         repl_lag_fail "${_guest}" "${_peer}" "${_now}" 1
         return 1
     fi
@@ -1076,6 +1313,90 @@ repl_cron_line()
     printf '*/%d * * * * root %s repl\n' "${_mins}" "${SEANCE_ROOT}/bin/seance"
 }
 
+# repl_run_pair <guest> <peer> <home> <now> <dry 0|1> <locked 0|1>
+#
+# One pair, either directly (this process already holds the lock, or is only
+# saying what it would do) or in a fresh dispatcher under lockf(1) (D-62).
+# Returns the pair's status, with REPL_RC_LOCKED meaning "another tick owns
+# this pair" rather than "this pair failed".
+#
+# Factored out so that the configuration mirror rides exactly the machinery the
+# guests do -- one lock discipline, not two.
+repl_run_pair()
+{
+    local _guest _peer _home _now _dry _locked _lock _rundir
+
+    _guest=$1
+    _peer=$2
+    _home=$3
+    _now=$4
+    _dry=$5
+    _locked=$6
+
+    if [ "${_locked}" -eq 1 ] || [ "${_dry}" -eq 1 ]; then
+        repl_pair "${_guest}" "${_peer}" "${_home}" "${_now}" "${_dry}"
+        return $?
+    fi
+
+    _lock=$( repl_lock_file "${_guest}" "${_peer}" ) ||
+        seance_die 2 "repl: no run directory; set SEANCE_RUN_DIR or run under CBSD"
+    _rundir=${_lock%/*}
+    mkdir -p "${_rundir}" || seance_die 1 "repl: cannot create ${_rundir}"
+
+    lockf -s -t 0 "${_lock}" "${SEANCE_ROOT}/bin/seance" repl \
+        --guest "${_guest}" --peer "${_peer}" --locked < /dev/null
+}
+
+# repl_sys_snapshot <home> <ts>
+#
+# Snapshot the configuration mirror with the tick's own name, so that its
+# lineage is the fleet's lineage and every consumer -- staleness, retention,
+# the promotion ladder -- reads it with the parser it already has.
+repl_sys_snapshot()
+{
+    local _home _ts _short _ds _tmp
+
+    _home=$1
+    _ts=$2
+
+    _ds=$( repl_sys_dataset ) || {
+        seance_log err "repl: cannot name the configuration mirror dataset"
+        return 1
+    }
+
+    _short=$( pol_snap_format "${_home}" "${_ts}" ) || {
+        seance_log err "repl: node key ${_home} cannot appear in a snapshot name"
+        return 1
+    }
+
+    zfs_snapshot_r "${_ds}" "${_short}" && return 0
+
+    # Two ticks in the same second (D-87). The mirror is a guest as far as the
+    # machinery is concerned, so it gets the guest's rule: a snapshot that
+    # already exists across the WHOLE tree was taken by the other tick, at
+    # exactly the instant this one asked for, and is replicated rather than
+    # called a failure. Anything less than the whole tree is not a point in
+    # time and is a failure like any other.
+    #
+    # Found by tests/tier6/t_replconc.sh: without this the mirror turned every
+    # same-second race into a failed tick, which is the exact thing D-87 was
+    # written to stop happening.
+    _tmp=$( seance_tmpdir ) || return 1
+    if ! zfs_datasets_r "${_ds}" > "${_tmp}/sysds" 2>/dev/null; then
+        seance_log err "repl: zfs snapshot -r ${_ds}@${_short} failed"
+        return 1
+    fi
+
+    if repl_snapshot_complete "${_tmp}/sysds" "${_short}"; then
+        seance_log notice "repl ${REPL_SYS_GUEST}: ${_ds}@${_short} already exists;" \
+            "another tick took this instant. Replicating it."
+        return 0
+    fi
+
+    seance_log err "repl: zfs snapshot -r ${_ds}@${_short} failed"
+    return 1
+}
+
 # repl_tick <guest-filter|""> <peer-filter|""> <dry-run 0|1> <now 0|1>
 #           <locked 0|1>
 #
@@ -1092,6 +1413,7 @@ repl_tick()
     local _gf _pf _dry _now_flag _locked
     local _home _now _ts _short _guest _peer _peers _rc _names _droot
     local _guests _pairs _ok _failed _skipped _busy _tmp _lock _rundir
+    local _syspeers _syspairs _sysok _sysfailed _sysbusy
 
     _gf=$1
     _pf=$2
@@ -1108,8 +1430,34 @@ repl_tick()
 
     _tmp=$( seance_tmpdir ) || return 1
 
+    # A locked sub-invocation for the configuration mirror does exactly its one
+    # pair: the mirror is not a guest, so none of the enumeration below applies
+    # to it, and falling through would end in "no guest called seance-sys".
+    if [ "${_gf}" = "${REPL_SYS_GUEST}" ] && [ "${_locked}" -eq 1 ]; then
+        repl_pair "${REPL_SYS_GUEST}" "${_pf}" "${_home}" "${_now}" 0
+        return $?
+    fi
+
     if ! adapter_guest_list > "${_tmp}/guests" < /dev/null; then
         seance_die 1 "repl: adapter_guest_list failed"
+    fi
+
+    # The configuration mirror rides the guest machinery under a name of its
+    # own, so a real guest wearing that name would have its data replicated
+    # into the mirror's place. It is refused rather than renamed.
+    if awk -F "${REPL_TAB}" -v n="${REPL_SYS_GUEST}" \
+           '$1 == n { found = 1 } END { exit !found }' "${_tmp}/guests"; then
+        seance_die 2 "repl: this node has a guest called \"${REPL_SYS_GUEST}\"," \
+            "which is the name seance's own configuration mirror uses; rename the guest"
+    fi
+
+    # The mirror itself, before anything is snapshotted. A mirror that could
+    # not be made is a failed tick -- a survivor would have the data and no way
+    # to register it -- but it does not stop the data from being replicated,
+    # which is the half that cannot be reconstructed.
+    if [ "${_locked}" -eq 0 ] && [ "${_dry}" -eq 0 ] && ! repl_sys_ensure; then
+        seance_log err "repl: the configuration mirror could not be prepared;" \
+            "guest data will still replicate, but a promotion may not find its configuration"
     fi
 
     # Names only, and iterated with 'for' rather than 'while read' over a
@@ -1123,11 +1471,37 @@ repl_tick()
     _failed=0
     _skipped=0
     _busy=0
+    _syspeers=""
 
     for _guest in ${_names}; do
         [ -n "${_gf}" ] && [ "${_gf}" != "${_guest}" ] && continue
 
         _guests=$(( _guests + 1 ))
+
+        # A HELD GUEST IS NOT THIS NODE'S TO REPLICATE.
+        #
+        # Held is the platform's own "this guest lives elsewhere" flag -- CBSD
+        # slave mode, which its own jcoldmigrate sets on the SOURCE after a
+        # migration (D-21), and which seance's boot gate sets on a returning
+        # node whose guest a survivor has claimed. Replicating from here would
+        # send this node's stale copy over the copy that is actually running,
+        # and the direction is exactly backwards: the interim has the live data
+        # and `seance failback` is what brings it home.
+        #
+        # It is a SKIP and not a failure. Found by tests/tier6/t_failback.sh:
+        # after web01 came home, alpha went on trying to replicate db01 -- still
+        # held here, still running on bravo -- and every tick failed with
+        # "destination has been modified since most recent snapshot" until
+        # somebody failed db01 back too. The receive refusing is the
+        # shadow-mount law and the absence of -F doing their job (D-64), so
+        # nothing was ever overwritten; what was wrong was that seance kept
+        # asking, and reported a broken fleet while doing it.
+        if [ "$( adapter_guest_held "${_guest}" 2>/dev/null )" = "1" ]; then
+            seance_log notice "repl ${_guest}: held here, so another node is hosting it;" \
+                "not replicating this node's copy over theirs (seance failback ${_guest} brings it home)"
+            _skipped=$(( _skipped + 1 ))
+            continue
+        fi
 
         if [ "${_locked}" -eq 0 ] && [ "${_now_flag}" -eq 0 ] && [ "${_dry}" -eq 0 ] &&
            ! repl_due "${_guest}" "${_home}" "${_now}"; then
@@ -1146,11 +1520,17 @@ repl_tick()
         # contacted, so that every peer receives the same instant. A locked
         # sub-invocation does not snapshot: its parent already has.
         if [ "${_locked}" -eq 0 ] && [ "${_dry}" -eq 0 ]; then
+            # The guest's configuration, into the mirror, before either is
+            # snapshotted -- so that the two travel as one instant (D-82).
+            repl_sys_sync "${_guest}" ||
+                seance_log err "repl ${_guest}: its configuration was NOT mirrored;" \
+                    "a survivor would have its data and no way to register it"
+
             _short=$( pol_snap_format "${_home}" "${_ts}" ) ||
                 seance_die 2 "repl: node key ${_home} cannot appear in a snapshot name"
 
-            adapter_guest_datasets "${_guest}" > "${_tmp}/ds" < /dev/null || {
-                seance_log err "repl ${_guest}: adapter_guest_datasets failed"
+            repl_guest_datasets "${_guest}" > "${_tmp}/ds" < /dev/null || {
+                seance_log err "repl ${_guest}: the dataset list could not be read"
                 _failed=$(( _failed + 1 ))
                 continue
             }
@@ -1189,40 +1569,68 @@ repl_tick()
             [ -n "${_pf}" ] && [ "${_pf}" != "${_peer}" ] && continue
             _pairs=$(( _pairs + 1 ))
 
-            if [ "${_locked}" -eq 1 ] || [ "${_dry}" -eq 1 ]; then
-                repl_pair "${_guest}" "${_peer}" "${_home}" "${_now}" "${_dry}"
-                _rc=$?
-                if [ "${_rc}" -eq 0 ]; then
-                    _ok=$(( _ok + 1 ))
-                else
-                    _failed=$(( _failed + 1 ))
-                fi
-                continue
-            fi
-
-            _lock=$( repl_lock_file "${_guest}" "${_peer}" ) ||
-                seance_die 2 "repl: no run directory; set SEANCE_RUN_DIR or run under CBSD"
-            _rundir=${_lock%/*}
-            mkdir -p "${_rundir}" || seance_die 1 "repl: cannot create ${_rundir}"
-
-            lockf -s -t 0 "${_lock}" "${SEANCE_ROOT}/bin/seance" repl \
-                --guest "${_guest}" --peer "${_peer}" --locked < /dev/null
+            repl_run_pair "${_guest}" "${_peer}" "${_home}" "${_now}" \
+                "${_dry}" "${_locked}"
             _rc=$?
 
             case "${_rc}" in
-                0)
-                    _ok=$(( _ok + 1 ))
-                    ;;
+                0) _ok=$(( _ok + 1 )) ;;
                 "${REPL_RC_LOCKED}")
                     seance_log notice "repl ${_guest}->${_peer}: another tick holds this pair; skipped"
                     _busy=$(( _busy + 1 ))
                     ;;
-                *)
-                    _failed=$(( _failed + 1 ))
-                    ;;
+                *) _failed=$(( _failed + 1 )) ;;
+            esac
+
+            case " ${_syspeers} " in
+                *" ${_peer} "*) ;;
+                *) _syspeers="${_syspeers} ${_peer}" ;;
             esac
         done
     done
+    _syspeers=${_syspeers# }
+
+    # --- the configuration mirror (D-82) ----------------------------------
+    #
+    # It rides after the guests, and only after them, because it has to contain
+    # every guest whose configuration was mirrored above before it is
+    # snapshotted. It goes to the union of the peers the guests went to: a peer
+    # that will one day have to promote a guest needs that guest's
+    # configuration, and which peer that is is the succession map's answer, not
+    # a second one kept here.
+    #
+    # ITS COUNTS ARE ITS OWN. The mirror is not a guest, and folding its pairs
+    # into "N guests x M pairs" makes that line arithmetically false -- one
+    # guest and four pairs is not something a reader can check. So it gets a
+    # line of its own, printed BEFORE the verdict line, which stays the verdict
+    # line and stays about guests.
+    _syspairs=0
+    _sysok=0
+    _sysfailed=0
+    _sysbusy=0
+
+    if [ -n "${_syspeers}" ] && [ "${_dry}" -eq 0 ] && [ "${_locked}" -eq 0 ]; then
+        if ! repl_sys_snapshot "${_home}" "${_ts}"; then
+            _sysfailed=$(( _sysfailed + 1 ))
+        else
+            for _peer in ${_syspeers}; do
+                _syspairs=$(( _syspairs + 1 ))
+
+                repl_run_pair "${REPL_SYS_GUEST}" "${_peer}" "${_home}" \
+                    "${_now}" 0 0
+                _rc=$?
+
+                case "${_rc}" in
+                    0) _sysok=$(( _sysok + 1 )) ;;
+                    "${REPL_RC_LOCKED}")
+                        seance_log notice "repl ${REPL_SYS_GUEST}->${_peer}: another tick holds this pair; skipped"
+                        _sysbusy=$(( _sysbusy + 1 ))
+                        ;;
+                    *) _sysfailed=$(( _sysfailed + 1 )) ;;
+                esac
+            done
+        fi
+    fi
 
     # A filter that matched nothing is a contract error, not a quiet success.
     # 'seance repl --guest webd01' with the name mistyped would otherwise print
@@ -1240,9 +1648,14 @@ repl_tick()
         return 1
     fi
 
+    if [ "${_syspairs}" -gt 0 ] || [ "${_sysfailed}" -gt 0 ]; then
+        printf 'repl: configuration mirror: %d pairs, %d ok, %d failed, %d in progress\n' \
+            "${_syspairs}" "${_sysok}" "${_sysfailed}" "${_sysbusy}"
+    fi
+
     printf 'repl: %d guests x %d pairs, %d ok, %d failed, %d skipped, %d in progress\n' \
         "${_guests}" "${_pairs}" "${_ok}" "${_failed}" "${_skipped}" "${_busy}"
 
-    [ "${_failed}" -eq 0 ] && return 0
+    [ "${_failed}" -eq 0 ] && [ "${_sysfailed}" -eq 0 ] && return 0
     return 1
 }

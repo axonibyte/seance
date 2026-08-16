@@ -23,8 +23,34 @@ automatic.
        cbsd seance version
        cbsd help | grep seance
 
+Two more steps before this node can take part in a succession. Neither is
+automatic either, and a node missing them looks healthy while being useless
+at exactly the wrong moment.
+
+  4. Put the dispatcher on the mesh's PATH. One node runs "seance placement"
+     on another over ssh, and an ssh session gets the login PATH rather than
+     any shell's:
+
+       ln -s /usr/local/cbsd/modules/seance.d/bin/seance /usr/local/bin/seance
+       ssh <peer> seance placement
+
+     Without it every peer reads as silent, and a boot gate that hears silence
+     from every peer withholds the whole estate -- correct behaviour arriving
+     for the wrong reason.
+
+  5. Install and enable the boot gate, which withholds any guest a living peer
+     still claims BEFORE the estate autostarts. It is disabled by default:
+
+       cp /usr/local/cbsd/modules/seance.d/rc.d/seance_gate /usr/local/etc/rc.d/
+       sysrc seance_gate_enable=YES
+       service seance_gate onestart
+
+     Try it now rather than discovering at the next reboot that it was never
+     enabled. docs/RUNBOOK-failback.md is what to read when a node comes back.
+
 To undo: remove the "seance.d" line from ~cbsd/etc/modules.conf and re-run the
-initialisation. Stage 8 removes the symlink and clears the inventory flag.
+initialisation. Stage 8 removes the symlink and clears the inventory flag; the
+symlink from step 4 and the rc unit from step 5 are removed by hand.
 
 Note: if this directory is a symlink rather than a real directory, every verb
 still works, but "cbsd module mode=list" will not show seance -- it enumerates

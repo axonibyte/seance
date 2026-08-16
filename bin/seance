@@ -34,8 +34,14 @@ readonly SEANCE_ROOT
 # shellcheck source=../lib/transport.subr
 . "${SEANCE_ROOT}/lib/transport.subr"
 # shellcheck source-path=SCRIPTDIR
+# shellcheck source=../lib/notify.subr
+. "${SEANCE_ROOT}/lib/notify.subr"
+# shellcheck source-path=SCRIPTDIR
 # shellcheck source=../lib/zfs.subr
 . "${SEANCE_ROOT}/lib/zfs.subr"
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=../lib/lineage.subr
+. "${SEANCE_ROOT}/lib/lineage.subr"
 # shellcheck source-path=SCRIPTDIR
 # shellcheck source=../lib/repl.subr
 . "${SEANCE_ROOT}/lib/repl.subr"
@@ -45,6 +51,15 @@ readonly SEANCE_ROOT
 # shellcheck source-path=SCRIPTDIR
 # shellcheck source=../lib/verify.subr
 . "${SEANCE_ROOT}/lib/verify.subr"
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=../lib/gate.subr
+. "${SEANCE_ROOT}/lib/gate.subr"
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=../lib/promote.subr
+. "${SEANCE_ROOT}/lib/promote.subr"
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=../lib/failback.subr
+. "${SEANCE_ROOT}/lib/failback.subr"
 
 # The adapter: everything that knows what a guest is on this host. One file,
 # selected by $SEANCE_ADAPTER so that the pseudo-cluster and the conformance
@@ -96,6 +111,19 @@ Verbs:
   verify [--render cron]
                      render the configuration seance expects and diff it
                      against reality; never writes anything
+  promote <deadnode> [--force[=<rung>,...]] [--guest <g>]
+                     walk the succession ladder for a dead node's estate.
+                     Forceable rungs: quorum, fence, lineage, kernel.
+  failback <guest> [--discard-origin-writes]
+                     bring a guest home; run this on the guest's home node
+  failback-assist <guest> <stop|start|snapshot|unregister|release>
+                     internal: the interim host's half of a failback
+  gate [--check] [--release <guest>]
+                     the resurrection gate: withhold any guest a living peer
+                     still claims, and the whole estate if none answers
+  placement [--remote]
+                     print which guests this node hosts away from home;
+                     --remote gathers the same from the living peers
   config [--check] [--file <path>]
                      print the effective configuration; --check validates it
                      and prints one line per problem
@@ -231,6 +259,159 @@ seance_verify()
     verify_report
 }
 
+# seance_promote <deadnode> [--force[=rung,...]] [--guest <g>]
+#
+# The succession ladder (lib/promote.subr). --force names the rungs it skips
+# and every skipped rung says so in its own line, so "force skips exactly the
+# rungs it names" is readable in the log rather than promised in a comment.
+seance_promote()
+{
+    local _dead _guest _forced
+
+    _dead=""
+    _guest=""
+    _forced=0
+    PROMOTE_FORCE=""
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --force)
+                promote_parse_force "" || exit 2
+                _forced=1
+                ;;
+            --force=*)
+                promote_parse_force "${1#--force=}" || exit 2
+                _forced=1
+                ;;
+            --guest)
+                [ $# -ge 2 ] || seance_die 2 "promote: --guest needs a guest name"
+                _guest=$2
+                shift
+                ;;
+            --guest=*) _guest=${1#--guest=} ;;
+            -*) seance_die 2 "promote: unknown argument: $1" ;;
+            *)
+                [ -z "${_dead}" ] ||
+                    seance_die 2 "promote: more than one node named: ${_dead} and $1"
+                _dead=$1
+                ;;
+        esac
+        shift
+    done
+
+    [ -n "${_dead}" ] || seance_die 2 "promote: which node died? usage: seance promote <node>"
+    [ "${_forced}" -eq 1 ] || PROMOTE_FORCE=""
+
+    seance_load_conf
+    seance_adapter_init
+    seance_tmp_init
+
+    promote_run "${_dead}" "${_guest}"
+}
+
+# seance_failback <guest> [--discard-origin-writes]
+seance_failback()
+{
+    local _guest _discard
+
+    _guest=""
+    _discard=0
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --discard-origin-writes) _discard=1 ;;
+            -*) seance_die 2 "failback: unknown argument: $1" ;;
+            *)
+                [ -z "${_guest}" ] ||
+                    seance_die 2 "failback: more than one guest named: ${_guest} and $1"
+                _guest=$1
+                ;;
+        esac
+        shift
+    done
+
+    [ -n "${_guest}" ] ||
+        seance_die 2 "failback: which guest? usage: seance failback <guest>"
+
+    seance_load_conf
+    seance_adapter_init
+    seance_tmp_init
+
+    failback_run "${_guest}" "${_discard}"
+}
+
+# seance_failback_assist <guest> <op>
+#
+# INTERNAL. The interim host's half of a failback, invoked over the mesh by the
+# origin. Documented because an operator finishing a half-failed failback by
+# hand needs it, not because anybody should reach for it otherwise.
+seance_failback_assist()
+{
+    [ $# -eq 2 ] ||
+        seance_die 2 "failback-assist: usage: seance failback-assist <guest> <stop|start|snapshot|unregister|release>"
+
+    seance_load_conf
+    seance_adapter_init
+    seance_tmp_init
+
+    failback_assist "$1" "$2"
+}
+
+# seance_gate [--check] [--release <guest>]
+seance_gate()
+{
+    local _mode
+
+    _mode=act
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --check) _mode=check ;;
+            --release)
+                [ $# -ge 2 ] || seance_die 2 "gate: --release needs a guest name"
+                _mode="release:$2"
+                shift
+                ;;
+            --release=*) _mode="release:${1#--release=}" ;;
+            *) seance_die 2 "gate: unknown argument: $1" ;;
+        esac
+        shift
+    done
+
+    seance_load_conf
+    seance_adapter_init
+    seance_tmp_init
+
+    gate_run "${_mode}"
+}
+
+# seance_placement [--remote]
+seance_placement()
+{
+    local _remote
+
+    _remote=0
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --remote) _remote=1 ;;
+            *) seance_die 2 "placement: unknown argument: $1" ;;
+        esac
+        shift
+    done
+
+    seance_load_conf
+    seance_tmp_init
+
+    # The LOCAL answer deliberately needs no adapter: this is the verb every
+    # peer runs over ssh to answer "are you holding one of mine", and a node
+    # whose CBSD is not up must still be able to say so. --remote needs to know
+    # which node it is, which is the adapter's fact.
+    [ "${_remote}" -eq 1 ] && seance_adapter_init
+
+    placement_report "${_remote}"
+}
+
 # seance_version
 #
 # Print "seance <version>" and nothing else -- this verb is data, not a report,
@@ -362,6 +543,26 @@ case "${_verb}" in
         ;;
     verify)
         seance_verify "$@"
+        exit $?
+        ;;
+    promote)
+        seance_promote "$@"
+        exit $?
+        ;;
+    failback)
+        seance_failback "$@"
+        exit $?
+        ;;
+    failback-assist)
+        seance_failback_assist "$@"
+        exit $?
+        ;;
+    gate)
+        seance_gate "$@"
+        exit $?
+        ;;
+    placement)
+        seance_placement "$@"
         exit $?
         ;;
     config)

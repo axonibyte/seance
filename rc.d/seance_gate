@@ -1,0 +1,140 @@
+#!/bin/sh
+#
+# PROVIDE: seance_gate
+# REQUIRE: FILESYSTEMS NETWORKING
+# BEFORE: cbsdd
+# KEYWORD: nojail
+#
+# seance_gate_enable="YES"
+# seance_gate_program="/path/to/modules/seance.d/bin/seance"
+#
+# The resurrection gate (design §8, decision D-21). Before the platform's
+# autostart runs, this asks every LIVING peer whether it already claims one of
+# this node's guests, and withholds any guest that is claimed -- and the WHOLE
+# estate if not one peer answers.
+#
+# WHY BEFORE cbsdd, AND NOT BEFORE ANYTHING ELSE. The platform's autostart is
+# not an rc(8) unit of its own: rc.d/jails-astart has no PROVIDE line and is
+# never run by rc(8). It is started from inside cbsdd's own prestart --
+# rc.d/cbsdd's cbsdd_prestart() ends with
+#
+#     ${miscdir}/daemonize ${CIX_BIN} ${rcddir}/jails-astart start
+#
+# -- so the only ordering that gets in front of the estate coming up is
+# BEFORE: cbsdd. rc.d/cbsdd's own header is
+#
+#     # PROVIDE: cbsdd
+#     # REQUIRE: LOGIN FILESYSTEMS cleanvar sshd
+#     # KEYWORD: shutdown
+#
+# (read from the installed 15.0.9 tree), which is where FILESYSTEMS comes from
+# here; NETWORKING is this unit's own requirement, because a gate that cannot
+# reach a peer must be able to tell "nobody answered" from "the network is not
+# up yet", and rc(8) is the only thing that can promise the difference.
+#
+# THIS UNIT CANNOT VETO ANYTHING BY FAILING. rc(8) does not stop later services
+# when one exits non-zero, so the gate does not try to say "no" -- it marks each
+# withheld guest in the platform's own database (slave mode), which the start
+# paths refuse and the autostart ordering skips, and which survives the reboot
+# it was written for. A non-zero exit here is a loud log line, not a lever.
+#
+# Disabled by default. A unit that began withholding guests the moment the
+# module landed on a node would be a surprise, and surprises are what this
+# whole project is a reaction to.
+#
+# shellcheck shell=sh
+# shellcheck disable=SC2034
+#   name, rcvar, start_cmd and stop_cmd are read by rc.subr, not by this file.
+# shellcheck disable=SC1091,SC1094
+#   /etc/rc.subr is the base system's: there is no fixed source path to follow,
+#   it is not written for -s sh, and it is not ours to check. Every rc(8) unit
+#   on the system sources it.
+# shellcheck disable=SC2154
+#   ${seance_gate_enable}, ${seance_gate_program} and ${cbsd_workdir} are set
+#   by load_rc_config out of rc.conf, which is the whole mechanism of an rc(8)
+#   unit.
+# shellcheck disable=SC3043
+#   'local' is not in POSIX sh but is implemented by FreeBSD /bin/sh (sh(1),
+#   "local"); seance targets FreeBSD sh and nothing else (handoff §5).
+
+. /etc/rc.subr
+
+name=seance_gate
+rcvar=seance_gate_enable
+
+load_rc_config $name
+
+: "${seance_gate_enable:=NO}"
+: "${seance_gate_program:=}"
+
+start_cmd="seance_gate_start"
+stop_cmd=":"
+
+# seance_gate_find_program
+#
+# Where the dispatcher is, when rc.conf did not say. The module directory is
+# resolved through the verb symlink the platform's own initialisation plants in
+# ${workdir}/modules/ -- so this unit learns the path from the same place the
+# operator installed it, rather than carrying a compiled-in guess that would be
+# wrong on any node with a different workdir.
+seance_gate_find_program()
+{
+    local _link _dir
+
+    [ -n "${seance_gate_program}" ] && return 0
+
+    # Set in rc.conf for the platform's own daemon; this unit only reads it.
+    [ -n "${cbsd_workdir:-}" ] || return 1
+
+    _link="${cbsd_workdir}/modules/seance"
+    [ -e "${_link}" ] || return 1
+
+    _dir=$( realpath "${_link}" 2>/dev/null ) || return 1
+    _dir=${_dir%/*}
+
+    [ -x "${_dir}/bin/seance" ] || return 1
+
+    seance_gate_program="${_dir}/bin/seance"
+    return 0
+}
+
+seance_gate_start()
+{
+    local _rc
+
+    if ! seance_gate_find_program; then
+        warn "${name}: cannot find the seance dispatcher." \
+            "Set seance_gate_program in rc.conf. THE ESTATE HAS NOT BEEN GATED."
+        logger -t seance -p daemon.crit -- \
+            "seance_gate: dispatcher not found; the estate has NOT been gated"
+        return 1
+    fi
+
+    echo "Gating this node's estate before the platform's autostart."
+
+    "${seance_gate_program}" gate
+    _rc=$?
+
+    case "${_rc}" in
+        0)
+            echo "${name}: nothing withheld."
+            ;;
+        1)
+            # The fail-safe firing is not an error: it is the unit doing its
+            # job. It is still said loudly, because an estate that did not come
+            # up is the first thing anybody will ask about.
+            echo "${name}: guests were WITHHELD -- see the log and run" \
+                "'seance placement --remote' before releasing anything."
+            ;;
+        *)
+            warn "${name}: the gate could not run (exit ${_rc})." \
+                "THE ESTATE HAS NOT BEEN GATED."
+            logger -t seance -p daemon.crit -- \
+                "seance_gate: exit ${_rc}; the estate has NOT been gated"
+            ;;
+    esac
+
+    return "${_rc}"
+}
+
+run_rc_command "$1"

@@ -268,6 +268,22 @@ done
 
 t_is "${LOCKED}" "yes" "the first tick is holding the web01->bravo lock"
 
+# THE PREMISE OF THE SNAPSHOT ASSERTION BELOW, MADE TRUE RATHER THAN HOPED FOR.
+# "Two ticks a second apart took two instants" is only a statement about the
+# lock if the two ticks really are in different seconds; land them both in one
+# and D-87 is what gets measured instead -- the second tick finds the instant
+# already taken, replicates it, and there is one new snapshot rather than two.
+# Nothing here enforced that, so the assertion turned on where a second
+# boundary happened to fall relative to how long the first tick takes to reach
+# the lock. It failed the moment M2 put a little more work in front of that
+# (the configuration mirror, D-82), which is the test telling the truth about
+# itself. Waiting out the current second costs at most a second and makes the
+# sentence the assertion is written in true.
+_conc_second=$( date -u +%s )
+while [ "$( date -u +%s )" = "${_conc_second}" ]; do
+    sleep 0.1
+done
+
 SECOND=$( node_seance alpha repl --now 2>&1 )
 SECOND_RC=$?
 

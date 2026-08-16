@@ -1,0 +1,233 @@
+# seance -- the M2 tier-6 world: three nodes, an estate, and seance installed.
+#
+# Sourced by tests/tier6/t_promote.sh, t_failback.sh, t_resurrection.sh and
+# t_hostile.sh. Every tier-6 stage is individually runnable (D-25), so each of
+# them has to build its own world -- and four copies of that world would be
+# four chances for the stages to drift into testing different things. This is
+# the one copy.
+#
+# What it builds:
+#
+#   * a three-node pseudo-cluster (cluster_up 3): alpha, bravo, charlie;
+#   * ONE configuration file, byte-identical on every node, succession ring
+#     alpha -> bravo -> charlie -> alpha, with a fence driver configured for
+#     every node so the ladder's rung 4 is real;
+#   * /usr/local/bin/seance on every node -- a wrapper carrying the node's
+#     seance environment. It has to be on PATH and not merely present, because
+#     `seance placement` is what one node runs on another over ssh, and an ssh
+#     session gets the login PATH rather than anybody's shell;
+#   * the fence driver on every node's PATH, and its host-side helper;
+#   * an estate on alpha: web01 (a jail) and db01 (a VM), each with a child
+#     dataset and a marker file, so that a promotion has a tree to mount and
+#     something to have carried.
+#
+# shellcheck shell=sh
+# shellcheck disable=SC3043
+#   'local' is not in POSIX sh but is implemented by FreeBSD /bin/sh (sh(1),
+#   "local"); seance targets FreeBSD sh and nothing else (handoff §5).
+
+ESTATE_TAB=$( printf '\t.' )
+ESTATE_TAB=${ESTATE_TAB%.}
+
+ESTATE_ADAPTER="/usr/local/seance/tests/cluster/adapter-pseudo.subr"
+ESTATE_BIN="/usr/local/seance/bin/seance"
+
+# node_seance <node> <args...>
+#
+# Run a seance verb inside a node, through the same wrapper a peer reaches over
+# ssh. </dev/null because the verbs start ssh, and a caller inside a read loop
+# would otherwise lose its input to it (D-24).
+node_seance()
+{
+    local _n
+
+    _n=$1
+    shift
+
+    cluster_exec "${_n}" /usr/local/bin/seance "$@" < /dev/null
+}
+
+# node_sh <node> <shell-command...>  -- one command inside a node, with the
+# seance environment set, for the fixture work the adapter owns.
+node_sh()
+{
+    local _n
+
+    _n=$1
+    shift
+
+    cluster_exec "${_n}" env \
+        SEANCE_CONF=/etc/seance.conf \
+        SEANCE_STATE_DIR=/var/db/seance \
+        SEANCE_RUN_DIR=/var/run/seance \
+        "SEANCE_ADAPTER=${ESTATE_ADAPTER}" \
+        sh -c "$*" < /dev/null
+}
+
+# nz <node> <zfs args...>  -- zfs inside a node, stdin closed.
+nz()
+{
+    local _n
+
+    _n=$1
+    shift
+
+    cluster_exec "${_n}" zfs "$@" < /dev/null
+}
+
+# estate_guest_create <node> <guest> <type> <home>
+estate_guest_create()
+{
+    node_sh "$1" ". ${ESTATE_ADAPTER}; adapter_init && pseudo_guest_create $2 $3 $4"
+}
+
+# estate_replica_root <peer> <homekey> <guest>
+estate_replica_root()
+{
+    printf '%s/standby/%s/%s\n' "$( cluster_dataset "$1" )" "$2" "$3"
+}
+
+# estate_write_conf <path>
+#
+# The one configuration file. A fence driver for every node, because a ladder
+# whose rung 4 has nothing to call is a ladder with a rung missing.
+estate_write_conf()
+{
+    local _out
+
+    _out=$1
+
+    cat > "${_out}" <<EOF
+cadence=60
+retention_recent=14400
+retention_hourly=172800
+skew_tolerance=120
+fence_timeout=90
+ssh_user=root
+ssh_port=22
+ssh_extra_opts=-i /root/.ssh/id_ed25519 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR
+standby_root=$( cluster_base_dataset )/%n/standby
+
+node_alpha_nodename=alpha
+node_alpha_mgmt=$( cluster_ip alpha )
+node_alpha_heir=bravo
+node_alpha_heir2=charlie
+node_alpha_fence_driver=jail
+node_alpha_fence_target=alpha
+
+node_bravo_nodename=bravo
+node_bravo_mgmt=$( cluster_ip bravo )
+node_bravo_heir=charlie
+node_bravo_heir2=alpha
+node_bravo_fence_driver=jail
+node_bravo_fence_target=bravo
+
+node_charlie_nodename=charlie
+node_charlie_mgmt=$( cluster_ip charlie )
+node_charlie_heir=alpha
+node_charlie_heir2=bravo
+node_charlie_fence_driver=jail
+node_charlie_fence_target=charlie
+EOF
+}
+
+# estate_install_wrapper <node>
+#
+# /usr/local/bin/seance: the node's seance, with the node's environment, on a
+# path an ssh session will find. This is the mesh prerequisite README and
+# docs/RUNBOOK-failback.md name; the pseudo-cluster satisfies it the same way a
+# real node would, with a link on PATH rather than with a special case in
+# seance.
+estate_install_wrapper()
+{
+    local _root
+
+    _root=$( cluster_root "$1" ) || return 1
+
+    mkdir -p "${_root}/usr/local/bin" || return 1
+
+    cat > "${_root}/usr/local/bin/seance" <<EOF
+#!/bin/sh
+exec env SEANCE_CONF=/etc/seance.conf \\
+    SEANCE_STATE_DIR=/var/db/seance \\
+    SEANCE_RUN_DIR=/var/run/seance \\
+    SEANCE_ADAPTER=${ESTATE_ADAPTER} \\
+    ${ESTATE_BIN} "\$@"
+EOF
+
+    chmod 0755 "${_root}/usr/local/bin/seance" || return 1
+    return 0
+}
+
+# estate_up
+#
+# Build the whole world. Returns 0 when every node is up, configured, carrying
+# seance and the fence driver, and alpha has an estate with lineage on both of
+# its heirs.
+estate_up()
+{
+    local _n _conf _list
+
+    cluster_up 3 || return 1
+
+    _list=$( cluster_nodes ) || return 1
+
+    _conf=$( t_tmpdir )/seance.conf
+    estate_write_conf "${_conf}" || return 1
+
+    for _n in ${_list}; do
+        cp "${_conf}" "$( cluster_root "${_n}" )/etc/seance.conf" || return 1
+        mkdir -p "$( cluster_root "${_n}" )/usr/local/etc/cron.d" || return 1
+        estate_install_wrapper "${_n}" || return 1
+    done
+
+    fence_install || return 1
+    t_at_exit 'fence_uninstall'
+
+    estate_guest_create alpha web01 jail alpha || return 1
+    estate_guest_create alpha db01 bhyve alpha || return 1
+
+    nz alpha create "$( cluster_dataset alpha )/web01/data" || return 1
+    nz alpha create "$( cluster_dataset alpha )/db01/data" || return 1
+
+    node_sh alpha 'echo web01-v1 > /seance/web01/marker' || return 1
+    node_sh alpha 'echo web01-child-v1 > /seance/web01/data/marker' || return 1
+    node_sh alpha 'echo db01-v1 > /seance/db01/marker' || return 1
+
+    return 0
+}
+
+# estate_replicate  -- one tick on alpha, with the cadence gate ignored.
+estate_replicate()
+{
+    node_seance alpha repl --now
+}
+
+# estate_reboot <node>  -- start a node the way a node comes back.
+#
+# cluster_start alone is not a reboot. The pseudo adapter's "running" field is a
+# RECORD rather than a process, so a node whose jail is restarted still claims
+# to be running the estate it was running when it died -- and a returning node
+# that claims to be running its estate is a fiction the gate would then be
+# tested against. A real node that has just booted is running nothing until its
+# autostart says otherwise, which is precisely the instant the gate exists for.
+#
+# The record is edited from the guest host, through the node's jail root, so
+# that the node's own seance is never asked to lie about itself.
+estate_reboot()
+{
+    local _root _db
+
+    cluster_start "$1" || return 1
+
+    _root=$( cluster_root "$1" ) || return 1
+    _db="${_root}/var/db/seance-pseudo/guests.tsv"
+
+    [ -r "${_db}" ] || return 0
+
+    awk -F '\t' -v OFS='\t' 'NF >= 6 { $5 = 0 } { print }' "${_db}" \
+        > "${_db}.boot" || return 1
+    mv "${_db}.boot" "${_db}" || return 1
+
+    return 0
+}
