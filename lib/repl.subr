@@ -70,79 +70,9 @@ REPL_DS_SAFE='abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.:/
 REPL_TAB=$( printf '\t.' )
 REPL_TAB=${REPL_TAB%.}
 
-# ---------------------------------------------------------------------------
-# Paths and node facts
-#
-# RELOCATION NOTE: seance_state_dir, seance_run_dir, seance_self_key and
-# seance_peer_addr are not replication concepts -- status and verify use them
-# too. They live here because lib/common.subr belonged to another unit while
-# this one was written. The state and run directories belong in common.subr
-# beside the other path discipline; the two key lookups belong beside
-# conf_self_key. Moving them is a cut, a paste and a re-source.
-# ---------------------------------------------------------------------------
-
-# seance_state_dir  -- where seance keeps what it must remember across ticks.
-#
-# $SEANCE_STATE_DIR wins (D-3: it is how the tiers and the pseudo-cluster point
-# seance at a directory of their own), then CBSD's workdir. rc 1 when neither
-# is available: guessing is how a node ends up writing its lag records
-# somewhere nobody looks.
-seance_state_dir()
-{
-    if [ -n "${SEANCE_STATE_DIR:-}" ]; then
-        printf '%s\n' "${SEANCE_STATE_DIR}"
-        return 0
-    fi
-
-    if [ -n "${SEANCE_CBSD_WORKDIR:-}" ]; then
-        printf '%s/var/db/seance\n' "${SEANCE_CBSD_WORKDIR}"
-        return 0
-    fi
-
-    return 1
-}
-
-# seance_run_dir  -- where seance keeps what dies with the boot: the locks.
-seance_run_dir()
-{
-    if [ -n "${SEANCE_RUN_DIR:-}" ]; then
-        printf '%s\n' "${SEANCE_RUN_DIR}"
-        return 0
-    fi
-
-    if [ -n "${SEANCE_CBSD_WORKDIR:-}" ]; then
-        printf '%s/var/run/seance\n' "${SEANCE_CBSD_WORKDIR}"
-        return 0
-    fi
-
-    return 1
-}
-
-# seance_self_key  -- this node's config key, from the adapter's node name.
-#
-# rc 1 when no node block claims this host: a hard failure everywhere it is
-# asked (D-4), because a node that cannot find itself cannot name its own
-# snapshots, and a snapshot nobody can attribute is not a wire protocol.
-seance_self_key()
-{
-    local _nn
-
-    _nn=$( adapter_node_self ) || return 1
-    [ -n "${_nn}" ] || return 1
-
-    conf_self_key "${_nn}"
-}
-
-# seance_peer_addr <nodekey>  -- the address peers reach that node on.
-seance_peer_addr()
-{
-    local _a
-
-    _a=$( conf_get "node_${1:?}_mgmt" "" )
-    [ -n "${_a}" ] || return 1
-
-    printf '%s\n' "${_a}"
-}
+# seance_state_dir, seance_run_dir, seance_self_key and seance_peer_addr --
+# used throughout this file but not replication concepts (status and verify
+# use them too) -- live in lib/common.subr, sourced before this file.
 
 # repl_ds_safe <name>  -- rc 0 if the name may be interpolated into a command
 # string destined for a peer's shell.
@@ -162,23 +92,33 @@ repl_ds_safe()
 
 # repl_standby_root <peer-nodekey>
 #
-# The dataset under which <peer> keeps other nodes' replicas.
+# The dataset under which <peer> keeps other nodes' replicas. Three-step
+# precedence (Decision D-67, superseding D-59's rejected alternative now that
+# lib/conf.subr is open):
 #
-# The configured value is used verbatim, except that the token %n is replaced
-# by the node key of the node that OWNS that standby root -- the peer. A fleet
-# whose nodes have identical pool layouts writes `standby_root=<pool>/standby`
-# and never meets %n; a fleet whose nodes do not (different pool names, or a
-# per-node subtree, as the pseudo-cluster has) writes
-# `standby_root=tank/state/seance/%n/standby` and still keeps ONE configuration
-# file across the mesh -- which is the invariant `verify` enforces and which a
-# per-node value would break. (Decision D-59.)
+#   1. node_<peer>_standby_root, if <peer> has one, used verbatim -- the peer
+#      owns its own layout and is best placed to say where its replicas live.
+#   2. otherwise the fleet standby_root, with %n replaced by <peer>'s node key.
+#      A fleet whose nodes have identical pool layouts writes
+#      `standby_root=<pool>/standby` and never meets %n; a fleet whose nodes do
+#      not (different pool names, or a per-node subtree, as the pseudo-cluster
+#      has) writes `standby_root=tank/state/seance/%n/standby` and still keeps
+#      ONE configuration file across the mesh -- which is the invariant
+#      `verify` enforces and which a per-node value alone would break.
+#   3. otherwise rc 1: the caller derives (repl_standby_root_derived).
 #
-# rc 1 when the key is unset; the caller then derives.
+# rc 1 when neither key is set; the caller then derives.
 repl_standby_root()
 {
     local _peer _v _out _rest
 
     _peer=${1:?}
+
+    _v=$( conf_get "node_${_peer}_standby_root" "" )
+    if [ -n "${_v}" ]; then
+        printf '%s\n' "${_v}"
+        return 0
+    fi
 
     _v=$( conf_get standby_root "" )
     [ -n "${_v}" ] || return 1

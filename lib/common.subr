@@ -1,8 +1,10 @@
 # seance -- common helpers.
 #
-# Sourced, never executed. Nothing here knows anything about CBSD, ZFS or the
-# host: this file is logging, exit discipline, temporary directories and the
-# RC-capture pattern, and it stays that small.
+# Sourced, never executed. Logging, exit discipline, temporary directories and
+# the RC-capture pattern, plus the state/run directory and node-identity
+# lookups that repl, status and verify all share (D-3, D-4) -- nothing here
+# talks to CBSD or ZFS directly; the identity lookups defer to the adapter and
+# to lib/conf.subr for that.
 #
 # shellcheck shell=sh
 # shellcheck disable=SC3043
@@ -194,4 +196,83 @@ seance_tmp_cleanup()
 
     rm -f "${SEANCE_TMP_REGISTRY}"
     return 0
+}
+
+# ---------------------------------------------------------------------------
+# State and run directories
+#
+# Not CBSD, ZFS or replication concepts -- repl, status and verify all need
+# to know where seance keeps what it must remember, so the lookup lives here
+# rather than being duplicated three times or owned by one of the three.
+# ---------------------------------------------------------------------------
+
+# seance_state_dir  -- where seance keeps what it must remember across ticks.
+#
+# $SEANCE_STATE_DIR wins (D-3: it is how the tiers and the pseudo-cluster point
+# seance at a directory of their own), then CBSD's workdir. rc 1 when neither
+# is available: guessing is how a node ends up writing its lag records
+# somewhere nobody looks.
+seance_state_dir()
+{
+    if [ -n "${SEANCE_STATE_DIR:-}" ]; then
+        printf '%s\n' "${SEANCE_STATE_DIR}"
+        return 0
+    fi
+
+    if [ -n "${SEANCE_CBSD_WORKDIR:-}" ]; then
+        printf '%s/var/db/seance\n' "${SEANCE_CBSD_WORKDIR}"
+        return 0
+    fi
+
+    return 1
+}
+
+# seance_run_dir  -- where seance keeps what dies with the boot: the locks.
+seance_run_dir()
+{
+    if [ -n "${SEANCE_RUN_DIR:-}" ]; then
+        printf '%s\n' "${SEANCE_RUN_DIR}"
+        return 0
+    fi
+
+    if [ -n "${SEANCE_CBSD_WORKDIR:-}" ]; then
+        printf '%s/var/run/seance\n' "${SEANCE_CBSD_WORKDIR}"
+        return 0
+    fi
+
+    return 1
+}
+
+# ---------------------------------------------------------------------------
+# Node identity
+#
+# Beside conf_self_key's own use (lib/conf.subr stays pure parsing: it can
+# tell you which configured key names a given CBSD nodename, but not which
+# nodename this host answers to -- that is the adapter's fact, not config's).
+# ---------------------------------------------------------------------------
+
+# seance_self_key  -- this node's config key, from the adapter's node name.
+#
+# rc 1 when no node block claims this host: a hard failure everywhere it is
+# asked (D-4), because a node that cannot find itself cannot name its own
+# snapshots, and a snapshot nobody can attribute is not a wire protocol.
+seance_self_key()
+{
+    local _nn
+
+    _nn=$( adapter_node_self ) || return 1
+    [ -n "${_nn}" ] || return 1
+
+    conf_self_key "${_nn}"
+}
+
+# seance_peer_addr <nodekey>  -- the address peers reach that node on.
+seance_peer_addr()
+{
+    local _a
+
+    _a=$( conf_get "node_${1:?}_mgmt" "" )
+    [ -n "${_a}" ] || return 1
+
+    printf '%s\n' "${_a}"
 }

@@ -36,10 +36,11 @@ what M2 adds here, together with the two live assertions M0 and M1 left
 UNVERIFIED:
 
   * a real jail in slave mode refuses `cbsd jstart` (decision D-21);
-  * `cbsd jstatus jname=<n>` for a guest that EXISTS exits 1 and prints its
-    jid (docs/cbsd-module-notes.md §6 records the absent case only, and
-    lib/adapter.subr's adapter_guest_running is built on the inverted exit
-    code that claim implies).
+  * `cbsd jstatus jname=<n> invert=1` (what `adapter_guest_running` actually
+    calls, D-47) for a guest that EXISTS exits 0 and prints its jid
+    (docs/cbsd-module-notes.md §6 has the source-level argument for this and
+    marks it UNVERIFIED live until this tier; M0 had no guest to run it
+    against).
 
 Substrate note from M0, binding on this tier: `cbsd initenv` starts cbsdd,
 which holds files open under the reset dataset, so a stage here must stop

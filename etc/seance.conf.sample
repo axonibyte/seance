@@ -103,8 +103,20 @@
 #   node_<key>_heir2          the node that inherits them if the first heir is
 #                             itself unreachable.
 #   node_<key>_fence_driver   the fence driver to use against this node.
-#   node_<key>_fence_target   what to hand that driver -- a BMC address, a PDU
-#                             outlet, whatever the driver understands.
+#   node_<key>_fence_target   the name of an ENTRY the driver looks up, not an
+#                             address -- for fence_ipmi, a token of [a-z0-9]+
+#                             naming a target_<name>_* block in
+#                             ${workdir}/etc/seance-fence-ipmi.conf (host,
+#                             user and passfile live there, never here; see
+#                             docs/fence-drivers.md). Other drivers may define
+#                             their own lookup file with the same convention.
+#   node_<key>_standby_root   overrides the fleet standby_root (above) for
+#                             replicas landing on THIS node -- this node's own
+#                             opinion of its layout, and it beats the fleet
+#                             setting and the %n substitution both. Optional;
+#                             unset means the fleet standby_root (with its %n
+#                             substituted for this node's key) applies, and
+#                             failing that, the derived default.
 #
 # Fencing keys are parsed and shape-checked from v1 but are not used until the
 # fencing milestone. A display name for a node whose real name is not
@@ -121,21 +133,22 @@ node_alpha_mgmt=alpha-mgmt.example.net
 node_alpha_heir=bravo
 node_alpha_heir2=charlie
 #node_alpha_fence_driver=ipmi
-#node_alpha_fence_target=alpha-bmc.example.net
+#node_alpha_fence_target=alpha
+#node_alpha_standby_root=mypool/standby
 
 node_bravo_nodename=bravo.example.net
 node_bravo_mgmt=bravo-mgmt.example.net
 node_bravo_heir=charlie
 node_bravo_heir2=alpha
 #node_bravo_fence_driver=ipmi
-#node_bravo_fence_target=bravo-bmc.example.net
+#node_bravo_fence_target=bravo
 
 node_charlie_nodename=charlie.example.net
 node_charlie_mgmt=charlie-mgmt.example.net
 node_charlie_heir=alpha
 node_charlie_heir2=bravo
 #node_charlie_fence_driver=ipmi
-#node_charlie_fence_target=charlie-bmc.example.net
+#node_charlie_fence_target=charlie
 
 # Display names, for a node or guest whose real name is not [a-z0-9]+.
 #names_alpha=alpha.example.net

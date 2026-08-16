@@ -42,7 +42,7 @@
 # asserting against the definition and not against a copy of it. The order of
 # CONF_FLEET_KEYS is also conf_dump's order.
 CONF_FLEET_KEYS="cadence retention_recent retention_hourly staleness_max skew_tolerance debounce fence_timeout ssh_user ssh_port ssh_extra_opts standby_root notify_cmd witness"
-CONF_NODE_KEYS="nodename mgmt heir heir2 fence_driver fence_target"
+CONF_NODE_KEYS="nodename mgmt heir heir2 fence_driver fence_target standby_root"
 CONF_GUEST_KEYS="cadence staleness_max heir heir2"
 
 # Fleet keys whose value is computed from other configuration when unset.
@@ -704,6 +704,11 @@ _conf_check_node()
             _conf_problem "node ${_n}: fence_target must be a single non-empty word"
         conf_has "node_${_n}_fence_driver" ||
             _conf_problem "node ${_n}: fence_target is set without a fence_driver"
+    fi
+
+    if conf_has "node_${_n}_standby_root"; then
+        _conf_word_ok "$( conf_get "node_${_n}_standby_root" "" )" ||
+            _conf_problem "node ${_n}: standby_root must be a single non-empty word"
     fi
 }
 

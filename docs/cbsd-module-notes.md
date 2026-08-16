@@ -356,11 +356,29 @@ a comma-separated column list (default
 header, a bare argument list limits scope, and a trailing `WHERE …` is passed
 to SQL — `cbsd jls ver=15.1 WHERE astart=1`.
 
-**`cbsd jstatus jname=<absent>` exits 0 with no output.** Any claim that a
-non-zero exit means "the guest exists" is not what 15.0.9 does on this path;
-treat empty stdout as "unknown", never as "absent", and do not use the exit
-code as an existence test until it has been observed with a real guest.
-**UNVERIFIED for a guest that does exist** — the spike had none.
+**`cbsd jstatus jname=<absent>` exits 0 with no output — and the exit code IS
+a reliable existence test, un-inverted correctly.** The MYDESC line says so
+directly: "Return jail ID in output and jail existance as error code (0: no
+jail, 1: jail exist)" (`jailctl/jstatus:5`). Without `invert`, `EXIST=1
+NOT_EXIST=0` (`jailctl/jstatus:27-33`); the absent case observed live above is
+exactly that default's `NOT_EXIST=0`. seance's adapter passes `invert=1`,
+which swaps them to the ordinary sense — `EXIST=0 NOT_EXIST=1` — so under
+`invert=1` a guest that does not exist here exits 1 with no output, and a
+guest that does exits 0 and prints `${myjid}` on stdout
+(`jailctl/jstatus:41-47`). `myjid` is computed against reality, not the
+database, and by two different routes depending on guest type: for a jail,
+`get_jid` walks `cbsdjls` for a matching name and sets `myjid` to the jid it
+finds there, returning 1 (exists) or 0 (absent) (`subr/nc.subr:19-45`); for a
+bhyve VM, by the existence of `/dev/vmm/<jname>` (`subr/rcconf.subr:117-127`).
+This is what `adapter_guest_running` relies on (D-47; `lib/adapter.subr`,
+`adapter_guest_running`): a non-zero jid means running, a jid of `0` means
+present but stopped, and `invert=1`'s own `NOT_EXIST=1` means absent.
+
+**The absent case is observed live, above. The exists case is UNVERIFIED live
+until tier 5** — M0 had no guest to run it against, so everything above about
+that branch is read from source, not watched happen. `tests/tier5/README`
+names it as a required shape-B assertion: `cbsd jstatus jname=<n> invert=1`
+for a guest that EXISTS must exit 0 and print its jid.
 
 `cbsd version` prints the bare version once a workdir exists, and fails
 loudly before that:

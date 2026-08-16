@@ -47,6 +47,11 @@ node running under CBSD.
 
 ## Verbs
 
+Every verb the dispatcher answers to has a section here, and every section
+names a verb the dispatcher answers to. `tests/tier3/t_verb_docs.sh` asserts
+both directions against the source, so a verb added without a section — or a
+section left behind after a verb was removed — fails the suite.
+
 ### seance repl
 
 One replication tick, and the target of the crontab line `verify` renders. Per
@@ -140,12 +145,6 @@ seance help
 seance --help
 ```
 
-## Verbs
-
-Every verb the dispatcher answers to has a section here, and every section
-names a verb the dispatcher answers to. `tests/tier3/t_verb_docs.sh` asserts
-both directions against the source, so a verb added without a section — or a
-section left behind after a verb was removed — fails the suite.
 
 ### seance config
 
@@ -239,6 +238,17 @@ other CBSD 15.0.9 defects worth knowing before relying on any of this.
 
 `0` ok, `1` operation failed, `2` usage or contract error. stdout is data,
 stderr is diagnostics, and every verb ends in a verdict line.
+
+## Documents
+
+| Document | What it is |
+| --- | --- |
+| `DESIGN.md` | design rationale |
+| `TESTING.md` | the testing contract, tier by tier |
+| `HANDOFF.md` | the implementation brief |
+| `docs/cbsd-module-notes.md` | what M0 learned about CBSD 15.0.9, with citations |
+| `docs/repl-wire.md` | the exact `zfs send`/`recv` command lines, and the evidence for each |
+| `docs/DRILLS.md` | the fleet drills each milestone is gated on |
 
 ## License
 
