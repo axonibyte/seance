@@ -1,0 +1,96 @@
+# seance tier 6/7 stage selection.
+#
+# Sourced by every tests/tier6/t_*.sh before it does anything expensive.
+# Tier 6 is a set of named stages (TESTING.md §7) and a session is often
+# spent on one of them:
+#
+#   SEANCE_STAGES=repl,promote sh tests/run.sh
+#
+# Empty or unset means every stage. A stage that is not selected prints one
+# diagnostic and exits 0 without asserting anything, which tests/run.sh
+# counts as zero assertions and no failure.
+#
+# The one thing this must never do is skip silently because a name was
+# mistyped: an unknown stage name is a contract error (exit 2), so
+# 'SEANCE_STAGES=replication' fails the suite instead of quietly running
+# nothing and reporting PASS 0/0.
+#
+# shellcheck shell=sh
+# shellcheck disable=SC3043
+#   'local' is not in POSIX sh but is implemented by FreeBSD /bin/sh (sh(1),
+#   "local"); seance targets FreeBSD sh and nothing else (handoff §5).
+
+# Every stage name tier 6 and tier 7 may carry. Adding a stage script means
+# adding its name here; the alternative -- accepting any name -- is the typo
+# that turns a skipped suite into a green one.
+STAGE_KNOWN="substrate repl interrupt promote quorum concurrency failback resurrection hostile sim"
+
+# stage_diag <message...> -- a TAP comment, independent of the harness so
+# that the order in which a test file sources the two does not matter.
+stage_diag()
+{
+    printf '# %s\n' "$*"
+}
+
+# stage_selected <name> -- 0 if the stage should run, 1 if it should not.
+#
+# Exits 2 on an unknown name in either argument or SEANCE_STAGES.
+stage_selected()
+{
+    local _want _s _k _kk _found _list
+
+    if [ $# -ne 1 ]; then
+        echo "stage_selected: usage: stage_selected <name>" >&2
+        exit 2
+    fi
+
+    _want=$1
+
+    _found=no
+    for _k in ${STAGE_KNOWN}; do
+        [ "${_k}" = "${_want}" ] && _found=yes
+    done
+    if [ "${_found}" = "no" ]; then
+        echo "stage_selected: unknown stage name: ${_want}" \
+            "(known: ${STAGE_KNOWN})" >&2
+        exit 2
+    fi
+
+    _list=${SEANCE_STAGES:-}
+    [ -z "${_list}" ] && return 0
+
+    _found=no
+    for _s in $( printf '%s\n' "${_list}" | tr ',' ' ' ); do
+        _k=no
+        for _kk in ${STAGE_KNOWN}; do
+            [ "${_kk}" = "${_s}" ] && _k=yes
+        done
+        if [ "${_k}" = "no" ]; then
+            echo "stage_selected: unknown stage in SEANCE_STAGES: ${_s}" \
+                "(known: ${STAGE_KNOWN})" >&2
+            exit 2
+        fi
+        [ "${_s}" = "${_want}" ] && _found=yes
+    done
+
+    [ "${_found}" = "yes" ]
+}
+
+# stage_begin <name>
+#
+# Called first in a stage script: returns if the stage is selected, and
+# otherwise prints the skip diagnostic and exits 0.
+stage_begin()
+{
+    if [ $# -ne 1 ]; then
+        echo "stage_begin: usage: stage_begin <name>" >&2
+        exit 2
+    fi
+
+    if stage_selected "$1"; then
+        return 0
+    fi
+
+    stage_diag "skipped by SEANCE_STAGES"
+    exit 0
+}

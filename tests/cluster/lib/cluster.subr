@@ -1,0 +1,1026 @@
+# seance shape-A pseudo-cluster substrate.
+#
+# Sourced by tier 6/7 stage scripts, which run as root inside a reaper guest.
+# It builds N vnet jails on a private if_bridge, each with a delegated ZFS
+# dataset, an ssh mesh, and nothing of seance's own logic in it: the point of
+# this file is that the *transport* (jails, bridge, delegation, send/recv over
+# ssh) is real and proven before any policy code is asked to ride on it.
+#
+# Everything it creates lives under one directory and one dataset subtree, and
+# cluster_down removes both. reaper's holders guard protects only the dataset
+# named in [reset]; children created here are ours to destroy, which is why the
+# cleanliness contract is asserted by tests/tier6/t_substrate.sh rather than
+# assumed.
+#
+# Every function owns its exit status. Diagnostics go to stderr, data to
+# stdout, exit 0 ok / 1 operation failed / 2 usage or contract error.
+#
+# shellcheck shell=sh
+# shellcheck disable=SC3043
+#   'local' is not in POSIX sh but is implemented by FreeBSD /bin/sh (sh(1),
+#   "local"); seance targets FreeBSD sh and nothing else (handoff §5).
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+# The fictional site (charter §6): node names that are not a tenant's.
+CLUSTER_NAMES="alpha bravo charlie delta echo foxtrot"
+
+# Jail names are prefixed so that the cleanliness sweep can recognise ours
+# without a registry, and so a stray jail from an earlier crashed run is
+# visible as sn-* in jls.
+CLUSTER_JAIL_PREFIX="sn-"
+
+# TEST-NET-1 (RFC 5737), which exists precisely so documentation and test
+# fixtures need not borrow somebody's address space. The host end of the
+# bridge is .1; node i is .11 + i.
+CLUSTER_NET="192.0.2"
+CLUSTER_HOST_IP="192.0.2.1"
+CLUSTER_PREFIXLEN="24"
+
+# Read-only base directories nullfs-mounted from the guest's own userland.
+# /usr/lib32 is appended at build time when the guest has one (the reaper
+# template does not).
+CLUSTER_BASE_DIRS="/bin /sbin /lib /libexec /usr/bin /usr/sbin /usr/lib /usr/libexec /usr/share"
+
+# Where the delegated dataset appears *inside* the jail. The host sees it
+# under <root>/seance; nothing outside the jail is expected to use that path.
+CLUSTER_DS_MOUNTPOINT="/seance"
+
+# devfsrules_jail, /etc/defaults/devfs.rules ruleset 4 -- the ruleset jail(8)
+# applies by default for mount.devfs, and the one that carries 'add path zfs
+# unhide', without which zfs(8) cannot run inside the jail (zfs-jail(8),
+# "the required devfs.conf(5) entries to expose /dev/zfs").
+CLUSTER_DEVFS_RULESET="4"
+
+# ---------------------------------------------------------------------------
+# Diagnostics
+# ---------------------------------------------------------------------------
+
+cluster_diag()
+{
+    printf 'cluster: %s\n' "$*" >&2
+}
+
+cluster_fail()
+{
+    local _rc
+
+    _rc=$1
+    shift
+    printf 'cluster: FAIL: %s\n' "$*" >&2
+    return "${_rc}"
+}
+
+# ---------------------------------------------------------------------------
+# Paths and naming
+# ---------------------------------------------------------------------------
+
+# cluster_base_dir -- the directory the whole cluster lives under.
+#
+# Derived from $REAPER_STATE (the one dataset reaper rolls back) so that no
+# pool name is written down here, and overridable for a hand-driven run.
+cluster_base_dir()
+{
+    local _base
+
+    _base=${SEANCE_CLUSTER_BASE:-${REAPER_STATE:-}}
+
+    if [ -z "${_base}" ]; then
+        cluster_fail 2 "neither SEANCE_CLUSTER_BASE nor REAPER_STATE is set;" \
+            "the pseudo-cluster does not guess where it may write"
+        return 2
+    fi
+
+    printf '%s/seance\n' "${_base}"
+}
+
+# cluster_dir -- the per-cluster state directory.
+#
+# A plain directory on the reset dataset, deliberately not a child dataset:
+# if teardown ever fails outright, 'reaper reset' still removes it.
+cluster_dir()
+{
+    local _b
+
+    _b=$( cluster_base_dir ) || return $?
+    printf '%s/cluster\n' "${_b}"
+}
+
+# cluster_base_dataset -- the container dataset the per-node datasets hang off.
+cluster_base_dataset()
+{
+    local _base _ds
+
+    _base=${SEANCE_CLUSTER_BASE:-${REAPER_STATE:-}}
+
+    if [ -z "${_base}" ]; then
+        cluster_fail 2 "neither SEANCE_CLUSTER_BASE nor REAPER_STATE is set"
+        return 2
+    fi
+
+    _ds=$( zfs list -H -o name "${_base}" 2>/dev/null )
+
+    if [ -z "${_ds}" ]; then
+        cluster_fail 1 "${_base} is not a ZFS filesystem;" \
+            "the pseudo-cluster needs one to delegate from"
+        return 1
+    fi
+
+    printf '%s/seance\n' "${_ds}"
+}
+
+# cluster_dataset <node> -- the node's delegated dataset name.
+cluster_dataset()
+{
+    local _ds
+
+    [ $# -eq 1 ] || { cluster_fail 2 "usage: cluster_dataset <node>"; return 2; }
+
+    _ds=$( cluster_base_dataset ) || return $?
+    printf '%s/%s\n' "${_ds}" "$1"
+}
+
+# cluster_jail_name <node>
+cluster_jail_name()
+{
+    [ $# -eq 1 ] || { cluster_fail 2 "usage: cluster_jail_name <node>"; return 2; }
+    printf '%s%s\n' "${CLUSTER_JAIL_PREFIX}" "$1"
+}
+
+# cluster_root <node> -- the node's jail root on the host.
+cluster_root()
+{
+    local _d
+
+    [ $# -eq 1 ] || { cluster_fail 2 "usage: cluster_root <node>"; return 2; }
+
+    _d=$( cluster_dir ) || return $?
+    printf '%s/%s/root\n' "${_d}" "$1"
+}
+
+# cluster_nodes -- the node names of the running cluster, one per line.
+cluster_nodes()
+{
+    local _d
+
+    _d=$( cluster_dir ) || return $?
+
+    if [ ! -r "${_d}/nodes" ]; then
+        cluster_fail 1 "no cluster is up (${_d}/nodes is absent)"
+        return 1
+    fi
+
+    cat "${_d}/nodes"
+}
+
+# cluster_ip <node>
+cluster_ip()
+{
+    local _i _n _idx
+
+    [ $# -eq 1 ] || { cluster_fail 2 "usage: cluster_ip <node>"; return 2; }
+
+    _idx=0
+    for _n in ${CLUSTER_NAMES}; do
+        if [ "${_n}" = "$1" ]; then
+            printf '%s.%d\n' "${CLUSTER_NET}" "$(( 11 + _idx ))"
+            return 0
+        fi
+        _idx=$(( _idx + 1 ))
+    done
+
+    cluster_fail 2 "unknown node name: $1 (known: ${CLUSTER_NAMES})"
+    return 2
+}
+
+# cluster_jid <node> -- the running jail's jid.
+cluster_jid()
+{
+    local _j _jid
+
+    [ $# -eq 1 ] || { cluster_fail 2 "usage: cluster_jid <node>"; return 2; }
+
+    _j=$( cluster_jail_name "$1" ) || return $?
+    _jid=$( jls -j "${_j}" jid 2>/dev/null )
+
+    if [ -z "${_jid}" ]; then
+        cluster_fail 1 "jail ${_j} is not running"
+        return 1
+    fi
+
+    printf '%s\n' "${_jid}"
+}
+
+# cluster_key -- path to the cluster's private ssh key.
+cluster_key()
+{
+    local _d
+
+    _d=$( cluster_dir ) || return $?
+    printf '%s/id_ed25519\n' "${_d}"
+}
+
+# cluster_node_key -- where the same private key lives *inside* a node.
+#
+# The cluster directory is not visible from a jail, so each node carries its
+# own copy at the standard path. Anything ssh'ing from inside a node passes
+# this to cluster_ssh_opts; anything ssh'ing from the guest host passes
+# nothing and gets cluster_key.
+cluster_node_key()
+{
+    printf '/root/.ssh/id_ed25519\n'
+}
+
+# cluster_ssh_opts [<identity>] -- the ssh options every mesh connection uses.
+#
+# Printed as one line for the caller to word-split deliberately. Host key
+# checking is off and the known-hosts file is /dev/null because the jails
+# generate fresh host keys on every cluster_up and nothing here is
+# authenticating a host -- the key pair authenticates the client, which is
+# what the fence driver will later depend on.
+#
+# shellcheck disable=SC2120
+#   The optional identity argument is passed by the tier-6 stage scripts, not
+#   from inside this file; shellcheck checks each file on its own and cannot
+#   see those call sites.
+cluster_ssh_opts()
+{
+    local _k
+
+    if [ $# -ge 1 ]; then
+        _k=$1
+    else
+        _k=$( cluster_key ) || return $?
+    fi
+
+    printf -- '-i %s -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 -o LogLevel=ERROR\n' \
+        "${_k}"
+}
+
+# cluster_epair <node> -- the base name of the node's epair (e.g. epair0).
+cluster_epair()
+{
+    local _d
+
+    [ $# -eq 1 ] || { cluster_fail 2 "usage: cluster_epair <node>"; return 2; }
+
+    _d=$( cluster_dir ) || return $?
+
+    if [ ! -r "${_d}/$1/epair" ]; then
+        cluster_fail 1 "no such node in this cluster: $1"
+        return 1
+    fi
+
+    cat "${_d}/$1/epair"
+}
+
+# cluster_exec <node> <cmd> [args...] -- run a command inside the node's jail.
+cluster_exec()
+{
+    local _j
+
+    [ $# -ge 2 ] || { cluster_fail 2 "usage: cluster_exec <node> <cmd> [args]"; return 2; }
+
+    _j=$( cluster_jail_name "$1" ) || return $?
+    shift
+
+    jexec "${_j}" "$@"
+}
+
+# cluster_ifaces -- every interface this cluster created, one per line.
+#
+# The teardown removes them, so a caller asserting the cleanliness contract
+# must ask for the list *before* calling cluster_down.
+cluster_ifaces()
+{
+    local _d _n _list
+
+    _d=$( cluster_dir ) || return $?
+
+    [ -r "${_d}/bridge" ] && cat "${_d}/bridge"
+
+    if [ -r "${_d}/nodes" ]; then
+        _list=$( cat "${_d}/nodes" )
+        for _n in ${_list}; do
+            [ -r "${_d}/${_n}/epair" ] || continue
+            printf '%sa\n' "$( cat "${_d}/${_n}/epair" )"
+            printf '%sb\n' "$( cat "${_d}/${_n}/epair" )"
+        done
+    fi
+
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# Construction
+# ---------------------------------------------------------------------------
+
+# cluster_kmods -- load the kernel modules the substrate needs.
+cluster_kmods()
+{
+    local _m
+
+    for _m in if_bridge if_epair nullfs tmpfs; do
+        if ! kldload -n "${_m}"; then
+            cluster_fail 1 "kldload -n ${_m} failed"
+            return 1
+        fi
+    done
+
+    return 0
+}
+
+# cluster_build_root <node> <epair-b>
+#
+# A thin jail from the guest's own userland: read-only nullfs of the base
+# directories, a private copy of /etc, an mtree-built /var, tmpfs on /tmp, a
+# writable /root, and the seance working tree read-only at
+# /usr/local/seance.
+cluster_build_root()
+{
+    local _node _epb _root _ip _d _src _dirs
+
+    _node=$1
+    _epb=$2
+
+    _root=$( cluster_root "${_node}" ) || return $?
+    _ip=$( cluster_ip "${_node}" ) || return $?
+
+    mkdir -p "${_root}" || { cluster_fail 1 "mkdir ${_root}"; return 1; }
+
+    _dirs=${CLUSTER_BASE_DIRS}
+    [ -d /usr/lib32 ] && _dirs="${_dirs} /usr/lib32"
+
+    for _d in ${_dirs}; do
+        mkdir -p "${_root}${_d}" ||
+            { cluster_fail 1 "mkdir ${_root}${_d}"; return 1; }
+        mount -t nullfs -o ro "${_d}" "${_root}${_d}" ||
+            { cluster_fail 1 "nullfs ro ${_d} -> ${_root}${_d}"; return 1; }
+    done
+
+    for _d in etc var tmp dev root "${CLUSTER_DS_MOUNTPOINT#/}" \
+              usr/local/seance; do
+        mkdir -p "${_root}/${_d}" ||
+            { cluster_fail 1 "mkdir ${_root}/${_d}"; return 1; }
+    done
+
+    # cp -a rather than cp -Rp: -a additionally preserves the flags, and
+    # /etc carries none today but a copy that silently drops them would be a
+    # difference between the node and the guest it is modelled on.
+    cp -a /etc/ "${_root}/etc/" ||
+        { cluster_fail 1 "cp /etc -> ${_root}/etc"; return 1; }
+
+    mtree -deU -f /etc/mtree/BSD.var.dist -p "${_root}/var" >/dev/null ||
+        { cluster_fail 1 "mtree BSD.var.dist -> ${_root}/var"; return 1; }
+
+    mount -t tmpfs tmpfs "${_root}/tmp" ||
+        { cluster_fail 1 "tmpfs -> ${_root}/tmp"; return 1; }
+    chmod 1777 "${_root}/tmp" || return 1
+    chmod 0700 "${_root}/root" || return 1
+
+    _src=${CLUSTER_SEANCE_SRC:-${SEANCE_ROOT:-${REAPER_WORK:-}}}
+    if [ -z "${_src}" ] || [ ! -d "${_src}" ]; then
+        cluster_fail 1 "no seance source tree to mount:" \
+            "set CLUSTER_SEANCE_SRC, SEANCE_ROOT or REAPER_WORK"
+        return 1
+    fi
+    mount -t nullfs -o ro "${_src}" "${_root}/usr/local/seance" ||
+        { cluster_fail 1 "nullfs ro ${_src} -> ${_root}/usr/local/seance"; return 1; }
+
+    # The jail's own rc.conf, not the guest's. netif runs inside a vnet jail
+    # and configures the epair from here, which is why sshd -- started later
+    # in the same rc run -- finds its ListenAddress already present.
+    cat > "${_root}/etc/rc.conf" <<EOF
+hostname="${_node}"
+sshd_enable="YES"
+sendmail_enable="NONE"
+syslogd_flags="-ss"
+cron_enable="NO"
+dumpdev="NO"
+ifconfig_${_epb}="inet ${_ip}/${CLUSTER_PREFIXLEN}"
+EOF
+
+    # The guest's rc.conf.d belongs to the guest; an empty one keeps the node
+    # configured only by the file above.
+    rm -rf "${_root}/etc/rc.conf.d" || return 1
+    mkdir -p "${_root}/etc/rc.conf.d" || return 1
+
+    # The guest's sysctl.conf sets vfs.zfs.arc_max, which a jail may not
+    # write; an empty file is the difference between a clean boot and a
+    # permission error on every start.
+    : > "${_root}/etc/sysctl.conf" || return 1
+    : > "${_root}/etc/fstab" || return 1
+
+    # No resolver: names come from /etc/hosts, so a DNS lookup that somehow
+    # escapes the fixture fails immediately rather than hanging.
+    : > "${_root}/etc/resolv.conf" || return 1
+
+    cluster_write_hosts "${_root}/etc/hosts" || return 1
+
+    # Fresh host keys per node. The copied /etc carried the guest's, and a
+    # fixture that clones a real host's private keys into six directories is
+    # a habit worth not forming; rc.d/sshd generates what is missing at start.
+    rm -f "${_root}"/etc/ssh/ssh_host_* || return 1
+
+    # sshd honours the *first* occurrence of a keyword, so these are prepended
+    # rather than appended to the copied config.
+    {
+        printf 'PermitRootLogin prohibit-password\n'
+        printf 'ListenAddress %s\n' "${_ip}"
+        cat "${_root}/etc/ssh/sshd_config"
+    } > "${_root}/etc/ssh/sshd_config.new" || return 1
+    mv "${_root}/etc/ssh/sshd_config.new" "${_root}/etc/ssh/sshd_config" ||
+        return 1
+
+    mkdir -p "${_root}/root/.ssh" || return 1
+    chmod 0700 "${_root}/root/.ssh" || return 1
+    cp "$( cluster_key ).pub" "${_root}/root/.ssh/authorized_keys" || return 1
+    chmod 0600 "${_root}/root/.ssh/authorized_keys" || return 1
+    cp "$( cluster_key )" "${_root}$( cluster_node_key )" || return 1
+    chmod 0600 "${_root}$( cluster_node_key )" || return 1
+
+    return 0
+}
+
+# cluster_write_hosts <path> -- the mesh's name resolution, such as it is.
+cluster_write_hosts()
+{
+    local _out _n _ip _d _list
+
+    _out=$1
+    _d=$( cluster_dir ) || return $?
+    _list=$( cat "${_d}/nodes" ) || return 1
+
+    {
+        printf '::1 localhost\n'
+        printf '127.0.0.1 localhost\n'
+        printf '%s host\n' "${CLUSTER_HOST_IP}"
+        for _n in ${_list}; do
+            _ip=$( cluster_ip "${_n}" ) || return 1
+            printf '%s %s\n' "${_ip}" "${_n}"
+        done
+    } > "${_out}"
+}
+
+# cluster_write_jailconf
+#
+# One config file for the whole cluster, so that 'jail -f conf -r name' knows
+# the same parameters 'jail -f conf -c name' used and can undo them --
+# notably mount.devfs, which a bare 'jail -r name' leaves mounted (observed:
+# a devfs mount survived 'jail -r' when the jail had been created with
+# 'jail -c' parameters on the command line).
+cluster_write_jailconf()
+{
+    local _d _n _root _epb _j _list
+
+    _d=$( cluster_dir ) || return $?
+    _list=$( cat "${_d}/nodes" ) || return 1
+
+    {
+        for _n in ${_list}; do
+            _root=$( cluster_root "${_n}" ) || return 1
+            _j=$( cluster_jail_name "${_n}" ) || return 1
+            _epb="$( cat "${_d}/${_n}/epair" )b"
+            cat <<EOF
+${_j} {
+    path = "${_root}";
+    host.hostname = "${_n}";
+    vnet = new;
+    vnet.interface = "${_epb}";
+    persist;
+    allow.raw_sockets;
+    allow.mount;
+    allow.mount.devfs;
+    allow.mount.zfs;
+    allow.mount.tmpfs;
+    enforce_statfs = 1;
+    mount.devfs;
+    devfs_ruleset = ${CLUSTER_DEVFS_RULESET};
+    exec.clean;
+    exec.start = "/bin/sh /etc/rc";
+    exec.stop = "/bin/sh /etc/rc.shutdown jail";
+}
+EOF
+        done
+    } > "${_d}/jail.conf"
+}
+
+# cluster_attach_dataset <node>
+#
+# zfs jail(8) the node's dataset to its running jail and mount it from
+# inside. jailed=on is set at creation; the mountpoint is interpreted
+# relative to the jail's root, so the host sees it under <root>/seance and
+# the jail sees it at /seance.
+cluster_attach_dataset()
+{
+    local _node _ds _jid _j
+
+    _node=$1
+    _ds=$( cluster_dataset "${_node}" ) || return $?
+    _jid=$( cluster_jid "${_node}" ) || return $?
+    _j=$( cluster_jail_name "${_node}" ) || return $?
+
+    zfs jail "${_jid}" "${_ds}" ||
+        { cluster_fail 1 "zfs jail ${_jid} ${_ds}"; return 1; }
+
+    jexec "${_j}" zfs mount -a ||
+        { cluster_fail 1 "zfs mount -a inside ${_j}"; return 1; }
+
+    return 0
+}
+
+# cluster_wait_ssh <node> [seconds]
+cluster_wait_ssh()
+{
+    local _node _ip _limit _i _opts
+
+    _node=$1
+    _limit=${2:-60}
+    _ip=$( cluster_ip "${_node}" ) || return $?
+    # shellcheck disable=SC2119
+    #   Deliberately no identity argument: this connection is made from the
+    #   guest host, where the key is at cluster_key's path.
+    _opts=$( cluster_ssh_opts ) || return $?
+
+    _i=0
+    while [ "${_i}" -lt "${_limit}" ]; do
+        # shellcheck disable=SC2086
+        #   Deliberate word splitting: ${_opts} is an option list.
+        if ssh ${_opts} "root@${_ip}" true < /dev/null 2>/dev/null; then
+            return 0
+        fi
+        _i=$(( _i + 1 ))
+        sleep 1
+    done
+
+    cluster_fail 1 "node ${_node} (${_ip}) did not accept ssh within ${_limit}s"
+    jexec "$( cluster_jail_name "${_node}" )" ps ax >&2 2>/dev/null
+    return 1
+}
+
+# cluster_up [N]
+#
+# Build and start an N-node pseudo-cluster (default 3). Registers its own
+# teardown so that a stage script which dies half way through still leaves
+# the guest clean.
+cluster_up()
+{
+    local _n _dir _bd _ds _names _node _idx _br _ep _epa _epb _pub _ak
+
+    _n=${1:-3}
+
+    case "${_n}" in
+        ''|*[!0-9]*) cluster_fail 2 "cluster_up: N must be a number: ${_n}"; return 2 ;;
+    esac
+
+    _idx=$( printf '%s\n' "${CLUSTER_NAMES}" | wc -w )
+    if [ "${_n}" -lt 1 ] || [ "${_n}" -gt "${_idx}" ]; then
+        cluster_fail 2 "cluster_up: N must be 1..${_idx}, got ${_n}"
+        return 2
+    fi
+
+    _dir=$( cluster_dir ) || return $?
+    _bd=$( cluster_base_dir ) || return $?
+    _ds=$( cluster_base_dataset ) || return $?
+
+    if [ -d "${_dir}" ]; then
+        cluster_fail 1 "a cluster is already up at ${_dir};" \
+            "call cluster_down first"
+        return 1
+    fi
+
+    cluster_kmods || return 1
+
+    # The container dataset is canmount=off so that ${_bd} stays a plain
+    # directory on the reset dataset: 'reaper reset' then removes the whole
+    # cluster directory even if this teardown never runs.
+    if ! zfs list -H -o name "${_ds}" >/dev/null 2>&1; then
+        zfs create -o canmount=off "${_ds}" ||
+            { cluster_fail 1 "zfs create ${_ds}"; return 1; }
+    fi
+
+    mkdir -p "${_dir}" || { cluster_fail 1 "mkdir ${_dir}"; return 1; }
+
+    # From here on there is something to tear down, so the teardown is armed
+    # before anything else can fail.
+    cluster_arm_teardown
+
+    _names=""
+    _idx=0
+    for _node in ${CLUSTER_NAMES}; do
+        [ "${_idx}" -lt "${_n}" ] || break
+        _names="${_names}${_node}
+"
+        _idx=$(( _idx + 1 ))
+    done
+    printf '%s' "${_names}" > "${_dir}/nodes"
+
+    _br=$( ifconfig bridge create ) || { cluster_fail 1 "ifconfig bridge create"; return 1; }
+    printf '%s\n' "${_br}" > "${_dir}/bridge"
+    ifconfig "${_br}" inet "${CLUSTER_HOST_IP}/${CLUSTER_PREFIXLEN}" alias ||
+        { cluster_fail 1 "ifconfig ${_br} inet ${CLUSTER_HOST_IP}"; return 1; }
+    ifconfig "${_br}" up || { cluster_fail 1 "ifconfig ${_br} up"; return 1; }
+
+    ssh-keygen -q -t ed25519 -N '' -C "seance-pseudo-cluster" \
+        -f "${_dir}/id_ed25519" ||
+        { cluster_fail 1 "ssh-keygen for the mesh key"; return 1; }
+
+    # The guest host is a peer of the mesh: the fence driver will ssh from a
+    # node to 'host'. The exact line is recorded so teardown removes that and
+    # nothing else -- reaper's own session key lives in the same file.
+    _pub=$( cat "${_dir}/id_ed25519.pub" )
+    _ak=/root/.ssh/authorized_keys
+    if [ -e "${_ak}" ]; then
+        printf 'present\n' > "${_dir}/host_authkeys.state"
+    else
+        printf 'absent\n' > "${_dir}/host_authkeys.state"
+        mkdir -p /root/.ssh || return 1
+        chmod 0700 /root/.ssh || return 1
+        : > "${_ak}" || return 1
+        chmod 0600 "${_ak}" || return 1
+    fi
+    printf '%s\n' "${_pub}" >> "${_ak}" ||
+        { cluster_fail 1 "appending the mesh key to ${_ak}"; return 1; }
+
+    # 'for' over the node list, never 'while read < nodes': the jail's
+    # exec.start is /bin/sh /etc/rc, which inherits stdin and would eat the
+    # rest of the list. The commands below are also stdin-guarded, but a loop
+    # whose control flow depends on a file descriptor a child may read is the
+    # wrong shape to begin with.
+    for _node in ${_names}; do
+        mkdir -p "${_dir}/${_node}" || return 1
+
+        _epa=$( ifconfig epair create ) ||
+            { cluster_fail 1 "ifconfig epair create for ${_node}"; return 1; }
+        _ep=${_epa%a}
+        printf '%s\n' "${_ep}" > "${_dir}/${_node}/epair"
+        _epb="${_ep}b"
+
+        ifconfig "${_br}" addm "${_epa}" ||
+            { cluster_fail 1 "ifconfig ${_br} addm ${_epa}"; return 1; }
+        ifconfig "${_epa}" up ||
+            { cluster_fail 1 "ifconfig ${_epa} up"; return 1; }
+
+        cluster_build_root "${_node}" "${_epb}" || return 1
+
+        zfs create -o "mountpoint=${CLUSTER_DS_MOUNTPOINT}" \
+            "$( cluster_dataset "${_node}" )" ||
+            { cluster_fail 1 "zfs create for ${_node}"; return 1; }
+        zfs set jailed=on "$( cluster_dataset "${_node}" )" ||
+            { cluster_fail 1 "zfs set jailed=on for ${_node}"; return 1; }
+    done
+
+    cluster_write_jailconf || return 1
+
+    for _node in ${_names}; do
+        cluster_start "${_node}" || return 1
+    done
+
+    # The post-condition, stated rather than assumed: a cluster_up that built
+    # one node out of three and ran off the end of a loop must not report
+    # success. This is the assertion the first green-looking run of this file
+    # did not have.
+    _idx=0
+    for _node in ${_names}; do
+        cluster_jid "${_node}" >/dev/null || return 1
+        _idx=$(( _idx + 1 ))
+    done
+    if [ "${_idx}" -ne "${_n}" ]; then
+        cluster_fail 1 "cluster_up asked for ${_n} nodes and started ${_idx}"
+        return 1
+    fi
+
+    cluster_diag "up: ${_n} nodes ($( tr '\n' ' ' < "${_dir}/nodes" ))"
+    return 0
+}
+
+# cluster_arm_teardown -- register cluster_down for this shell's exit.
+cluster_arm_teardown()
+{
+    if command -v t_at_exit >/dev/null 2>&1; then
+        t_at_exit 'cluster_down'
+        return 0
+    fi
+
+    cluster_diag "no t_at_exit from the harness; installing a bare trap" \
+        "(any trap the caller set on EXIT/INT/TERM is now replaced)"
+    trap 'cluster_down' EXIT
+    trap 'cluster_down; exit 1' INT TERM
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# Node lifecycle
+# ---------------------------------------------------------------------------
+
+# cluster_start <node>
+#
+# Create the jail from the recorded configuration. The root and the dataset
+# are untouched, so on-disk state made before a cluster_stop is still there.
+cluster_start()
+{
+    local _node _dir _j _epb _i
+
+    [ $# -eq 1 ] || { cluster_fail 2 "usage: cluster_start <node>"; return 2; }
+
+    _node=$1
+    _dir=$( cluster_dir ) || return $?
+    _j=$( cluster_jail_name "${_node}" ) || return $?
+
+    if [ ! -r "${_dir}/${_node}/epair" ]; then
+        cluster_fail 2 "no such node in this cluster: ${_node}"
+        return 2
+    fi
+    _epb="$( cat "${_dir}/${_node}/epair" )b"
+
+    if jls -j "${_j}" jid >/dev/null 2>&1; then
+        cluster_fail 1 "jail ${_j} is already running"
+        return 1
+    fi
+
+    # A vnet interface returns to the host asynchronously after the jail that
+    # held it is removed (observed: absent from 'ifconfig -l' immediately
+    # after 'jail -r', present a few seconds later). Starting before it is
+    # back fails with 'interface not found', so wait for it.
+    _i=0
+    while [ "${_i}" -lt 30 ]; do
+        ifconfig "${_epb}" >/dev/null 2>&1 && break
+        _i=$(( _i + 1 ))
+        sleep 1
+    done
+    if ! ifconfig "${_epb}" >/dev/null 2>&1; then
+        cluster_fail 1 "${_epb} did not return to the host within 30s;" \
+            "cannot start ${_j}"
+        return 1
+    fi
+
+    # </dev/null: exec.start is "/bin/sh /etc/rc", which inherits this
+    # shell's stdin and will read from it -- a loop driven by a file
+    # descriptor lost its remaining input to exactly this.
+    jail -f "${_dir}/jail.conf" -c "${_j}" < /dev/null ||
+        { cluster_fail 1 "jail -c ${_j}"; return 1; }
+
+    cluster_attach_dataset "${_node}" || return 1
+    cluster_wait_ssh "${_node}" || return 1
+
+    return 0
+}
+
+# cluster_unmount_dataset <node>
+#
+# Unmount everything the node's delegated dataset has mounted, deepest first.
+# Silent about finding nothing: it is called repeatedly while a jail dies.
+cluster_unmount_dataset()
+{
+    local _ds _m _rc _list
+
+    _ds=$( cluster_dataset "$1" ) || return $?
+    _rc=0
+
+    _list=$( mount -p | awk -v d="${_ds}" \
+        '$1 == d || index($1, d "/") == 1 { print $2 }' | sort -r )
+
+    for _m in ${_list}; do
+        umount -f "${_m}" || _rc=1
+    done
+
+    return "${_rc}"
+}
+
+# cluster_stop <node>
+#
+# Remove the jail and wait until it is *fully* gone: not merely absent from
+# jls, but absent from 'jls -d' and with its vnet interface handed back to
+# the host, which is the state cluster_start needs and the state the
+# cleanliness contract means.
+#
+# Two things learned the hard way here, both worth stating:
+#
+#   1. A jail whose delegated dataset is still mounted stays in the 'dying'
+#      state indefinitely -- observed at over 120 s -- and its epair never
+#      returns. Unmounting the dataset released it within a second.
+#   2. That mount only becomes visible in the host's mount table a moment
+#      *after* 'jail -r' returns, so the unmount has to be retried rather
+#      than attempted once. A single 'mount -p' immediately after 'jail -r'
+#      finds nothing and leaves the jail wedged.
+cluster_stop()
+{
+    local _node _dir _j _epb _i _dying _back
+
+    [ $# -eq 1 ] || { cluster_fail 2 "usage: cluster_stop <node>"; return 2; }
+
+    _node=$1
+    _dir=$( cluster_dir ) || return $?
+    _j=$( cluster_jail_name "${_node}" ) || return $?
+
+    [ -r "${_dir}/${_node}/epair" ] ||
+        { cluster_fail 2 "no such node in this cluster: ${_node}"; return 2; }
+    _epb="$( cat "${_dir}/${_node}/epair" )b"
+
+    if jls -j "${_j}" jid >/dev/null 2>&1; then
+        jail -f "${_dir}/jail.conf" -r "${_j}" < /dev/null ||
+            { cluster_fail 1 "jail -r ${_j}"; return 1; }
+    fi
+
+    _i=0
+    while [ "${_i}" -lt 90 ]; do
+        cluster_unmount_dataset "${_node}"
+
+        _dying=$( jls -d -j "${_j}" jid 2>/dev/null )
+        if [ -z "${_dying}" ] && ifconfig "${_epb}" >/dev/null 2>&1; then
+            return 0
+        fi
+
+        _i=$(( _i + 1 ))
+        sleep 1
+    done
+
+    _dying=$( jls -d -j "${_j}" jid 2>/dev/null )
+    if ifconfig "${_epb}" >/dev/null 2>&1; then
+        _back=yes
+    else
+        _back=no
+    fi
+    cluster_fail 1 "jail ${_j} did not finish dying within 90s" \
+        "(jls -d jid: [${_dying}], ${_epb} back on the host: ${_back})"
+    return 1
+}
+
+# cluster_isolate <node>
+#
+# Cut the node off from every peer and from the host while its jail keeps
+# running, by removing its host-side epair from the bridge. The jail's own
+# interface stays up and configured, so the node believes it is fine and
+# discovers otherwise only by failing to reach anybody -- which is the
+# condition the quorum rule exists for.
+cluster_isolate()
+{
+    local _node _dir _br _epa
+
+    [ $# -eq 1 ] || { cluster_fail 2 "usage: cluster_isolate <node>"; return 2; }
+
+    _node=$1
+    _dir=$( cluster_dir ) || return $?
+
+    [ -r "${_dir}/${_node}/epair" ] ||
+        { cluster_fail 2 "no such node in this cluster: ${_node}"; return 2; }
+
+    _br=$( cat "${_dir}/bridge" )
+    _epa="$( cat "${_dir}/${_node}/epair" )a"
+
+    if ifconfig "${_br}" | grep -q "member: ${_epa} "; then
+        ifconfig "${_br}" deletem "${_epa}" ||
+            { cluster_fail 1 "ifconfig ${_br} deletem ${_epa}"; return 1; }
+    fi
+
+    return 0
+}
+
+# cluster_heal <node> -- undo cluster_isolate.
+cluster_heal()
+{
+    local _node _dir _br _epa
+
+    [ $# -eq 1 ] || { cluster_fail 2 "usage: cluster_heal <node>"; return 2; }
+
+    _node=$1
+    _dir=$( cluster_dir ) || return $?
+
+    [ -r "${_dir}/${_node}/epair" ] ||
+        { cluster_fail 2 "no such node in this cluster: ${_node}"; return 2; }
+
+    _br=$( cat "${_dir}/bridge" )
+    _epa="$( cat "${_dir}/${_node}/epair" )a"
+
+    if ! ifconfig "${_br}" | grep -q "member: ${_epa} "; then
+        ifconfig "${_br}" addm "${_epa}" ||
+            { cluster_fail 1 "ifconfig ${_br} addm ${_epa}"; return 1; }
+    fi
+    ifconfig "${_epa}" up || { cluster_fail 1 "ifconfig ${_epa} up"; return 1; }
+
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# Teardown
+# ---------------------------------------------------------------------------
+
+# cluster_down
+#
+# Idempotent, and safe when the cluster is only partly built: every step
+# tolerates its subject being absent and none of them tolerates a failure it
+# could have acted on. Returns 0 only when the guest is clean.
+cluster_down()
+{
+    local _dir _ds _rc _j _n _if _m _pub _ak _tmp _state _grc _i _left
+
+    _rc=0
+    _dir=$( cluster_dir ) || return $?
+    _ds=$( cluster_base_dataset ) || return $?
+
+    # 1. Jails. By pattern rather than from the registry, so that a jail left
+    #    behind by a crashed earlier run is removed too.
+    for _j in $( jls -h name 2>/dev/null | tail -n +2 ); do
+        case "${_j}" in
+            "${CLUSTER_JAIL_PREFIX}"*) ;;
+            *) continue ;;
+        esac
+        if [ -r "${_dir}/jail.conf" ]; then
+            jail -f "${_dir}/jail.conf" -r "${_j}" < /dev/null || _rc=1
+        else
+            jail -r "${_j}" < /dev/null || _rc=1
+        fi
+    done
+
+    # 2. The mesh key's line in the guest root's authorized_keys, and only it.
+    _ak=/root/.ssh/authorized_keys
+    if [ -r "${_dir}/id_ed25519.pub" ] && [ -r "${_ak}" ]; then
+        _pub=$( cat "${_dir}/id_ed25519.pub" )
+        _tmp="${_ak}.seance-teardown"
+        grep -v -F -x "${_pub}" "${_ak}" > "${_tmp}"
+        _grc=$?
+        # grep(1) exits 1 when it selects no lines, which is the correct
+        # answer when the mesh key was the only line in the file; only 2 and
+        # above are errors.
+        if [ "${_grc}" -gt 1 ]; then
+            cluster_fail 1 "grep filtering the mesh key out of ${_ak} exited ${_grc}"
+            _rc=1
+        fi
+        chmod 0600 "${_tmp}" || _rc=1
+        mv "${_tmp}" "${_ak}" || _rc=1
+
+        _state=$( cat "${_dir}/host_authkeys.state" 2>/dev/null )
+        if [ "${_state}" = "absent" ] && [ ! -s "${_ak}" ]; then
+            rm -f "${_ak}" || _rc=1
+        fi
+    fi
+
+    # 3. Datasets. Recursive, and jailed=on is no obstacle to a destroy from
+    #    the host (observed), so no unjail dance is needed. This is also what
+    #    releases a jail still in the 'dying' state -- see cluster_stop.
+    if zfs list -H -o name "${_ds}" >/dev/null 2>&1; then
+        zfs destroy -r "${_ds}" ||
+            { cluster_fail 1 "zfs destroy -r ${_ds}"; _rc=1; }
+    fi
+
+    # 3b. Only now is it fair to ask whether the jails are gone, and 'jls -d'
+    #     is the question that means it: a dying jail still holds its vnet
+    #     interface and is not a clean guest.
+    _i=0
+    while [ "${_i}" -lt 90 ]; do
+        _left=$( jls -d -h name 2>/dev/null | tail -n +2 |
+            awk -v p="${CLUSTER_JAIL_PREFIX}" 'index($1, p) == 1' )
+        [ -z "${_left}" ] && break
+        _i=$(( _i + 1 ))
+        sleep 1
+    done
+    if [ -n "${_left}" ]; then
+        cluster_fail 1 "jails survived teardown (jls -d): ${_left}"
+        _rc=1
+    fi
+
+    # 4. Every mount still under the cluster directory, deepest first.
+    for _m in $( mount -p | awk -v d="${_dir}/" 'index($2, d) == 1 { print $2 }' \
+            | sort -r ); do
+        umount -f "${_m}" || { cluster_fail 1 "umount ${_m}"; _rc=1; }
+    done
+
+    for _m in $( mount -p | awk -v d="${_dir}/" 'index($2, d) == 1 { print $2 }' ); do
+        cluster_fail 1 "mount ${_m} survived teardown"
+        _rc=1
+    done
+
+    # 5. Interfaces. Destroying an epair's a side destroys the pair.
+    if [ -r "${_dir}/nodes" ]; then
+        _left=$( cat "${_dir}/nodes" )
+        for _n in ${_left}; do
+            [ -r "${_dir}/${_n}/epair" ] || continue
+            _if="$( cat "${_dir}/${_n}/epair" )a"
+            if ifconfig "${_if}" >/dev/null 2>&1; then
+                ifconfig "${_if}" destroy ||
+                    { cluster_fail 1 "ifconfig ${_if} destroy"; _rc=1; }
+            fi
+        done
+    fi
+
+    if [ -r "${_dir}/bridge" ]; then
+        _if=$( cat "${_dir}/bridge" )
+        if ifconfig "${_if}" >/dev/null 2>&1; then
+            ifconfig "${_if}" destroy ||
+                { cluster_fail 1 "ifconfig ${_if} destroy"; _rc=1; }
+        fi
+    fi
+
+    # 6. The directory itself, last, because everything above reads from it.
+    if [ -d "${_dir}" ]; then
+        rm -rf "${_dir}" || { cluster_fail 1 "rm -rf ${_dir}"; _rc=1; }
+    fi
+
+    if [ "${_rc}" -eq 0 ]; then
+        cluster_diag "down: clean"
+    fi
+
+    return "${_rc}"
+}
