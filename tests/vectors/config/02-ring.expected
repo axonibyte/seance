@@ -1,0 +1,31 @@
+fleet set cadence 300
+fleet set retention_recent 7200
+fleet set retention_hourly 86400
+fleet derived staleness_max 900
+fleet set skew_tolerance 60
+fleet set debounce 30
+fleet set fence_timeout 120
+fleet set ssh_user seance
+fleet set ssh_port 2222
+fleet set ssh_extra_opts -o ConnectTimeout=5 -o StrictHostKeyChecking=yes
+fleet runtime standby_root
+fleet unset notify_cmd
+fleet unset witness
+node alpha nodename alpha.example.net
+node alpha mgmt alpha-mgmt.example.net
+node alpha heir bravo
+node alpha heir2 charlie
+node alpha fence_driver ipmi
+node alpha fence_target alpha-bmc.example.net
+node bravo nodename bravo.example.net
+node bravo mgmt bravo-mgmt.example.net
+node bravo heir charlie
+node bravo heir2 alpha
+node bravo fence_driver ipmi
+node bravo fence_target bravo-bmc.example.net
+node charlie nodename charlie.example.net
+node charlie mgmt charlie-mgmt.example.net
+node charlie heir alpha
+node charlie heir2 bravo
+node charlie fence_driver ipmi
+node charlie fence_target charlie-bmc.example.net

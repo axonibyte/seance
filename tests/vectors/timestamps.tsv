@@ -1,0 +1,64 @@
+# seance timestamp vectors -- UTC timestamp <TAB> seconds since the epoch.
+#
+# PROVENANCE, and the only reason this file is worth having: every epoch below
+# was produced by date(1), on FreeBSD, as
+#
+#     date -u -j -f '%Y%m%dT%H%M%SZ' <timestamp> +%s
+#
+# once, when this file was written, and then committed. seance's own converter
+# is pure integer arithmetic (the days-from-civil algorithm) and never calls
+# date(1) -- so these two implementations are genuinely independent, and this
+# file is an oracle rather than a snapshot of the code's own opinion.
+#
+# tests/tier2/t_vectors.sh runs every row in both directions and does so under
+# a non-UTC TZ and under two locales. A timestamp is UTC always, by spec, so
+# any row that moves when the environment does is a defect and not a
+# configuration problem.
+#
+# Lines beginning with '#' and blank lines are ignored.
+#
+# The rows are chosen for what a hand-rolled calendar gets wrong: the epoch
+# itself and the seconds either side of it, pre-epoch instants, the leap-year
+# century rules (1900 and 2100 are not leap years, 2000 is), the ends of
+# months and years, and the 2038 signed-32-bit boundary.
+#
+# One row is deliberately absent. date(1) accepts 20260229T000000Z and returns
+# 1772323200, which is 2026-03-01: 2026 is not a leap year and BSD date
+# normalises the impossible date instead of refusing it. seance refuses it, so
+# the two implementations disagree there on purpose and the case lives in
+# snapnames.tsv as a "foreign" row rather than here as an epoch pair. That
+# disagreement is the argument for not delegating validation to date(1) in the
+# first place: a promotion must not read a replica whose name it had to guess
+# the meaning of.
+19700101T000000Z	0
+19700101T000001Z	1
+19700101T235959Z	86399
+19700102T000000Z	86400
+19691231T235959Z	-1
+19691231T000000Z	-86400
+19000101T000000Z	-2208988800
+19000301T000000Z	-2203891200
+19040229T120000Z	-2077704000
+19991231T235959Z	946684799
+20000101T000000Z	946684800
+20000229T000000Z	951782400
+20000301T000000Z	951868800
+20040229T235959Z	1078099199
+20200229T000000Z	1582934400
+20200301T000000Z	1583020800
+20240229T120000Z	1709208000
+20250101T000000Z	1735689600
+20251231T235959Z	1767225599
+20260101T000000Z	1767225600
+20260630T235959Z	1782863999
+20260701T000000Z	1782864000
+20260816T101500Z	1786875300
+20261231T235959Z	1798761599
+20270101T000000Z	1798761600
+20380119T031407Z	2147483647
+20380119T031408Z	2147483648
+20991231T235959Z	4102444799
+21000228T000000Z	4107456000
+21000301T000000Z	4107542400
+20260816T000000Z	1786838400
+20260816T235959Z	1786924799

@@ -8,10 +8,17 @@
 # nowhere else -- a list in a code comment is documentation, a list in a test
 # is a contract.
 #
-# Scanned: seance bin lib drivers rc.d devd cron tools etc LICENSE (whichever
-# exist). Not scanned: docs and the spec copies (DESIGN.md, TESTING.md,
-# HANDOFF.md), which carry tenant nicknames by decision D-11, and tests/, which
-# has to contain the forbidden strings in order to test for them.
+# Scanned: seance bin lib drivers rc.d devd cron tools etc LICENSE, plus the
+# three CBSD module markers at the repository root -- metadata.conf, securecmd
+# and message.txt (whichever exist). The markers were the gap D-15 left open:
+# they are shipped framework files like any other and a site name in one of
+# them would travel just as far. They join the TENANT guard only; message.txt
+# legitimately names cbsd commands in the instructions it prints, so it must
+# not join the seam guard.
+#
+# Not scanned: docs and the spec copies (DESIGN.md, TESTING.md, HANDOFF.md),
+# which carry tenant nicknames by decision D-11, and tests/, which has to
+# contain the forbidden strings in order to test for them.
 #
 # Every line is scanned, comments included: a site node name in a comment is
 # still tenant knowledge shipped in framework code.
@@ -33,7 +40,8 @@ set -u
 # shellcheck source=../lib/harness.subr
 . "$( dirname "$( realpath "$0" )" )/../lib/harness.subr"
 
-SCAN_PATHS="seance bin lib drivers rc.d devd cron tools etc LICENSE"
+SCAN_PATHS="seance bin lib drivers rc.d devd cron tools etc LICENSE
+metadata.conf securecmd message.txt"
 
 PROG=$( t_tmpdir )/tenant.awk
 cat > "${PROG}" <<'AWK'
@@ -134,10 +142,18 @@ probe()
     guard "${_dir}"
 }
 
-t_plan 13
+t_plan 17
 
 scanned=$( guard_files "${T_ROOT}" | wc -l | tr -d ' ' )
 t_isnt "${scanned}" "0" "the tenant guard scans a non-empty file list"
+
+# The scan set is part of the contract, not an implementation detail: a file
+# quietly dropped from it is a guard that stops noticing, so each of the three
+# module markers is named here as well as in SCAN_PATHS.
+for marker in metadata.conf securecmd message.txt; do
+    t_like "$( guard_files "${T_ROOT}" )" "^${marker}\$" \
+        "the module marker ${marker} is scanned"
+done
 
 violations=$( guard "${T_ROOT}" )
 t_is "${violations}" "" "no tenant strings in module code"
@@ -149,10 +165,13 @@ for p in ${SCAN_PATHS}; do
     [ -e "${T_ROOT}/${p}" ] && cp -R "${T_ROOT}/${p}" "${scratch}/"
 done
 printf '# default node is hyp2c\n' >> "${scratch}/lib/common.subr"
+printf 'MYDESC="succession for the okc estate"\n' >> "${scratch}/metadata.conf"
 
 planted=$( guard "${scratch}" )
 t_like "${planted}" '^lib/common\.subr:[0-9]+: site-node: ' \
     "a planted site node name is caught"
+t_like "${planted}" '^metadata\.conf:[0-9]+: site-location: ' \
+    "a planted site string in a module marker is caught"
 
 # Each class of the forbidden list, caught.
 t_like "$( probe 'ssh_port=2212' )" '^lib/probe\.subr:1: site-port: ' \

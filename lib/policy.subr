@@ -1,0 +1,967 @@
+# seance -- the policy engine: pure decision functions.
+#
+# Sourced, never executed. Nothing here touches ZFS, the host's guest tooling,
+# ssh, the network, or the filesystem, and -- with the single exception of
+# pol_now, which exists so that the verbs have one place to ask -- nothing here
+# calls date(1). Every function that needs the current time takes it as an
+# argument. That is what makes this file testable to the second without a
+# clock, and what makes the tier-2 vectors meaningful.
+#
+# Time arithmetic is pure integer arithmetic (the days-from-civil algorithm),
+# not date(1) and not strftime(3): the timestamp in a snapshot name is the wire
+# protocol (handoff §2.1), it is UTC always, and an implementation that reached
+# for the C library would inherit TZ and LC_TIME. Tier 2 runs every vector
+# under a non-UTC TZ and under two locales for exactly this reason.
+#
+# Locale independence is deliberate throughout, not incidental:
+#   * character classes are written out as explicit lists ([!0123456789]) and
+#     never as ranges ([!0-9]), because POSIX leaves bracket ranges outside the
+#     C locale unspecified;
+#   * every sort(1) is invoked as 'LC_ALL=C sort', because collation order is
+#     a locale property and snapshot ordering is not;
+#   * decimal fields are stripped of leading zeros before any $(( )), because
+#     FreeBSD sh reads 08 as an invalid octal constant and dies.
+#
+# Contract, as everywhere in seance: stdout is data, stderr is diagnostics, and
+# the exit status is the verdict -- 0 ok, 1 the operation's own negative
+# answer (stale, freeze, stand-down, foreign name), 2 a usage or contract
+# error (the caller passed something that is not a timestamp at all).
+#
+# shellcheck shell=sh
+# shellcheck disable=SC3043
+#   'local' is not in POSIX sh but is implemented by FreeBSD /bin/sh (sh(1),
+#   "local"); seance targets FreeBSD sh and nothing else (handoff §5).
+
+# The snapshot-name prefix. The whole wire protocol is
+#     <dataset>@seance-<nodekey>-<YYYYmmddTHHMMSSZ>
+POL_SNAP_PREFIX="seance-"
+
+# Decomposed timestamp fields, set by _pol_ts_fields. Globals rather than a
+# command substitution because these functions run thousands of times in the
+# vector suites and a subshell per call is a fork per call.
+_POL_Y=0
+_POL_MON=0
+_POL_DAY=0
+_POL_H=0
+_POL_MI=0
+_POL_S=0
+
+# ---------------------------------------------------------------------------
+# Small pure helpers
+# ---------------------------------------------------------------------------
+
+# _pol_dec <digits>
+#
+# Print a run of decimal digits as a decimal integer with leading zeros
+# removed, so that it is safe inside $(( )). FreeBSD sh treats 08 as an octal
+# constant and fails the whole expression; this is the guard against that, and
+# it is applied to every field parsed out of a timestamp.
+_pol_dec()
+{
+    local _d
+
+    _d=${1#"${1%%[!0]*}"}
+    [ -n "${_d}" ] || _d=0
+
+    printf '%s\n' "${_d}"
+}
+
+# pol_is_int <string> [--signed]
+#
+# rc 0 if the string is a decimal integer. Unsigned by default; with --signed a
+# single leading '-' is allowed. Empty is not an integer, and neither is
+# anything with a sign in the middle or a space at either end.
+pol_is_int()
+{
+    local _v
+
+    _v=${1:-}
+
+    if [ "${2:-}" = "--signed" ]; then
+        case "${_v}" in
+            -*) _v=${_v#-} ;;
+        esac
+    fi
+
+    case "${_v}" in
+        ''|*[!0123456789]*) return 1 ;;
+    esac
+
+    return 0
+}
+
+# pol_now
+#
+# The current time as seconds since the epoch. THE ONLY PLACE IN seance THAT
+# ASKS THE CLOCK. Verbs call it once and thread the answer through the policy
+# functions as an argument, so that every decision a verb makes is reproducible
+# from its inputs.
+pol_now()
+{
+    date -u +%s
+}
+
+# ---------------------------------------------------------------------------
+# Timestamps
+# ---------------------------------------------------------------------------
+
+# _pol_is_leap <year>   -- rc 0 if the (proleptic Gregorian) year is a leap year.
+_pol_is_leap()
+{
+    local _y
+
+    _y=$1
+
+    [ $(( _y % 4 )) -eq 0 ] || return 1
+    [ $(( _y % 100 )) -eq 0 ] || return 0
+    [ $(( _y % 400 )) -eq 0 ] || return 1
+
+    return 0
+}
+
+# _pol_days_in_month <year> <month>  -- print the length of the month.
+_pol_days_in_month()
+{
+    local _y _m
+
+    _y=$1
+    _m=$2
+
+    case "${_m}" in
+        1|3|5|7|8|10|12) printf '31\n' ;;
+        4|6|9|11)        printf '30\n' ;;
+        2)
+            if _pol_is_leap "${_y}"; then
+                printf '29\n'
+            else
+                printf '28\n'
+            fi
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+# _pol_ts_fields <ts>
+#
+# Decompose and fully validate a YYYYmmddTHHMMSSZ timestamp, setting _POL_Y,
+# _POL_MON, _POL_DAY, _POL_H, _POL_MI and _POL_S to leading-zero-free decimals.
+# rc 1 if the string is not a valid UTC timestamp in that exact form.
+#
+# The field extraction is done with fixed-length ?-patterns rather than a
+# regular expression so that it has no dependency on any external program, and
+# the digit test uses an explicit character list rather than a range so that it
+# has no dependency on the locale.
+_pol_ts_fields()
+{
+    local _ts _rest _y _mon _day _t _h _mi _s _z _dim
+
+    _ts=${1:-}
+
+    [ ${#_ts} -eq 16 ] || return 1
+
+    _rest=${_ts}
+    _y=${_rest%????????????};   _rest=${_rest#????}
+    _mon=${_rest%??????????};   _rest=${_rest#??}
+    _day=${_rest%????????};     _rest=${_rest#??}
+    _t=${_rest%???????};        _rest=${_rest#?}
+    _h=${_rest%?????};          _rest=${_rest#??}
+    _mi=${_rest%???};           _rest=${_rest#??}
+    _s=${_rest%?};              _rest=${_rest#??}
+    _z=${_rest}
+
+    # The literal separators. A timestamp without its Z is not UTC-looking and
+    # is rejected as foreign rather than guessed at.
+    [ "${_t}" = "T" ] || return 1
+    [ "${_z}" = "Z" ] || return 1
+
+    case "${_y}${_mon}${_day}${_h}${_mi}${_s}" in
+        *[!0123456789]*) return 1 ;;
+    esac
+
+    _y=$( _pol_dec "${_y}" )
+    _mon=$( _pol_dec "${_mon}" )
+    _day=$( _pol_dec "${_day}" )
+    _h=$( _pol_dec "${_h}" )
+    _mi=$( _pol_dec "${_mi}" )
+    _s=$( _pol_dec "${_s}" )
+
+    [ "${_mon}" -ge 1 ] && [ "${_mon}" -le 12 ] || return 1
+    [ "${_h}" -le 23 ] || return 1
+    [ "${_mi}" -le 59 ] || return 1
+    [ "${_s}" -le 59 ] || return 1
+
+    _dim=$( _pol_days_in_month "${_y}" "${_mon}" ) || return 1
+    [ "${_day}" -ge 1 ] && [ "${_day}" -le "${_dim}" ] || return 1
+
+    _POL_Y=${_y}
+    _POL_MON=${_mon}
+    _POL_DAY=${_day}
+    _POL_H=${_h}
+    _POL_MI=${_mi}
+    _POL_S=${_s}
+
+    return 0
+}
+
+# pol_ts_valid <ts>   -- rc 0 if <ts> is a valid UTC timestamp, else rc 1.
+pol_ts_valid()
+{
+    _pol_ts_fields "${1:-}"
+}
+
+# pol_ts_to_epoch <ts>
+#
+# Print seconds since 1970-01-01T00:00:00Z. rc 2 if <ts> is not a valid
+# timestamp -- a caller that hands this function garbage has a bug, and a
+# plausible-looking zero would hide it.
+#
+# The date arithmetic is Howard Hinnant's days_from_civil: shift the year so
+# that it begins in March (making the leap day the last day of the year and
+# removing it from the month-length table), then count whole 400-year eras.
+# Exact for every proleptic Gregorian date, and it is arithmetic, so it cannot
+# consult a timezone.
+pol_ts_to_epoch()
+{
+    local _y _era _yoe _doy _doe _days _mp
+
+    _pol_ts_fields "${1:-}" || return 2
+
+    _y=${_POL_Y}
+    [ "${_POL_MON}" -le 2 ] && _y=$(( _y - 1 ))
+
+    if [ "${_y}" -ge 0 ]; then
+        _era=$(( _y / 400 ))
+    else
+        _era=$(( (_y - 399) / 400 ))
+    fi
+
+    _yoe=$(( _y - _era * 400 ))
+
+    if [ "${_POL_MON}" -gt 2 ]; then
+        _mp=$(( _POL_MON - 3 ))
+    else
+        _mp=$(( _POL_MON + 9 ))
+    fi
+
+    _doy=$(( (153 * _mp + 2) / 5 + _POL_DAY - 1 ))
+    _doe=$(( _yoe * 365 + _yoe / 4 - _yoe / 100 + _doy ))
+    _days=$(( _era * 146097 + _doe - 719468 ))
+
+    printf '%s\n' \
+        $(( _days * 86400 + _POL_H * 3600 + _POL_MI * 60 + _POL_S ))
+}
+
+# pol_epoch_to_ts <epoch>
+#
+# Print the UTC timestamp for an integer epoch. rc 2 if the argument is not an
+# integer, or if the result would fall outside the four-digit years the wire
+# format can express -- silently emitting a five-digit year would produce a
+# name that no parser in the fleet accepts.
+#
+# civil_from_days, the inverse of the above, with a floored division so that
+# pre-epoch instants come out right rather than truncating towards zero.
+pol_epoch_to_ts()
+{
+    local _e _days _secs _z _era _doe _yoe _y _doy _mp _day _mon _h _mi _s
+
+    _e=${1:-}
+    pol_is_int "${_e}" --signed || return 2
+
+    if [ "${_e}" -ge 0 ]; then
+        _days=$(( _e / 86400 ))
+    else
+        _days=$(( 0 - ( ( 0 - _e + 86399 ) / 86400 ) ))
+    fi
+    _secs=$(( _e - _days * 86400 ))
+
+    _z=$(( _days + 719468 ))
+    if [ "${_z}" -ge 0 ]; then
+        _era=$(( _z / 146097 ))
+    else
+        _era=$(( (_z - 146096) / 146097 ))
+    fi
+
+    _doe=$(( _z - _era * 146097 ))
+    _yoe=$(( (_doe - _doe / 1460 + _doe / 36524 - _doe / 146096) / 365 ))
+    _y=$(( _yoe + _era * 400 ))
+    _doy=$(( _doe - (365 * _yoe + _yoe / 4 - _yoe / 100) ))
+    _mp=$(( (5 * _doy + 2) / 153 ))
+    _day=$(( _doy - (153 * _mp + 2) / 5 + 1 ))
+
+    if [ "${_mp}" -lt 10 ]; then
+        _mon=$(( _mp + 3 ))
+    else
+        _mon=$(( _mp - 9 ))
+    fi
+    [ "${_mon}" -le 2 ] && _y=$(( _y + 1 ))
+
+    [ "${_y}" -ge 0 ] && [ "${_y}" -le 9999 ] || return 2
+
+    _h=$(( _secs / 3600 ))
+    _mi=$(( _secs % 3600 / 60 ))
+    _s=$(( _secs % 60 ))
+
+    printf '%04d%02d%02dT%02d%02d%02dZ\n' \
+        "${_y}" "${_mon}" "${_day}" "${_h}" "${_mi}" "${_s}"
+}
+
+# pol_ts_cmp <a> <b>
+#
+# Print -1, 0 or 1 as <a> sorts before, with, or after <b>. rc 2 if either
+# argument is not a valid timestamp.
+#
+# The format sorts (handoff §2.1): it is fixed-width, big-endian, and its only
+# non-digit characters sit at constant positions. So comparing the six decimal
+# fields in order is exactly a byte comparison of the two strings -- and unlike
+# a byte comparison it cannot be re-ordered by a collation table.
+pol_ts_cmp()
+{
+    local _ay _amon _aday _ah _ami _as _r
+
+    _pol_ts_fields "${1:-}" || return 2
+    _ay=${_POL_Y}; _amon=${_POL_MON}; _aday=${_POL_DAY}
+    _ah=${_POL_H}; _ami=${_POL_MI};   _as=${_POL_S}
+
+    _pol_ts_fields "${2:-}" || return 2
+
+    for _r in "${_ay}:${_POL_Y}" "${_amon}:${_POL_MON}" \
+              "${_aday}:${_POL_DAY}" "${_ah}:${_POL_H}" \
+              "${_ami}:${_POL_MI}" "${_as}:${_POL_S}"; do
+        if [ "${_r%%:*}" -lt "${_r#*:}" ]; then
+            printf '%s\n' '-1'
+            return 0
+        fi
+        if [ "${_r%%:*}" -gt "${_r#*:}" ]; then
+            printf '%s\n' '1'
+            return 0
+        fi
+    done
+
+    printf '%s\n' '0'
+}
+
+# pol_ts_hour <ts>
+#
+# Print the UTC hour bucket a timestamp falls in: the timestamp truncated to
+# the hour, YYYYmmddTHH. rc 2 on an invalid timestamp. Used by the retention
+# ladder, where "one per hour" means one per wall-clock UTC hour and not one
+# per 3600 seconds of age.
+pol_ts_hour()
+{
+    local _ts
+
+    _ts=${1:-}
+    _pol_ts_fields "${_ts}" || return 2
+
+    printf '%s\n' "${_ts%?????}"
+}
+
+# ---------------------------------------------------------------------------
+# Snapshot names -- the wire protocol
+# ---------------------------------------------------------------------------
+
+# pol_snap_format <nodekey> <ts>
+#
+# Print the snapshot short name (no leading '@') for a node key and timestamp.
+# rc 2 if the node key is not [a-z0-9]+ or the timestamp is not valid: seance
+# writes only names it would itself parse, and the asymmetry with the parser
+# below is deliberate -- we are strict in what we send.
+pol_snap_format()
+{
+    local _node _ts
+
+    _node=${1:-}
+    _ts=${2:-}
+
+    case "${_node}" in
+        ''|*[!abcdefghijklmnopqrstuvwxyz0123456789]*) return 2 ;;
+    esac
+
+    pol_ts_valid "${_ts}" || return 2
+
+    printf '%s%s-%s\n' "${POL_SNAP_PREFIX}" "${_node}" "${_ts}"
+}
+
+# pol_snap_parse <shortname>
+#
+# Parse a snapshot short name -- the part after the '@'. Prints
+# "<node><TAB><ts>" and rc 0; rc 1 for anything that does not parse, which is
+# "foreign, ignore, not an error": other tools' snapshots live in the same
+# datasets and seance must walk past them without comment.
+#
+# PARSE FROM THE RIGHT (handoff §2.1). Node names may contain dashes, so the
+# timestamp is the *final* dash-delimited field and the node is everything
+# between the prefix and that dash, verbatim -- including a node name that
+# itself ends in something that looks like a timestamp.
+#
+# We are liberal in what we accept: the node field is not required to be a
+# [a-z0-9]+ config key, because names written by another node, another seance
+# version or a hand-made replica must still be understood. It is required to
+# be made of characters ZFS permits in a snapshot name and nothing else, so
+# that a name carrying whitespace, a tab or a stray byte sequence is refused
+# rather than fed into a tab-separated record.
+pol_snap_parse()
+{
+    local _in _rest _node _ts
+
+    _in=${1:-}
+
+    case "${_in}" in
+        "${POL_SNAP_PREFIX}"*) ;;
+        *) return 1 ;;
+    esac
+
+    _rest=${_in#"${POL_SNAP_PREFIX}"}
+
+    case "${_rest}" in
+        *-*) ;;
+        *) return 1 ;;
+    esac
+
+    _ts=${_rest##*-}
+    _node=${_rest%-*}
+
+    [ -n "${_node}" ] || return 1
+
+    case "${_node}" in
+        *[!abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.:-]*)
+            return 1
+            ;;
+    esac
+
+    pol_ts_valid "${_ts}" || return 1
+
+    printf '%s\t%s\n' "${_node}" "${_ts}"
+}
+
+# pol_snap_split <dataset@shortname>
+#
+# Print "<dataset><TAB><shortname>". rc 1 if the argument is not a snapshot
+# reference -- no '@', more than one '@', or an empty half. Like pol_snap_parse
+# this is a data verdict, not a contract error: it is fed lines from a listing
+# that may contain anything.
+pol_snap_split()
+{
+    local _in _ds _short
+
+    _in=${1:-}
+
+    case "${_in}" in
+        *@*@*) return 1 ;;
+        *@*) ;;
+        *) return 1 ;;
+    esac
+
+    _ds=${_in%@*}
+    _short=${_in#*@}
+
+    [ -n "${_ds}" ] || return 1
+    [ -n "${_short}" ] || return 1
+
+    printf '%s\t%s\n' "${_ds}" "${_short}"
+}
+
+# ---------------------------------------------------------------------------
+# Age, staleness, clock skew
+# ---------------------------------------------------------------------------
+
+# pol_age <snap_ts> <now_epoch> <skew_tolerance>
+#
+# Print the age of a snapshot in seconds.
+#
+#   past, or future by at most the tolerance -> the age (0 when future), rc 0
+#   future by more than the tolerance        -> the negative delta,      rc 1
+#
+# rc 1 is a clock-skew violation and callers treat it as hostile: a replica
+# stamped in the future either came from a node whose clock is wrong -- in
+# which case every staleness number derived from it is a fiction -- or from
+# something that is not seance. Nothing about it is safe to average away, so it
+# is reported rather than clamped, and the negative number is the evidence.
+#
+# rc 2 for an invalid timestamp or non-integer arguments.
+pol_age()
+{
+    local _ts _now _skew _age
+
+    _ts=${1:-}
+    _now=${2:-}
+    _skew=${3:-}
+
+    pol_is_int "${_now}" --signed || return 2
+    pol_is_int "${_skew}" || return 2
+
+    _age=$( pol_ts_to_epoch "${_ts}" ) || return 2
+    _age=$(( _now - _age ))
+
+    if [ "${_age}" -ge 0 ]; then
+        printf '%s\n' "${_age}"
+        return 0
+    fi
+
+    if [ $(( -_age )) -le "${_skew}" ]; then
+        printf '0\n'
+        return 0
+    fi
+
+    printf '%s\n' "${_age}"
+    return 1
+}
+
+# pol_is_stale <age> <staleness_max>   -- rc 0 fresh, rc 1 stale, rc 2 garbage.
+#
+# The boundary: stale iff age > staleness_max. An age exactly equal to the
+# threshold is FRESH. The threshold is a promise about what has been captured,
+# not about what has elapsed since -- with the default staleness_max of three
+# cadences, a replica whose age is exactly three cadences has missed no tick,
+# and refusing it would make the very first on-time snapshot after a slow tick
+# unusable. (Decision D-28.)
+pol_is_stale()
+{
+    local _age _max
+
+    _age=${1:-}
+    _max=${2:-}
+
+    pol_is_int "${_age}" --signed || return 2
+    pol_is_int "${_max}" || return 2
+
+    [ "${_age}" -gt "${_max}" ] && return 1
+
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# Quorum
+# ---------------------------------------------------------------------------
+
+# pol_quorum <N> <reachable_others>
+#
+# Print "act" rc 0, "freeze" rc 1, or "reject" rc 2.
+#
+# The rule is the design's: a node may act only if it plus the peers it can
+# still reach are a strict majority of the configured cluster,
+#
+#     1 + reachable > N / 2
+#
+# evaluated as 2 * (1 + reachable) > N so that integer division never rounds a
+# half-split into a majority. N=4 with two survivors is 6 > 4, act; N=4 split
+# two-two is 4 > 4, freeze -- availability sacrificed, consistency never.
+#
+# "reject" is a configuration verdict, not a runtime one: N < 2 is not a
+# cluster, and more reachable others than there are other nodes means the
+# caller counted something twice.
+pol_quorum()
+{
+    local _n _r
+
+    _n=${1:-}
+    _r=${2:-}
+
+    if ! pol_is_int "${_n}" || ! pol_is_int "${_r}"; then
+        printf 'reject\n'
+        return 2
+    fi
+
+    if [ "${_n}" -lt 2 ]; then
+        printf 'reject\n'
+        return 2
+    fi
+
+    if [ "${_r}" -gt $(( _n - 1 )) ]; then
+        printf 'reject\n'
+        return 2
+    fi
+
+    if [ $(( 2 * (1 + _r) )) -gt "${_n}" ]; then
+        printf 'act\n'
+        return 0
+    fi
+
+    printf 'freeze\n'
+    return 1
+}
+
+# ---------------------------------------------------------------------------
+# Succession
+# ---------------------------------------------------------------------------
+
+# pol_heirs <node_heir1> <node_heir2> <guest_heir1> <guest_heir2>
+#
+# Print the succession order, one heir per line, de-duplicated, first heir
+# first. Any argument may be the empty string.
+#
+# A per-guest override replaces the node's order ENTIRELY, and it is the
+# presence of guest_heir1 that switches it on: a guest that names a first heir
+# has had its succession thought about, and silently appending the node's
+# second heir to it would resurrect exactly the arrangement the operator
+# overrode. A guest_heir2 without a guest_heir1 is therefore ignored here and
+# reported by conf_check, which is where a half-written override belongs.
+# (Decision D-29.)
+#
+# rc 1, and no output, when there is no heir at all -- a guest whose home node
+# has no heir is not inheritable, and the caller must say so rather than
+# promote to nobody.
+pol_heirs()
+{
+    local _h1 _h2 _out
+
+    if [ -n "${3:-}" ]; then
+        _h1=${3:-}
+        _h2=${4:-}
+    else
+        _h1=${1:-}
+        _h2=${2:-}
+    fi
+
+    _out=""
+
+    [ -n "${_h1}" ] && _out=${_h1}
+
+    if [ -n "${_h2}" ] && [ "${_h2}" != "${_h1}" ]; then
+        if [ -n "${_out}" ]; then
+            _out="${_out}
+${_h2}"
+        else
+            _out=${_h2}
+        fi
+    fi
+
+    [ -n "${_out}" ] || return 1
+
+    printf '%s\n' "${_out}"
+}
+
+# pol_am_i_actor <self> <heir1> <heir2> <heir1_reachable 0|1>
+#
+# Print "act" rc 0 or "stand-down" rc 1. rc 2 on a malformed call.
+#
+# Exactly one survivor acts per failure, and the tie is broken by the
+# configured order rather than by a race: the first heir acts; the second heir
+# acts only when the first heir is unreachable, which is the caller's
+# measurement to make and to defend -- this function is told the answer, it
+# does not probe. A node always reaches itself, so heir1 calling this with
+# heir1_reachable=0 is a caller bug and not a scenario; it is not defended
+# against here because the defence belongs where the measurement is made. An
+# empty heir1 with heir1_reachable=0 is the "no first heir configured" case and
+# the second heir acts.
+pol_am_i_actor()
+{
+    local _self _h1 _h2 _reach
+
+    _self=${1:-}
+    _h1=${2:-}
+    _h2=${3:-}
+    _reach=${4:-}
+
+    [ -n "${_self}" ] || return 2
+
+    case "${_reach}" in
+        0|1) ;;
+        *) return 2 ;;
+    esac
+
+    if [ -n "${_h1}" ] && [ "${_self}" = "${_h1}" ]; then
+        printf 'act\n'
+        return 0
+    fi
+
+    if [ -n "${_h2}" ] && [ "${_self}" = "${_h2}" ] && [ "${_reach}" -eq 0 ]
+    then
+        printf 'act\n'
+        return 0
+    fi
+
+    printf 'stand-down\n'
+    return 1
+}
+
+# ---------------------------------------------------------------------------
+# Retention
+# ---------------------------------------------------------------------------
+
+# _pol_retention_ages <now_epoch> <recent> <hourly>
+#
+# Read timestamps on stdin, one per line, any order, duplicates allowed. Print
+# "<ts><TAB><age>" ascending by timestamp, de-duplicated. rc 2 if any line is
+# not a valid timestamp.
+#
+# An unparsable line is a hard error rather than a skip. The complement of this
+# function decides what gets destroyed, and a name we did not understand must
+# never fall out of "keep" and into "prune" by default.
+#
+# Ages are pol_age with a skew tolerance of zero, with a future timestamp
+# clamped to age 0 rather than propagated as a negative. Retention's job is to
+# choose what to destroy; a snapshot from the future is the last thing that
+# should be destroyed on the strength of arithmetic we already know is wrong.
+# The skew itself is diagnosed by pol_age at its real tolerance in status.
+_pol_retention_ages()
+{
+    local _now _line _lines _sorted _ts _age _oifs
+
+    _now=$1
+
+    _lines=""
+    while IFS= read -r _line || [ -n "${_line}" ]; do
+        [ -n "${_line}" ] || continue
+        pol_ts_valid "${_line}" || return 2
+        _lines="${_lines}${_line}
+"
+        _line=""
+    done
+
+    [ -n "${_lines}" ] || return 0
+
+    _sorted=$( printf '%s' "${_lines}" | LC_ALL=C sort -u ) || return 2
+
+    _oifs=$IFS
+    IFS='
+'
+    # shellcheck disable=SC2086
+    #   Deliberate word splitting on newline: ${_sorted} is a list of
+    #   timestamps, each of which is validated above to be sixteen characters
+    #   of [0123456789TZ] and so cannot word-split further or glob.
+    for _ts in ${_sorted}; do
+        IFS=$_oifs
+        _age=$( pol_age "${_ts}" "${_now}" 0 ) || _age=0
+        printf '%s\t%s\n' "${_ts}" "${_age}"
+        IFS='
+'
+    done
+    IFS=$_oifs
+}
+
+# pol_retention_keep <now_epoch> <retention_recent> <retention_hourly>
+#
+# Read timestamps on stdin; print those to KEEP, one per line, ascending.
+#
+#   age <= retention_recent                      keep, unconditionally
+#   retention_recent < age <= retention_hourly   keep the newest of each UTC
+#                                                hour bucket in this band
+#   age > retention_hourly                       drop
+#
+# Both boundaries are inclusive on the longer-lived side: a snapshot whose age
+# is exactly retention_recent is recent, and one exactly at retention_hourly is
+# still eligible for its hour. "At the threshold" is inside the window it names
+# throughout seance (see pol_is_stale, decision D-28).
+#
+# rc 2 on an invalid timestamp or non-integer argument.
+pol_retention_keep()
+{
+    local _now _recent _hourly _rows _row _ts _age _bucket _curb _cand _out
+    local _oifs
+
+    _now=${1:-}
+    _recent=${2:-}
+    _hourly=${3:-}
+
+    pol_is_int "${_now}" --signed || return 2
+    pol_is_int "${_recent}" || return 2
+    pol_is_int "${_hourly}" || return 2
+
+    _rows=$( _pol_retention_ages "${_now}" ) || return 2
+    [ -n "${_rows}" ] || return 0
+
+    _out=""
+    _curb=""
+    _cand=""
+
+    _oifs=$IFS
+    IFS='
+'
+    # shellcheck disable=SC2086
+    #   Deliberate word splitting on newline: each element is
+    #   "<timestamp><TAB><age>", neither field of which can contain a newline.
+    for _row in ${_rows}; do
+        IFS=$_oifs
+
+        _ts=${_row%	*}
+        _age=${_row#*	}
+
+        if [ "${_age}" -gt "${_hourly}" ]; then
+            :
+        elif [ "${_age}" -gt "${_recent}" ]; then
+            _bucket=${_ts%?????}
+            if [ "${_bucket}" != "${_curb}" ]; then
+                [ -n "${_cand}" ] && _out="${_out}${_cand}
+"
+                _curb=${_bucket}
+            fi
+            _cand=${_ts}
+        else
+            if [ -n "${_cand}" ]; then
+                _out="${_out}${_cand}
+"
+                _cand=""
+                _curb=""
+            fi
+            _out="${_out}${_ts}
+"
+        fi
+
+        IFS='
+'
+    done
+    IFS=$_oifs
+
+    [ -n "${_cand}" ] && _out="${_out}${_cand}
+"
+
+    [ -n "${_out}" ] || return 0
+
+    printf '%s' "${_out}" | LC_ALL=C sort
+}
+
+# pol_retention_prune <now_epoch> <retention_recent> <retention_hourly>
+#
+# The complement of pol_retention_keep over the same input: the timestamps to
+# destroy, one per line, ascending. rc 2 on invalid input.
+pol_retention_prune()
+{
+    pol_retention_prune_protected "${1:-}" "${2:-}" "${3:-}" ""
+}
+
+# pol_retention_prune_protected <now_epoch> <retention_recent>
+#                               <retention_hourly> [protected-list-file]
+#
+# pol_retention_prune, minus anything named in the protected list -- a file of
+# timestamps, one per line, that must never be printed as prunable whatever the
+# ladder says. An empty or absent path protects nothing.
+#
+# This is the seam the replication engine uses to defend the newest snapshot it
+# has in common with a peer. That snapshot is the base of the next incremental
+# send; destroying it because it aged out turns the next tick into a full
+# resend at best, and at worst breaks the lineage the promotion path reads. The
+# protection belongs to repl, which is the only layer that knows what a peer
+# has acknowledged, so the policy engine takes it as an argument and asks no
+# questions. (The parameter order follows its siblings: the file is last.)
+pol_retention_prune_protected()
+{
+    local _now _recent _hourly _prot _rows _keep _protected _row _ts _out _oifs
+
+    _now=${1:-}
+    _recent=${2:-}
+    _hourly=${3:-}
+    _prot=${4:-}
+
+    pol_is_int "${_now}" --signed || return 2
+    pol_is_int "${_recent}" || return 2
+    pol_is_int "${_hourly}" || return 2
+
+    _rows=$( _pol_retention_ages "${_now}" ) || return 2
+    [ -n "${_rows}" ] || return 0
+
+    _keep=$( printf '%s\n' "${_rows}" | cut -f 1 |
+        pol_retention_keep "${_now}" "${_recent}" "${_hourly}" ) || return 2
+
+    _protected=""
+    if [ -n "${_prot}" ] && [ -r "${_prot}" ]; then
+        _protected=$( LC_ALL=C sort -u < "${_prot}" ) || return 2
+    fi
+
+    _out=""
+    _oifs=$IFS
+    IFS='
+'
+    # shellcheck disable=SC2086
+    #   Deliberate word splitting on newline, as in pol_retention_keep.
+    for _row in ${_rows}; do
+        IFS=$_oifs
+        _ts=${_row%	*}
+
+        case "
+${_keep}
+" in
+            *"
+${_ts}
+"*) IFS='
+'; continue ;;
+        esac
+
+        case "
+${_protected}
+" in
+            *"
+${_ts}
+"*) IFS='
+'; continue ;;
+        esac
+
+        _out="${_out}${_ts}
+"
+        IFS='
+'
+    done
+    IFS=$_oifs
+
+    [ -n "${_out}" ] || return 0
+
+    printf '%s' "${_out}"
+}
+
+# ---------------------------------------------------------------------------
+# Lineage
+# ---------------------------------------------------------------------------
+
+# pol_lineage_disposition <newest_replica_ts|""> <now_epoch> <staleness_max>
+#                         <skew_tolerance> <force 0|1>
+#
+# The M1 subset of the promotion ladder (handoff §4): the staleness and lineage
+# rungs and nothing else. Prints exactly one of
+#
+#   proceed         rc 0  a replica exists and is inside the staleness window
+#   proceed-forced  rc 0  it is stale or skewed, and an operator said --force
+#   force-only      rc 1  it is stale or skewed and no operator has said so
+#   abort           rc 1  there is no lineage at all
+#
+# "abort" is unreachable by --force on purpose. Staleness is a judgement about
+# how much data a promotion would lose, and a human is entitled to accept that
+# loss; an absent replica is not a judgement but a fact, and there is nothing
+# on the disk to promote. --force skips exactly the rungs it names (TESTING.md
+# §5) and it cannot name this one.
+#
+# rc 2 on a malformed call.
+pol_lineage_disposition()
+{
+    local _ts _now _max _skew _force _age _rc
+
+    _ts=${1:-}
+    _now=${2:-}
+    _max=${3:-}
+    _skew=${4:-}
+    _force=${5:-}
+
+    pol_is_int "${_now}" --signed || return 2
+    pol_is_int "${_max}" || return 2
+    pol_is_int "${_skew}" || return 2
+
+    case "${_force}" in
+        0|1) ;;
+        *) return 2 ;;
+    esac
+
+    if [ -z "${_ts}" ]; then
+        printf 'abort\n'
+        return 1
+    fi
+
+    pol_ts_valid "${_ts}" || return 2
+
+    _age=$( pol_age "${_ts}" "${_now}" "${_skew}" )
+    _rc=$?
+    [ "${_rc}" -eq 2 ] && return 2
+
+    # _rc 0 from pol_age means "not skewed"; rc 0 from pol_is_stale means
+    # "fresh" (it returns the verdict, not the predicate).
+    if [ "${_rc}" -eq 0 ] && pol_is_stale "${_age}" "${_max}"; then
+        printf 'proceed\n'
+        return 0
+    fi
+
+    if [ "${_force}" -eq 1 ]; then
+        printf 'proceed-forced\n'
+        return 0
+    fi
+
+    printf 'force-only\n'
+    return 1
+}

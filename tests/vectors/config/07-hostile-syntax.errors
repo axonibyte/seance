@@ -1,0 +1,6 @@
+CONF:1: carriage return in line (CRLF line endings are not supported)
+CONF:2: not a comment and not key=value
+CONF:3: bad key "Cadence": keys are [a-z0-9_]+
+CONF:4: unknown key "cadance"
+CONF:5: unknown key "node_alpha_mgnt"
+CONF:7: duplicate key "node_alpha_nodename"

@@ -1,0 +1,21 @@
+fleet default cadence 900
+fleet default retention_recent 14400
+fleet default retention_hourly 172800
+fleet set staleness_max 5400
+fleet default skew_tolerance 120
+fleet default debounce 45
+fleet default fence_timeout 60
+fleet default ssh_user root
+fleet default ssh_port 22
+fleet unset ssh_extra_opts
+fleet set standby_root poolname/standby
+fleet set notify_cmd /usr/local/bin/page --to ops # not a comment
+fleet unset witness
+names alpha alpha-01.example.net
+names bravo bravo-01.example.net
+node alpha nodename alpha-01.example.net
+node alpha mgmt alpha-mgmt.example.net
+node alpha heir bravo
+node bravo nodename bravo-01.example.net
+node bravo mgmt bravo-mgmt.example.net
+node bravo heir alpha

@@ -1,0 +1,946 @@
+# seance -- the configuration file: parsed, never sourced.
+#
+# Sourced by seance, never executed. This file reads seance.conf; it does not
+# run it. That is the whole point (handoff §2.2): a config file that is sourced
+# cannot be validated, cannot be tested with hostile input, and hands whoever
+# can write it the shell. A file that is parsed can be told it is wrong before
+# anything acts on it, which is what 'seance config --check' exists to do.
+#
+# The grammar, in full:
+#
+#   * a line is stripped of leading whitespace before anything else;
+#   * an empty line is ignored;
+#   * a line whose first character is then '#' is a comment and is ignored.
+#     '#' introduces a comment ONLY there: seance.conf has no quoting, so a '#'
+#     after a value is part of the value, and a notify_cmd containing one must
+#     survive the trip (decision D-30);
+#   * every other line is <key>=<value>. The key is [a-z0-9_]+ and must be one
+#     seance knows. The value is the rest of the line with trailing whitespace
+#     removed and nothing else done to it -- no quotes, no escapes, no
+#     expansion (handoff §2.2);
+#   * a carriage return anywhere in a line is an error, not whitespace to trim
+#     (decision D-31);
+#   * a key that appears twice is an error (decision D-32).
+#
+# Values are stored in one shell variable as newline-joined key=value records.
+# No temporary files, and above all no eval: a value goes in as text and comes
+# out as text.
+#
+# CONF_FLEET_KEYS, CONF_NODE_KEYS and CONF_GUEST_KEYS below are the single
+# source of truth for the vocabulary. tests/tier3/t_config_keys.sh reads them
+# out of this file as text and cross-checks them against etc/seance.conf.sample
+# in both directions, so a key added here and not documented -- or documented
+# and not implemented -- fails the build.
+#
+# shellcheck shell=sh
+# shellcheck disable=SC3043
+#   'local' is not in POSIX sh but is implemented by FreeBSD /bin/sh (sh(1),
+#   "local"); seance targets FreeBSD sh and nothing else (handoff §5).
+
+# The vocabulary. Each list is one line, deliberately: tests/tier3 extracts it
+# from this source text rather than from a re-export, so that the guard is
+# asserting against the definition and not against a copy of it. The order of
+# CONF_FLEET_KEYS is also conf_dump's order.
+CONF_FLEET_KEYS="cadence retention_recent retention_hourly staleness_max skew_tolerance debounce fence_timeout ssh_user ssh_port ssh_extra_opts standby_root notify_cmd witness"
+CONF_NODE_KEYS="nodename mgmt heir heir2 fence_driver fence_target"
+CONF_GUEST_KEYS="cadence staleness_max heir heir2"
+
+# Fleet keys whose value is computed from other configuration when unset.
+CONF_DERIVED_KEYS="staleness_max"
+
+# Fleet keys whose value, when unset, is worked out at run time from facts this
+# file cannot see (the host's dataset layout). conf_dump reports them as
+# "runtime" rather than inventing a value (D-6).
+CONF_RUNTIME_KEYS="standby_root"
+
+# The defaults table. A fleet key absent from here and from CONF_DERIVED_KEYS
+# and CONF_RUNTIME_KEYS has no default at all: unset means unset, and the
+# feature it configures is off (notify_cmd unset -> syslog only, handoff §2.5).
+CONF_DEFAULTS="
+cadence=900
+retention_recent=14400
+retention_hourly=172800
+skew_tolerance=120
+debounce=45
+fence_timeout=60
+ssh_user=root
+ssh_port=22
+"
+
+# Sanity ranges for conf_check: "<key> <min> <max>", inclusive.
+#
+# The cadence floor of 60 s is a decision (D-33): the snapshot name carries one
+# second of resolution and the send has to finish before the next tick fires,
+# so below a minute the schedule stops being a schedule and becomes a queue.
+# The ceiling of one day is where "replication" stops describing what happens.
+CONF_RANGES="
+cadence 60 86400
+retention_recent 60 31536000
+retention_hourly 60 31536000
+staleness_max 60 604800
+skew_tolerance 0 3600
+debounce 0 3600
+fence_timeout 1 3600
+ssh_port 1 65535
+"
+
+CONF_DATA=""
+CONF_FILE=""
+CONF_NODE_ORDER=""
+CONF_GUEST_ORDER=""
+CONF_NAME_ORDER=""
+CONF_PROBLEMS=""
+CONF_PROBLEM_COUNT=0
+CONF_SEEN_NODENAMES=""
+
+# A literal newline, carriage return and tab, built without depending on any
+# escape being understood inside a case pattern.
+CONF_NL='
+'
+CONF_CR=$( printf '\r.' )
+CONF_CR=${CONF_CR%.}
+CONF_TAB=$( printf '\t.' )
+CONF_TAB=${CONF_TAB%.}
+
+# ---------------------------------------------------------------------------
+# Vocabulary helpers
+# ---------------------------------------------------------------------------
+
+# _conf_in_list <word> <space-separated list>  -- rc 0 if present.
+_conf_in_list()
+{
+    case " $2 " in
+        *" $1 "*) return 0 ;;
+    esac
+
+    return 1
+}
+
+# _conf_name_ok <name>  -- rc 0 if <name> is a legal node or guest key.
+#
+# [a-z0-9]+ and nothing else, so that node and guest names can be embedded in
+# config keys and in snapshot names without a quoting story (handoff §2.2,
+# D-4). Written as an explicit character list rather than a range, because
+# bracket ranges outside the C locale are unspecified.
+_conf_name_ok()
+{
+    case "${1:-}" in
+        ''|*[!abcdefghijklmnopqrstuvwxyz0123456789]*) return 1 ;;
+    esac
+
+    return 0
+}
+
+# _conf_field <space-separated record> <n>  -- print the nth word, 1-based.
+_conf_field()
+{
+    local _rec _n
+
+    _rec=$1
+    _n=$2
+
+    # shellcheck disable=SC2086
+    #   Deliberate word splitting: ${_rec} is a fixed-shape record of words
+    #   produced by this file, none of which can contain whitespace.
+    set -- ${_rec}
+
+    [ "$#" -ge "${_n}" ] || return 1
+
+    while [ "${_n}" -gt 1 ]; do
+        shift
+        _n=$(( _n - 1 ))
+    done
+
+    printf '%s\n' "$1"
+}
+
+# conf_classify <key>
+#
+# Print the key's shape and return 0, or return 1 if seance does not know it:
+#
+#   fleet <key>
+#   node <nodekey> <field>
+#   guest <guestkey> <field>
+#   names <name>
+conf_classify()
+{
+    local _k _rest _n _f
+
+    _k=${1:-}
+
+    case "${_k}" in
+        node_*)
+            _rest=${_k#node_}
+            _n=${_rest%%_*}
+            _f=${_rest#*_}
+            [ "${_n}" != "${_rest}" ] || return 1
+            _conf_name_ok "${_n}" || return 1
+            _conf_in_list "${_f}" "${CONF_NODE_KEYS}" || return 1
+            printf 'node %s %s\n' "${_n}" "${_f}"
+            ;;
+        guest_*)
+            _rest=${_k#guest_}
+            _n=${_rest%%_*}
+            _f=${_rest#*_}
+            [ "${_n}" != "${_rest}" ] || return 1
+            _conf_name_ok "${_n}" || return 1
+            _conf_in_list "${_f}" "${CONF_GUEST_KEYS}" || return 1
+            printf 'guest %s %s\n' "${_n}" "${_f}"
+            ;;
+        names_*)
+            _n=${_k#names_}
+            _conf_name_ok "${_n}" || return 1
+            printf 'names %s\n' "${_n}"
+            ;;
+        *)
+            _conf_in_list "${_k}" "${CONF_FLEET_KEYS}" || return 1
+            printf 'fleet %s\n' "${_k}"
+            ;;
+    esac
+
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# Loading
+# ---------------------------------------------------------------------------
+
+# conf_reset  -- forget everything loaded so far.
+conf_reset()
+{
+    CONF_DATA=""
+    CONF_FILE=""
+    CONF_NODE_ORDER=""
+    CONF_GUEST_ORDER=""
+    CONF_NAME_ORDER=""
+    CONF_PROBLEMS=""
+    CONF_PROBLEM_COUNT=0
+}
+
+# First-appearance order. Written out three times rather than through an eval
+# or a nameref, because the reason this file parses instead of sourcing is that
+# it does not evaluate its input, and that discipline does not get an exception
+# for its own bookkeeping.
+_conf_note_node()
+{
+    _conf_in_list "$1" "${CONF_NODE_ORDER}" && return 0
+    CONF_NODE_ORDER="${CONF_NODE_ORDER} $1"
+    CONF_NODE_ORDER=${CONF_NODE_ORDER# }
+}
+
+_conf_note_guest()
+{
+    _conf_in_list "$1" "${CONF_GUEST_ORDER}" && return 0
+    CONF_GUEST_ORDER="${CONF_GUEST_ORDER} $1"
+    CONF_GUEST_ORDER=${CONF_GUEST_ORDER# }
+}
+
+_conf_note_name()
+{
+    _conf_in_list "$1" "${CONF_NAME_ORDER}" && return 0
+    CONF_NAME_ORDER="${CONF_NAME_ORDER} $1"
+    CONF_NAME_ORDER=${CONF_NAME_ORDER# }
+}
+
+# conf_load <file>
+#
+# Parse a config file into memory. rc 0 on success; rc 2 with one
+# "<file>:<line>: <message>" per fault on stderr otherwise.
+#
+# EVERY fault is reported, not just the first. 'config --check' is the tool an
+# operator reaches for after editing a file at 03:00; telling them about one
+# typo at a time, with a full round trip per typo, is how a check gets skipped.
+#
+# An unknown key is one of those faults and it stops the load (decision D-34).
+# A mistyped key is not a key seance ignores -- it is a setting the operator
+# believes is in force and is not -- so every verb refuses to run rather than
+# quietly using the default the typo hid.
+conf_load()
+{
+    local _file _line _no _k _v _bad _shape
+
+    _file=${1:-}
+    conf_reset
+    CONF_FILE=${_file}
+
+    if [ -z "${_file}" ]; then
+        echo "conf_load: no file given" >&2
+        return 2
+    fi
+
+    if [ ! -r "${_file}" ]; then
+        printf '%s: not readable\n' "${_file}" >&2
+        return 2
+    fi
+
+    _no=0
+    _bad=0
+    _line=""
+
+    while IFS= read -r _line || [ -n "${_line}" ]; do
+        _no=$(( _no + 1 ))
+
+        case "${_line}" in
+            *"${CONF_CR}"*)
+                printf '%s:%d: carriage return in line (CRLF line endings are not supported)\n' \
+                    "${_file}" "${_no}" >&2
+                _bad=$(( _bad + 1 ))
+                _line=""
+                continue
+                ;;
+        esac
+
+        while :; do
+            case "${_line}" in
+                ' '*) _line=${_line# } ;;
+                "${CONF_TAB}"*) _line=${_line#"${CONF_TAB}"} ;;
+                *) break ;;
+            esac
+        done
+
+        case "${_line}" in
+            ''|'#'*) _line=""; continue ;;
+        esac
+
+        case "${_line}" in
+            *=*) ;;
+            *)
+                printf '%s:%d: not a comment and not key=value\n' \
+                    "${_file}" "${_no}" >&2
+                _bad=$(( _bad + 1 ))
+                _line=""
+                continue
+                ;;
+        esac
+
+        _k=${_line%%=*}
+        _v=${_line#*=}
+
+        while :; do
+            case "${_v}" in
+                *' ') _v=${_v% } ;;
+                *"${CONF_TAB}") _v=${_v%"${CONF_TAB}"} ;;
+                *) break ;;
+            esac
+        done
+
+        case "${_k}" in
+            ''|*[!abcdefghijklmnopqrstuvwxyz0123456789_]*)
+                printf '%s:%d: bad key "%s": keys are [a-z0-9_]+\n' \
+                    "${_file}" "${_no}" "${_k}" >&2
+                _bad=$(( _bad + 1 ))
+                _line=""
+                continue
+                ;;
+        esac
+
+        if ! _shape=$( conf_classify "${_k}" ); then
+            printf '%s:%d: unknown key "%s"\n' "${_file}" "${_no}" "${_k}" >&2
+            _bad=$(( _bad + 1 ))
+            _line=""
+            continue
+        fi
+
+        if conf_has "${_k}"; then
+            printf '%s:%d: duplicate key "%s"\n' \
+                "${_file}" "${_no}" "${_k}" >&2
+            _bad=$(( _bad + 1 ))
+            _line=""
+            continue
+        fi
+
+        case "${_shape}" in
+            'node '*)  _conf_note_node  "$( _conf_field "${_shape}" 2 )" ;;
+            'guest '*) _conf_note_guest "$( _conf_field "${_shape}" 2 )" ;;
+            'names '*) _conf_note_name  "$( _conf_field "${_shape}" 2 )" ;;
+        esac
+
+        CONF_DATA="${CONF_DATA}${CONF_NL}${_k}=${_v}"
+        _line=""
+    done < "${_file}"
+
+    # A file that did not parse leaves nothing loaded, not the half of it that
+    # happened to be above the first fault. A caller that ignored the exit
+    # status would otherwise run on a config that is neither the file's nor the
+    # defaults', which is the worst of the three possible states.
+    if [ "${_bad}" -ne 0 ]; then
+        conf_reset
+        CONF_FILE=${_file}
+        return 2
+    fi
+
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# Reading
+# ---------------------------------------------------------------------------
+
+# conf_file  -- the path conf_load was last given, loaded or not. Diagnostics
+# only: a message about a config file that does not name the file is a message
+# an operator has to go and reconstruct.
+conf_file()
+{
+    printf '%s\n' "${CONF_FILE}"
+}
+
+# conf_has <key>  -- rc 0 if the key was set in the file.
+conf_has()
+{
+    case "${CONF_DATA}" in
+        *"${CONF_NL}$1="*) return 0 ;;
+    esac
+
+    return 1
+}
+
+# conf_get <key> [default]
+#
+# Print the value the file gave, or the default if one was supplied. rc 1, and
+# no output, when the key is unset and there is no default. A key set to
+# nothing (`notify_cmd=`) is SET: it prints nothing and returns 0, which is why
+# conf_check has a rule about exactly that.
+conf_get()
+{
+    local _rest
+
+    case "${CONF_DATA}" in
+        *"${CONF_NL}$1="*)
+            _rest=${CONF_DATA#*"${CONF_NL}$1="}
+            printf '%s\n' "${_rest%%"${CONF_NL}"*}"
+            return 0
+            ;;
+    esac
+
+    if [ $# -ge 2 ]; then
+        printf '%s\n' "$2"
+        return 0
+    fi
+
+    return 1
+}
+
+# conf_default <key>  -- print the static default, rc 1 if there is none.
+conf_default()
+{
+    local _rest
+
+    case "${CONF_DEFAULTS}" in
+        *"${CONF_NL}$1="*)
+            _rest=${CONF_DEFAULTS#*"${CONF_NL}$1="}
+            printf '%s\n' "${_rest%%"${CONF_NL}"*}"
+            return 0
+            ;;
+    esac
+
+    return 1
+}
+
+# conf_effective <key> [guest]
+#
+# Resolve a key the way the running system sees it: a per-guest override, then
+# the fleet setting, then the default. rc 1 when there is no value anywhere,
+# which for notify_cmd, witness, ssh_extra_opts and standby_root is a normal
+# answer and not a failure.
+#
+# staleness_max, when nobody has set it, is three times the cadence THAT GUEST
+# actually gets -- so a guest with a five-minute cadence is called stale after
+# fifteen minutes, not after three fleet cadences. Deriving it from the fleet
+# cadence instead would make the most tightly replicated guest the slowest to
+# be noticed as dead, which is exactly backwards.
+conf_effective()
+{
+    local _key _guest _cad
+
+    _key=${1:-}
+    _guest=${2:-}
+
+    if [ -n "${_guest}" ] && _conf_in_list "${_key}" "${CONF_GUEST_KEYS}"; then
+        conf_get "guest_${_guest}_${_key}" && return 0
+    fi
+
+    conf_get "${_key}" && return 0
+
+    if [ "${_key}" = "staleness_max" ]; then
+        _cad=$( conf_effective cadence "${_guest}" ) || return 1
+        case "${_cad}" in
+            ''|*[!0123456789]*) return 1 ;;
+        esac
+        printf '%s\n' "$(( _cad * 3 ))"
+        return 0
+    fi
+
+    conf_default "${_key}" && return 0
+
+    return 1
+}
+
+# conf_nodes  -- the node keys, one per line, in order of first appearance.
+conf_nodes()
+{
+    local _n
+
+    # shellcheck disable=SC2086
+    #   Deliberate word splitting: node keys are [a-z0-9]+ by conf_classify.
+    set -- ${CONF_NODE_ORDER}
+
+    for _n in "$@"; do
+        printf '%s\n' "${_n}"
+    done
+}
+
+# conf_guests  -- guest keys carrying an override, first-appearance order.
+conf_guests()
+{
+    local _g
+
+    # shellcheck disable=SC2086
+    #   Deliberate word splitting: guest keys are [a-z0-9]+ by conf_classify.
+    set -- ${CONF_GUEST_ORDER}
+
+    for _g in "$@"; do
+        printf '%s\n' "${_g}"
+    done
+}
+
+# conf_node_count  -- N: the configured cluster size quorum is measured against.
+conf_node_count()
+{
+    # shellcheck disable=SC2086
+    #   Deliberate word splitting: node keys are [a-z0-9]+ by conf_classify.
+    set -- ${CONF_NODE_ORDER}
+
+    printf '%s\n' "$#"
+}
+
+# conf_self_key <nodename>
+#
+# Print the config node key whose node_<key>_nodename is <nodename>. rc 1 if no
+# node claims it -- which on a real host means this node is not in its own
+# config, and is a hard failure wherever it is asked (D-4).
+conf_self_key()
+{
+    local _want _n
+
+    _want=${1:-}
+    [ -n "${_want}" ] || return 1
+
+    # shellcheck disable=SC2086
+    #   Deliberate word splitting: node keys are [a-z0-9]+ by conf_classify.
+    set -- ${CONF_NODE_ORDER}
+
+    for _n in "$@"; do
+        if [ "$( conf_get "node_${_n}_nodename" "" )" = "${_want}" ]; then
+            printf '%s\n' "${_n}"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+# ---------------------------------------------------------------------------
+# Validation
+# ---------------------------------------------------------------------------
+
+_conf_problem()
+{
+    CONF_PROBLEM_COUNT=$(( CONF_PROBLEM_COUNT + 1 ))
+    CONF_PROBLEMS="${CONF_PROBLEMS}problem: $*${CONF_NL}"
+}
+
+# _conf_int_in_range <key> <label> [guest]
+#
+# Check one integer-valued setting against CONF_RANGES, reporting through
+# _conf_problem. Silent when the key has no value at all.
+_conf_int_in_range()
+{
+    local _key _label _guest _v _row _min _max _oifs
+
+    _key=$1
+    _label=$2
+    _guest=${3:-}
+
+    _v=$( conf_effective "${_key}" "${_guest}" ) || return 0
+
+    case "${_v}" in
+        ''|*[!0123456789]*)
+            _conf_problem "${_label}: \"${_v}\" is not a non-negative integer"
+            return 0
+            ;;
+    esac
+
+    _min=""
+    _max=""
+
+    _oifs=$IFS
+    IFS="${CONF_NL}"
+    # shellcheck disable=SC2086
+    #   Deliberate word splitting on newline: CONF_RANGES is a table of rows.
+    set -- ${CONF_RANGES}
+    IFS=$_oifs
+
+    for _row in "$@"; do
+        case "${_row}" in
+            "${_key} "*)
+                _min=$( _conf_field "${_row}" 2 )
+                _max=$( _conf_field "${_row}" 3 )
+                ;;
+        esac
+    done
+
+    [ -n "${_min}" ] || return 0
+
+    if [ "${_v}" -lt "${_min}" ] || [ "${_v}" -gt "${_max}" ]; then
+        _conf_problem "${_label}: ${_v} is outside ${_min}..${_max}"
+    fi
+}
+
+# _conf_word_ok <value>  -- rc 0 if the value is a single non-empty word.
+_conf_word_ok()
+{
+    [ -n "${1:-}" ] || return 1
+
+    case "$1" in
+        *' '*|*"${CONF_TAB}"*) return 1 ;;
+    esac
+
+    return 0
+}
+
+# _conf_ge <label> <a-key> <a-value> <b-key> <b-value>
+#
+# Report a problem unless <a-value> >= <b-value>. Both must already be
+# integers; a non-integer has been reported by _conf_int_in_range and is not
+# reported twice.
+_conf_ge()
+{
+    case "$3$5" in
+        ''|*[!0123456789]*) return 0 ;;
+    esac
+
+    [ "$3" -ge "$5" ] && return 0
+
+    _conf_problem "$1: $2 $3 is below $4 $5"
+}
+
+# _conf_check_heirs <label> <self-or-empty> <heir> <heir2> <known node keys>
+#
+# The succession rules, applied identically to a node's own heirs and to a
+# guest's override: an heir must be a configured node, must not be the node
+# itself, the two must differ, and a second heir without a first is a
+# half-written override that pol_heirs will ignore in silence -- so it is named
+# here instead (D-29).
+_conf_check_heirs()
+{
+    local _label _self _h1 _h2 _nodes
+
+    _label=$1
+    _self=$2
+    _h1=$3
+    _h2=$4
+    _nodes=$5
+
+    if [ -n "${_h1}" ]; then
+        _conf_in_list "${_h1}" "${_nodes}" ||
+            _conf_problem "${_label}: heir \"${_h1}\" is not a configured node"
+        [ "${_h1}" != "${_self}" ] ||
+            _conf_problem "${_label}: heir is the node itself"
+    fi
+
+    if [ -n "${_h2}" ]; then
+        _conf_in_list "${_h2}" "${_nodes}" ||
+            _conf_problem "${_label}: heir2 \"${_h2}\" is not a configured node"
+        [ "${_h2}" != "${_self}" ] ||
+            _conf_problem "${_label}: heir2 is the node itself"
+        [ "${_h2}" != "${_h1}" ] ||
+            _conf_problem "${_label}: heir and heir2 are the same node"
+        [ -n "${_h1}" ] ||
+            _conf_problem "${_label}: heir2 is set without an heir"
+    fi
+}
+
+# _conf_check_node <nodekey>
+_conf_check_node()
+{
+    local _n _v _nodename
+
+    _n=$1
+
+    _nodename=$( conf_get "node_${_n}_nodename" "" )
+    if [ -z "${_nodename}" ]; then
+        _conf_problem "node ${_n}: node_${_n}_nodename is required"
+    elif ! _conf_word_ok "${_nodename}"; then
+        _conf_problem "node ${_n}: nodename must be a single non-empty word"
+    elif _conf_in_list "${_nodename}" "${CONF_SEEN_NODENAMES}"; then
+        _conf_problem "node ${_n}: nodename \"${_nodename}\" is claimed by more than one node key"
+    else
+        CONF_SEEN_NODENAMES="${CONF_SEEN_NODENAMES} ${_nodename}"
+    fi
+
+    _v=$( conf_get "node_${_n}_mgmt" "" )
+    if [ -z "${_v}" ]; then
+        _conf_problem "node ${_n}: node_${_n}_mgmt is required"
+    elif ! _conf_word_ok "${_v}"; then
+        _conf_problem "node ${_n}: mgmt must be a single non-empty word"
+    fi
+
+    _conf_check_heirs "node ${_n}" "${_n}" \
+        "$( conf_get "node_${_n}_heir" "" )" \
+        "$( conf_get "node_${_n}_heir2" "" )" \
+        "${CONF_NODE_ORDER}"
+
+    if conf_has "node_${_n}_fence_driver"; then
+        _v=$( conf_get "node_${_n}_fence_driver" "" )
+        case "${_v}" in
+            ''|*[!abcdefghijklmnopqrstuvwxyz0123456789_]*)
+                _conf_problem "node ${_n}: fence_driver \"${_v}\" is not [a-z0-9_]+"
+                ;;
+        esac
+    fi
+
+    if conf_has "node_${_n}_fence_target"; then
+        _conf_word_ok "$( conf_get "node_${_n}_fence_target" "" )" ||
+            _conf_problem "node ${_n}: fence_target must be a single non-empty word"
+        conf_has "node_${_n}_fence_driver" ||
+            _conf_problem "node ${_n}: fence_target is set without a fence_driver"
+    fi
+}
+
+# _conf_check_guest <guestkey>
+_conf_check_guest()
+{
+    local _g
+
+    _g=$1
+
+    _conf_int_in_range cadence "guest ${_g}: cadence" "${_g}"
+    _conf_int_in_range staleness_max "guest ${_g}: staleness_max" "${_g}"
+
+    _conf_ge "guest ${_g}" \
+        staleness_max "$( conf_effective staleness_max "${_g}" )" \
+        cadence "$( conf_effective cadence "${_g}" )"
+
+    _conf_check_heirs "guest ${_g}" "" \
+        "$( conf_get "guest_${_g}_heir" "" )" \
+        "$( conf_get "guest_${_g}_heir2" "" )" \
+        "${CONF_NODE_ORDER}"
+}
+
+# conf_check
+#
+# Validate what has been loaded. Prints one "problem: ..." line per fault and
+# then a verdict line -- "PASS", or "FAIL: <n> problems". rc 0 or 1.
+#
+# The verdict line is the whole point and it is last, so that it survives a
+# scrollback. 'seance config --check' prints this and nothing else: this line
+# IS the verb's verdict line, and repeating it would only invite the two copies
+# to disagree one day.
+conf_check()
+{
+    local _n _count
+
+    CONF_PROBLEMS=""
+    CONF_PROBLEM_COUNT=0
+    CONF_SEEN_NODENAMES=""
+
+    _count=$( conf_node_count )
+
+    if [ "${_count}" -eq 0 ]; then
+        _conf_problem "no nodes are configured: seance needs at least two, each with a nodename and a mgmt address"
+    elif [ "${_count}" -eq 1 ]; then
+        _conf_problem "only one node is configured: a witness-less cluster of one is not a cluster"
+    fi
+
+    _conf_int_in_range cadence "cadence"
+    _conf_int_in_range retention_recent "retention_recent"
+    _conf_int_in_range retention_hourly "retention_hourly"
+    _conf_int_in_range staleness_max "staleness_max"
+    _conf_int_in_range skew_tolerance "skew_tolerance"
+    _conf_int_in_range debounce "debounce"
+    _conf_int_in_range fence_timeout "fence_timeout"
+    _conf_int_in_range ssh_port "ssh_port"
+
+    _conf_ge "fleet" \
+        staleness_max "$( conf_effective staleness_max )" \
+        cadence "$( conf_effective cadence )"
+    _conf_ge "fleet" \
+        retention_hourly "$( conf_effective retention_hourly )" \
+        retention_recent "$( conf_effective retention_recent )"
+
+    if conf_has ssh_user && ! _conf_word_ok "$( conf_get ssh_user "" )"; then
+        _conf_problem "ssh_user must be a single non-empty word"
+    fi
+
+    if conf_has notify_cmd && [ -z "$( conf_get notify_cmd "" )" ]; then
+        _conf_problem "notify_cmd is set to nothing: remove the line to mean syslog only"
+    fi
+
+    if conf_has witness && ! _conf_word_ok "$( conf_get witness "" )"; then
+        _conf_problem "witness must be a single non-empty word"
+    fi
+
+    if conf_has standby_root &&
+       ! _conf_word_ok "$( conf_get standby_root "" )"; then
+        _conf_problem "standby_root must be a single non-empty word"
+    fi
+
+    # shellcheck disable=SC2086
+    #   Deliberate word splitting: node keys are [a-z0-9]+ by conf_classify.
+    set -- ${CONF_NODE_ORDER}
+    for _n in "$@"; do
+        _conf_check_node "${_n}"
+    done
+
+    # shellcheck disable=SC2086
+    #   Deliberate word splitting: guest keys are [a-z0-9]+ by conf_classify.
+    set -- ${CONF_GUEST_ORDER}
+    for _n in "$@"; do
+        _conf_check_guest "${_n}"
+    done
+
+    # shellcheck disable=SC2086
+    #   Deliberate word splitting: display-name keys are [a-z0-9]+.
+    set -- ${CONF_NAME_ORDER}
+    for _n in "$@"; do
+        _conf_word_ok "$( conf_get "names_${_n}" "" )" ||
+            _conf_problem "names_${_n} must be a single non-empty word"
+    done
+
+    if [ "${CONF_PROBLEM_COUNT}" -eq 0 ]; then
+        printf 'PASS\n'
+        return 0
+    fi
+
+    printf '%s' "${CONF_PROBLEMS}"
+    printf 'FAIL: %d problems\n' "${CONF_PROBLEM_COUNT}"
+
+    return 1
+}
+
+# ---------------------------------------------------------------------------
+# Reporting
+# ---------------------------------------------------------------------------
+
+# _conf_emit <prefix...> -- print the words, dropping a trailing empty value so
+# that an unset or empty setting never leaves a trailing space behind.
+_conf_emit()
+{
+    local _out
+
+    _out="$*"
+
+    while :; do
+        case "${_out}" in
+            *' ') _out=${_out% } ;;
+            *) break ;;
+        esac
+    done
+
+    printf '%s\n' "${_out}"
+}
+
+# conf_dump
+#
+# Print the effective configuration in a stable order and a stable shape, one
+# record per line, the value always last so that a value containing spaces --
+# notify_cmd will -- stays unambiguous:
+#
+#   fleet <origin> <key> [value]
+#   names <name> <display>
+#   node <nodekey> <field> <value>
+#   guest <guestkey> <origin> <field> [value]
+#
+# Origins: set (the file said so), default (the table said so), derived
+# (computed from other settings), runtime (worked out from host facts this
+# process cannot see), unset (no value anywhere); override and inherited for
+# the per-guest view.
+conf_dump()
+{
+    local _k _n _g _v _origin
+
+    # shellcheck disable=SC2086
+    #   Deliberate word splitting: the vocabulary list is space-separated.
+    set -- ${CONF_FLEET_KEYS}
+    for _k in "$@"; do
+        if conf_has "${_k}"; then
+            _origin="set"
+        elif _conf_in_list "${_k}" "${CONF_DERIVED_KEYS}"; then
+            _origin="derived"
+        elif _conf_in_list "${_k}" "${CONF_RUNTIME_KEYS}"; then
+            _origin="runtime"
+        elif conf_default "${_k}" >/dev/null; then
+            _origin="default"
+        else
+            _origin="unset"
+        fi
+
+        case "${_origin}" in
+            runtime|unset) _v="" ;;
+            *) _v=$( conf_effective "${_k}" ) || _v="" ;;
+        esac
+
+        _conf_emit "fleet" "${_origin}" "${_k}" "${_v}"
+    done
+
+    # shellcheck disable=SC2086
+    #   Deliberate word splitting: display-name keys are [a-z0-9]+.
+    set -- ${CONF_NAME_ORDER}
+    for _n in "$@"; do
+        _conf_emit "names" "${_n}" "$( conf_get "names_${_n}" "" )"
+    done
+
+    # shellcheck disable=SC2086
+    #   Deliberate word splitting: node keys are [a-z0-9]+ by conf_classify.
+    set -- ${CONF_NODE_ORDER}
+    for _n in "$@"; do
+        _conf_dump_node "${_n}"
+    done
+
+    # shellcheck disable=SC2086
+    #   Deliberate word splitting: guest keys are [a-z0-9]+ by conf_classify.
+    set -- ${CONF_GUEST_ORDER}
+    for _g in "$@"; do
+        _conf_dump_guest "${_g}"
+    done
+}
+
+_conf_dump_node()
+{
+    local _n _k
+
+    _n=$1
+
+    # shellcheck disable=SC2086
+    #   Deliberate word splitting: the vocabulary list is space-separated.
+    set -- ${CONF_NODE_KEYS}
+    for _k in "$@"; do
+        conf_has "node_${_n}_${_k}" || continue
+        _conf_emit "node" "${_n}" "${_k}" \
+            "$( conf_get "node_${_n}_${_k}" "" )"
+    done
+}
+
+_conf_dump_guest()
+{
+    local _g _k _v _origin
+
+    _g=$1
+
+    # shellcheck disable=SC2086
+    #   Deliberate word splitting: the vocabulary list is space-separated.
+    set -- ${CONF_GUEST_KEYS}
+    for _k in "$@"; do
+        if conf_has "guest_${_g}_${_k}"; then
+            _origin="override"
+        else
+            _origin="inherited"
+        fi
+
+        if _v=$( conf_effective "${_k}" "${_g}" ); then
+            _conf_emit "guest" "${_g}" "${_origin}" "${_k}" "${_v}"
+        else
+            _conf_emit "guest" "${_g}" "unset" "${_k}"
+        fi
+    done
+}

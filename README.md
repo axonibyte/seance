@@ -12,10 +12,12 @@ file that is not in this repository.
 Design rationale is in `DESIGN.md`; the testing contract is in `TESTING.md`;
 the implementation brief is in `HANDOFF.md`.
 
-## Status: M0 — scaffolding spike
+## Status: M1 in progress — policy and configuration
 
-The module scaffold, the test harness, and the tier-3 guards exist. **No seance
-logic exists yet.** The only verb is `version`.
+The module scaffold, the test harness and the tier-3 guards are in place, and
+so are the two files that hold every decision seance makes: the pure policy
+functions and the configuration parser. **Nothing touches ZFS, CBSD or the
+network yet.** The verbs are `config` and `version`.
 
 What is here:
 
@@ -25,9 +27,24 @@ What is here:
 | `seance` | the CBSD verb, a `cbsdsh` wrapper that execs `bin/seance` |
 | `bin/seance` | the dispatcher, plain `/bin/sh` |
 | `lib/common.subr` | logging, exit discipline, RC capture, temp dirs |
+| `lib/policy.subr` | the policy engine: snapshot names, UTC time arithmetic, staleness, quorum, succession, retention, lineage — pure functions, no clock but one injectable "now" |
+| `lib/conf.subr` | the configuration file, parsed and never sourced |
+| `etc/seance.conf.sample` | every key, documented, with its default |
 | `tools/lint.sh` | `sh -n`, `shellcheck`, tiers 1–4 |
-| `tests/` | the harness and the tier directories |
+| `tests/` | the harness, the tier directories, and the committed vectors |
 | `docs/cbsd-module-notes.md` | what M0 learned about CBSD, with citations |
+
+```sh
+seance config            # the effective configuration, then a verdict line
+seance config --check    # one line per problem; exit 0 valid, 1 invalid,
+                         #   2 the file could not be parsed
+seance config --file /path/to/seance.conf --check
+seance version
+```
+
+The configuration file is `$SEANCE_CONF` if set, otherwise
+`$SEANCE_CBSD_WORKDIR/etc/seance.conf` — which is `~cbsd/etc/seance.conf` on a
+node running under CBSD.
 
 ## Running the tests
 

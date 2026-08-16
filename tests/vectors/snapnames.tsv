@@ -1,0 +1,87 @@
+# seance snapshot-name vectors -- the wire protocol's oracle.
+#
+# Format: four TAB-separated columns.
+#
+#   input     the snapshot SHORT name, the part after the '@'
+#   verdict   ok | foreign
+#   node      the expected node field, or - when the verdict is foreign
+#   ts        the expected timestamp,  or - when the verdict is foreign
+#
+# Lines beginning with '#' and blank lines are ignored. Nothing else in this
+# file is a comment: a '#' inside an input column is part of the input.
+#
+# This file is the oracle. Two implementations meet on this grammar -- the
+# replication engine that writes names and the status/promote paths that read
+# them -- so neither of them gets to be the authority, and a change to the
+# parser that these rows do not sanction is a change to the wire protocol.
+#
+# "foreign" means ignore-not-error (handoff §2.1): other tools keep snapshots
+# in the same datasets, and seance must walk past a name it does not recognise
+# without comment and without a non-zero exit.
+#
+# The parse runs from the RIGHT. Node names may contain dashes, and one may
+# itself end in something that looks like a timestamp; those rows are the
+# reason the grammar is specified the way it is, and they are the first rows
+# a rewrite will break.
+seance-alpha-20260816T101500Z	ok	alpha	20260816T101500Z
+seance-bravo-20260816T101500Z	ok	bravo	20260816T101500Z
+seance-a-19700101T000000Z	ok	a	19700101T000000Z
+seance-n1-20260816T000000Z	ok	n1	20260816T000000Z
+seance-alpha-20260816T235959Z	ok	alpha	20260816T235959Z
+seance-alpha-00010101T000000Z	ok	alpha	00010101T000000Z
+seance-alpha-99991231T235959Z	ok	alpha	99991231T235959Z
+seance-node-with-dashes-20260816T101500Z	ok	node-with-dashes	20260816T101500Z
+seance-a-b-c-d-e-20260816T101500Z	ok	a-b-c-d-e	20260816T101500Z
+seance-a-b-20260816T101500Z	ok	a-b	20260816T101500Z
+seance---20260816T101500Z	ok	-	20260816T101500Z
+seance-1234567890123456-20260816T101500Z	ok	1234567890123456	20260816T101500Z
+seance-x-1234567890123456-20260816T101500Z	ok	x-1234567890123456	20260816T101500Z
+seance-20260816T101500Z-20260816T101500Z	ok	20260816T101500Z	20260816T101500Z
+seance-node-20260816T101500Z-20260817T101500Z	ok	node-20260816T101500Z	20260817T101500Z
+seance-Alpha-20260816T101500Z	ok	Alpha	20260816T101500Z
+seance-host.example.net-20260816T101500Z	ok	host.example.net	20260816T101500Z
+seance-a_b-20260816T101500Z	ok	a_b	20260816T101500Z
+seance-a:b-20260816T101500Z	ok	a:b	20260816T101500Z
+seance-alpha-20000229T000000Z	ok	alpha	20000229T000000Z
+seance-alpha-20240229T235959Z	ok	alpha	20240229T235959Z
+seance-alpha-20200229T120000Z	ok	alpha	20200229T120000Z
+seance-alpha-20260229T101500Z	foreign	-	-
+seance-alpha-19000229T101500Z	foreign	-	-
+seance-alpha-21000229T101500Z	foreign	-	-
+seance-alpha-20260230T101500Z	foreign	-	-
+seance-alpha-20261316T101500Z	foreign	-	-
+seance-alpha-20260016T101500Z	foreign	-	-
+seance-alpha-20260832T101500Z	foreign	-	-
+seance-alpha-20260800T101500Z	foreign	-	-
+seance-alpha-20260816T241500Z	foreign	-	-
+seance-alpha-20260816T106000Z	foreign	-	-
+seance-alpha-20260816T101560Z	foreign	-	-
+seance-alpha-20260816T10150Z	foreign	-	-
+seance-alpha-20260816T1015000Z	foreign	-	-
+seance-alpha-2026081T101500Z	foreign	-	-
+seance-alpha-20260816T101500	foreign	-	-
+seance-alpha-20260816101500Z	foreign	-	-
+seance-alpha-20260816T101500z	foreign	-	-
+seance-alpha-20260816t101500Z	foreign	-	-
+seance-alpha-2026-08-16T101500Z	foreign	-	-
+seance-alpha-20260816T10:15:00Z	foreign	-	-
+seance--20260816T101500Z	foreign	-	-
+seance-20260816T101500Z	foreign	-	-
+seance-alpha-	foreign	-	-
+seance-	foreign	-	-
+seance	foreign	-	-
+	foreign	-	-
+seance-alpha-20260816T101500Z-extra	foreign	-	-
+zrepl-alpha-20260816T101500Z	foreign	-	-
+zfs-auto-snap_daily-2026-08-16-1015	foreign	-	-
+SEANCE-alpha-20260816T101500Z	foreign	-	-
+Seance-alpha-20260816T101500Z	foreign	-	-
+seance_alpha-20260816T101500Z	foreign	-	-
+xseance-alpha-20260816T101500Z	foreign	-	-
+manual-before-upgrade	foreign	-	-
+seance-node name-20260816T101500Z	foreign	-	-
+seance-nodé-20260816T101500Z	foreign	-	-
+seance-のーど-20260816T101500Z	foreign	-	-
+seance-node/child-20260816T101500Z	foreign	-	-
+seance-node@x-20260816T101500Z	foreign	-	-
+seance-node%s-20260816T101500Z	foreign	-	-

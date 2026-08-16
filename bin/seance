@@ -24,6 +24,12 @@ readonly SEANCE_ROOT
 # shellcheck source-path=SCRIPTDIR
 # shellcheck source=../lib/common.subr
 . "${SEANCE_ROOT}/lib/common.subr"
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=../lib/policy.subr
+. "${SEANCE_ROOT}/lib/policy.subr"
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=../lib/conf.subr
+. "${SEANCE_ROOT}/lib/conf.subr"
 
 seance_usage()
 {
@@ -31,8 +37,14 @@ seance_usage()
 usage: seance <verb> [args]
 
 Verbs:
+  config [--check] [--file <path>]
+                     print the effective configuration; --check validates it
+                     and prints one line per problem
   version            print the seance version
   help, --help, -h   print this usage
+
+The configuration file is \$SEANCE_CONF if set, otherwise
+\$SEANCE_CBSD_WORKDIR/etc/seance.conf, otherwise --file must say.
 
 Exit codes: 0 ok, 1 operation failed, 2 usage or contract error.
 EOF
@@ -56,6 +68,91 @@ seance_version()
     echo "seance ${_v}"
 }
 
+# seance_conf_path
+#
+# Print the configuration file this node uses, per decision D-3: SEANCE_CONF
+# wins (it is how the test tiers and the pseudo-cluster point seance at a file
+# of their own), then the workdir CBSD told the wrapper about. rc 1 when
+# neither is available, because guessing a path is how a node ends up running
+# on a config nobody edited.
+seance_conf_path()
+{
+    if [ -n "${SEANCE_CONF:-}" ]; then
+        printf '%s\n' "${SEANCE_CONF}"
+        return 0
+    fi
+
+    if [ -n "${SEANCE_CBSD_WORKDIR:-}" ]; then
+        printf '%s\n' "${SEANCE_CBSD_WORKDIR}/etc/seance.conf"
+        return 0
+    fi
+
+    return 1
+}
+
+# seance_config [--check] [--file <path>]
+#
+# Without --check: the effective configuration, then the validation verdict
+# line -- so that a config which cannot be trusted says so on the same screen
+# that shows what it currently means. The problem list is left to --check,
+# which is where an operator goes to fix it.
+#
+# Exit status is the verdict: 0 valid, 1 loaded but invalid, 2 could not be
+# parsed or was never found.
+seance_config()
+{
+    local _check _file _rc
+
+    _check=0
+    _file=""
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --check)
+                _check=1
+                ;;
+            --file)
+                [ $# -ge 2 ] || seance_die 2 "config: --file needs a path"
+                _file=$2
+                shift
+                ;;
+            --file=*)
+                _file=${1#--file=}
+                ;;
+            *)
+                seance_die 2 "config: unknown argument: $1"
+                ;;
+        esac
+        shift
+    done
+
+    if [ -z "${_file}" ]; then
+        _file=$( seance_conf_path ) ||
+            seance_die 2 "config: no config file: set SEANCE_CONF, or run under CBSD, or pass --file"
+    fi
+
+    conf_load "${_file}" || exit 2
+
+    if [ "${_check}" -eq 1 ]; then
+        conf_check
+        return $?
+    fi
+
+    conf_dump
+
+    conf_check > /dev/null
+    _rc=$?
+
+    if [ "${_rc}" -eq 0 ]; then
+        printf 'PASS\n'
+    else
+        printf 'FAIL: %d problems (run "seance config --check" for the list)\n' \
+            "${CONF_PROBLEM_COUNT}"
+    fi
+
+    return "${_rc}"
+}
+
 if [ $# -eq 0 ]; then
     seance_usage >&2
     exit 2
@@ -65,6 +162,10 @@ _verb=$1
 shift
 
 case "${_verb}" in
+    config)
+        seance_config "$@"
+        exit $?
+        ;;
     version)
         seance_version
         ;;

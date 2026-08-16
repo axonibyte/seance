@@ -1,0 +1,351 @@
+#!/bin/sh
+# Tier 1 -- conf_check: every rule has a fixture that breaks it.
+#
+# A validator is only worth what its failing cases prove. Every rule below gets
+# a config that violates exactly it, and the assertion is that the rule fires;
+# the committed sample is the positive control at the top, so a rule that has
+# started firing on a perfectly good file also shows up here.
+#
+# The verdict line is asserted as well as the problem lines. It is the last
+# line on purpose -- it survives a scrollback, and it is what
+# 'seance config --check' hands back as its own verdict rather than printing a
+# second one that could one day disagree with it.
+#
+# shellcheck disable=SC3043
+#   'local' is not in POSIX sh but is implemented by FreeBSD /bin/sh (sh(1),
+#   "local"); seance targets FreeBSD sh and nothing else (handoff §5).
+set -u
+
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=../lib/harness.subr
+. "$( dirname "$( realpath "$0" )" )/../lib/harness.subr"
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=../../lib/conf.subr
+. "${T_ROOT}/lib/conf.subr"
+
+DIR=$( t_tmpdir )
+N=0
+
+# A two-node config that passes, to which each fixture adds its own fault.
+GOOD='node_alpha_nodename=alpha.example.net
+node_alpha_mgmt=alpha-mgmt.example.net
+node_alpha_heir=bravo
+node_bravo_nodename=bravo.example.net
+node_bravo_mgmt=bravo-mgmt.example.net
+node_bravo_heir=alpha'
+
+# rule <name> <expected problem substring> -- extra config lines on stdin
+#
+# Builds GOOD plus the lines given, loads it, and asserts both that the check
+# fails and that it fails for the stated reason. Two assertions per rule: a
+# check that fails for the wrong reason is not the check being tested.
+rule()
+{
+    local _name _want _f _out
+
+    _name=$1
+    _want=$2
+    N=$(( N + 1 ))
+    _f="${DIR}/rule${N}.conf"
+
+    printf '%s\n' "${GOOD}" > "${_f}"
+    cat >> "${_f}"
+
+    if ! conf_load "${_f}"; then
+        t_not_ok "${_name}: fixture parses"
+        t_not_ok "${_name}"
+        return 0
+    fi
+    t_ok "${_name}: fixture parses"
+
+    if _out=$( conf_check ); then
+        t_not_ok "${_name}"
+        t_diag "conf_check passed a config it should have rejected"
+        t_diag "${_out}"
+        return 0
+    fi
+
+    t_like "${_out}" "${_want}" "${_name}"
+}
+
+t_plan 85
+
+# --- the positive control --------------------------------------------------
+
+t_rc 0 "the committed sample parses" -- \
+    conf_load "${T_ROOT}/etc/seance.conf.sample"
+t_stdout_is "PASS" "the committed sample passes the check" -- conf_check
+t_rc 0 "and the check exits 0" -- conf_check
+
+printf '%s\n' "${GOOD}" > "${DIR}/good.conf"
+conf_load "${DIR}/good.conf" || t_diag "good.conf failed to load"
+t_stdout_is "PASS" "the two-node base fixture passes" -- conf_check
+
+# --- cluster size ----------------------------------------------------------
+
+printf '' > "${DIR}/nonodes.conf"
+conf_load "${DIR}/nonodes.conf" || t_diag "nonodes.conf failed to load"
+t_like "$( conf_check )" 'problem: no nodes are configured' \
+    "a config with no nodes fails"
+t_rc 1 "and exits 1" -- conf_check
+
+cat > "${DIR}/onenode.conf" <<'EOF'
+node_alpha_nodename=alpha.example.net
+node_alpha_mgmt=alpha-mgmt.example.net
+EOF
+conf_load "${DIR}/onenode.conf" || t_diag "onenode.conf failed to load"
+t_like "$( conf_check )" \
+    'problem: only one node is configured: a witness-less cluster of one is not a cluster' \
+    "a cluster of one is not a cluster"
+
+# --- required node fields --------------------------------------------------
+
+rule "a node without a nodename fails" \
+    'problem: node charlie: node_charlie_nodename is required' <<'EOF'
+node_charlie_mgmt=charlie-mgmt.example.net
+EOF
+
+rule "a node without a mgmt address fails" \
+    'problem: node charlie: node_charlie_mgmt is required' <<'EOF'
+node_charlie_nodename=charlie.example.net
+EOF
+
+rule "a nodename with a space in it fails" \
+    'problem: node charlie: nodename must be a single non-empty word' <<'EOF'
+node_charlie_nodename=charlie one
+node_charlie_mgmt=charlie-mgmt.example.net
+EOF
+
+rule "a mgmt address with a space in it fails" \
+    'problem: node charlie: mgmt must be a single non-empty word' <<'EOF'
+node_charlie_nodename=charlie.example.net
+node_charlie_mgmt=charlie mgmt
+EOF
+
+rule "two node keys claiming one nodename fails" \
+    'problem: node charlie: nodename "alpha.example.net" is claimed by more than one node key' <<'EOF'
+node_charlie_nodename=alpha.example.net
+node_charlie_mgmt=charlie-mgmt.example.net
+EOF
+
+# --- succession ------------------------------------------------------------
+
+rule "an heir that is not a configured node fails" \
+    'problem: node charlie: heir "delta" is not a configured node' <<'EOF'
+node_charlie_nodename=charlie.example.net
+node_charlie_mgmt=charlie-mgmt.example.net
+node_charlie_heir=delta
+EOF
+
+rule "a node that is its own heir fails" \
+    'problem: node charlie: heir is the node itself' <<'EOF'
+node_charlie_nodename=charlie.example.net
+node_charlie_mgmt=charlie-mgmt.example.net
+node_charlie_heir=charlie
+EOF
+
+rule "a node that is its own second heir fails" \
+    'problem: node charlie: heir2 is the node itself' <<'EOF'
+node_charlie_nodename=charlie.example.net
+node_charlie_mgmt=charlie-mgmt.example.net
+node_charlie_heir=alpha
+node_charlie_heir2=charlie
+EOF
+
+rule "the same node named as both heirs fails" \
+    'problem: node charlie: heir and heir2 are the same node' <<'EOF'
+node_charlie_nodename=charlie.example.net
+node_charlie_mgmt=charlie-mgmt.example.net
+node_charlie_heir=alpha
+node_charlie_heir2=alpha
+EOF
+
+rule "a second heir with no first heir fails" \
+    'problem: node charlie: heir2 is set without an heir' <<'EOF'
+node_charlie_nodename=charlie.example.net
+node_charlie_mgmt=charlie-mgmt.example.net
+node_charlie_heir2=alpha
+EOF
+
+rule "a guest heir that is not a configured node fails" \
+    'problem: guest db01: heir "delta" is not a configured node' <<'EOF'
+guest_db01_heir=delta
+EOF
+
+rule "a guest heir2 with no guest heir fails" \
+    'problem: guest db01: heir2 is set without an heir' <<'EOF'
+guest_db01_heir2=alpha
+EOF
+
+# --- integer ranges --------------------------------------------------------
+
+rule "a cadence below the floor fails" \
+    'problem: cadence: 30 is outside 60\.\.86400' <<'EOF'
+cadence=30
+EOF
+
+rule "a cadence above the ceiling fails" \
+    'problem: cadence: 90000 is outside 60\.\.86400' <<'EOF'
+cadence=90000
+EOF
+
+rule "a cadence that is not a number fails" \
+    'problem: cadence: "often" is not a non-negative integer' <<'EOF'
+cadence=often
+EOF
+
+rule "a negative cadence fails" \
+    'problem: cadence: "-60" is not a non-negative integer' <<'EOF'
+cadence=-60
+EOF
+
+rule "an ssh port of zero fails" \
+    'problem: ssh_port: 0 is outside 1\.\.65535' <<'EOF'
+ssh_port=0
+EOF
+
+rule "an ssh port above 65535 fails" \
+    'problem: ssh_port: 65536 is outside 1\.\.65535' <<'EOF'
+ssh_port=65536
+EOF
+
+rule "a fence_timeout of zero fails" \
+    'problem: fence_timeout: 0 is outside 1\.\.3600' <<'EOF'
+fence_timeout=0
+EOF
+
+rule "a skew tolerance beyond an hour fails" \
+    'problem: skew_tolerance: 3601 is outside 0\.\.3600' <<'EOF'
+skew_tolerance=3601
+EOF
+
+rule "a debounce that is not a number fails" \
+    'problem: debounce: "soon" is not a non-negative integer' <<'EOF'
+debounce=soon
+EOF
+
+rule "a retention_recent below the floor fails" \
+    'problem: retention_recent: 30 is outside 60\.\.31536000' <<'EOF'
+retention_recent=30
+EOF
+
+# --- cross-field consistency ----------------------------------------------
+
+rule "a staleness_max below the cadence fails" \
+    'problem: fleet: staleness_max 600 is below cadence 900' <<'EOF'
+cadence=900
+staleness_max=600
+EOF
+
+rule "a retention_hourly below retention_recent fails" \
+    'problem: fleet: retention_hourly 3600 is below retention_recent 14400' <<'EOF'
+retention_hourly=3600
+EOF
+
+rule "a guest staleness_max below its own cadence fails" \
+    'problem: guest db01: staleness_max 300 is below cadence 3600' <<'EOF'
+guest_db01_cadence=3600
+guest_db01_staleness_max=300
+EOF
+
+rule "a guest cadence outside the range fails" \
+    'problem: guest db01: cadence: 10 is outside 60\.\.86400' <<'EOF'
+guest_db01_cadence=10
+EOF
+
+# --- the optional strings --------------------------------------------------
+
+rule "notify_cmd set to nothing fails" \
+    'problem: notify_cmd is set to nothing' <<'EOF'
+notify_cmd=
+EOF
+
+rule "an empty ssh_user fails" \
+    'problem: ssh_user must be a single non-empty word' <<'EOF'
+ssh_user=
+EOF
+
+rule "an ssh_user with a space fails" \
+    'problem: ssh_user must be a single non-empty word' <<'EOF'
+ssh_user=root admin
+EOF
+
+rule "an empty witness fails" \
+    'problem: witness must be a single non-empty word' <<'EOF'
+witness=
+EOF
+
+rule "an empty standby_root fails" \
+    'problem: standby_root must be a single non-empty word' <<'EOF'
+standby_root=
+EOF
+
+rule "an empty display name fails" \
+    'problem: names_alpha must be a single non-empty word' <<'EOF'
+names_alpha=
+EOF
+
+# --- fencing keys, shape only ---------------------------------------------
+
+rule "a fence_driver that is not [a-z0-9_]+ fails" \
+    'problem: node alpha: fence_driver "IPMI-2" is not' <<'EOF'
+node_alpha_fence_driver=IPMI-2
+node_alpha_fence_target=alpha-bmc.example.net
+EOF
+
+rule "an empty fence_driver fails" \
+    'problem: node alpha: fence_driver "" is not' <<'EOF'
+node_alpha_fence_driver=
+node_alpha_fence_target=alpha-bmc.example.net
+EOF
+
+rule "a fence_target without a driver fails" \
+    'problem: node alpha: fence_target is set without a fence_driver' <<'EOF'
+node_alpha_fence_target=alpha-bmc.example.net
+EOF
+
+rule "a fence_target with a space fails" \
+    'problem: node alpha: fence_target must be a single non-empty word' <<'EOF'
+node_alpha_fence_driver=ipmi
+node_alpha_fence_target=alpha bmc
+EOF
+
+# A well-formed pair of fencing keys is accepted, because the point of the
+# rules above is shape and not the presence of fencing, which M1 does not use.
+cat > "${DIR}/fence-ok.conf" <<EOF
+${GOOD}
+node_alpha_fence_driver=ipmi
+node_alpha_fence_target=alpha-bmc.example.net
+EOF
+conf_load "${DIR}/fence-ok.conf" || t_diag "fence-ok.conf failed to load"
+t_stdout_is "PASS" "well-formed fencing keys are accepted" -- conf_check
+
+# --- the verdict line ------------------------------------------------------
+
+cat > "${DIR}/three.conf" <<EOF
+${GOOD}
+cadence=30
+ssh_port=0
+notify_cmd=
+EOF
+conf_load "${DIR}/three.conf" || t_diag "three.conf failed to load"
+out=$( conf_check )
+t_like "${out}" '^FAIL: 3 problems$' "the verdict counts the problems"
+t_is "$( printf '%s\n' "${out}" | tail -n 1 )" "FAIL: 3 problems" \
+    "the verdict is the last line"
+t_is "$( printf '%s\n' "${out}" | grep -c '^problem: ' )" "3" \
+    "one line per problem, and no more"
+
+# The check is repeatable: running it twice must not accumulate the first run's
+# problems into the second. Run in THIS shell, redirected to files -- through a
+# command substitution each call gets its own subshell and the accumulation
+# this is looking for could never happen, which would make the assertion look
+# green and mean nothing.
+conf_check > "${DIR}/check1"
+conf_check > "${DIR}/check2"
+t_is "$( cat "${DIR}/check2" )" "$( cat "${DIR}/check1" )" \
+    "conf_check is repeatable in one shell"
+t_is "$( cat "${DIR}/check1" )" "${out}" \
+    "and gives the same answer as it did through a subshell"
+
+t_done

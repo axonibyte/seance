@@ -1,0 +1,13 @@
+Tier 2 -- committed config corpora.
+
+Each <name>.conf is a config file. Beside it:
+
+  <name>.expected   the exact output of conf_dump after loading it
+  <name>.check      the exact output of conf_check after loading it
+  <name>.errors     the exact stderr of conf_load, for a file that must NOT
+                    parse. A corpus has either .expected + .check, or .errors,
+                    never both.
+
+The paths in .errors are written with the placeholder CONF instead of the
+temporary path the test copies the file to, because the message format
+("<file>:<line>: <message>") is part of the contract and the directory is not.

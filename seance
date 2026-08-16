@@ -33,13 +33,25 @@ ${H3_COLOR}Description${N0_COLOR}:
 ${H3_COLOR}Options${N0_COLOR}:
 
  ${N2_COLOR}mode=${N0_COLOR} - verb to run. The verb may also be given bare. Verbs:
+   config  - print the effective configuration and its verdict;
+             'config --check' validates and lists every problem;
    version - print the seance version;
    help    - print dispatcher usage;
+
+ A verb that takes arguments of its own must be given bare rather than as
+ mode=<verb>: only the bare form is known to carry the remaining arguments
+ through to the dispatcher.
+
+ The configuration file is \${SEANCE_CONF} if set, otherwise
+ \${workdir}/etc/seance.conf; 'config --file <path>' overrides both.
 
 ${H3_COLOR}Examples${N0_COLOR}:
 
  # cbsd seance version
  # cbsd seance mode=version
+ # cbsd seance config
+ # cbsd seance config --check
+ # cbsd seance config --file /path/to/seance.conf
  # cbsd seance help
 
 "

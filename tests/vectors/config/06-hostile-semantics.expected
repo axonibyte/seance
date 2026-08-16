@@ -1,0 +1,23 @@
+fleet set cadence 30
+fleet set retention_recent 200000
+fleet set retention_hourly 100000
+fleet derived staleness_max 90
+fleet default skew_tolerance 120
+fleet default debounce 45
+fleet default fence_timeout 60
+fleet default ssh_user root
+fleet set ssh_port 0
+fleet unset ssh_extra_opts
+fleet runtime standby_root
+fleet set notify_cmd
+fleet unset witness
+node alpha nodename alpha.example.net
+node alpha mgmt alpha-mgmt.example.net
+node alpha heir alpha
+node alpha heir2 delta
+node bravo nodename alpha.example.net
+node bravo heir2 alpha
+guest db01 inherited cadence 30
+guest db01 inherited staleness_max 90
+guest db01 unset heir
+guest db01 override heir2 alpha

@@ -1,0 +1,12 @@
+problem: cadence: 30 is outside 60..86400
+problem: ssh_port: 0 is outside 1..65535
+problem: fleet: retention_hourly 100000 is below retention_recent 200000
+problem: notify_cmd is set to nothing: remove the line to mean syslog only
+problem: node alpha: heir is the node itself
+problem: node alpha: heir2 "delta" is not a configured node
+problem: node bravo: nodename "alpha.example.net" is claimed by more than one node key
+problem: node bravo: node_bravo_mgmt is required
+problem: node bravo: heir2 is set without an heir
+problem: guest db01: cadence: 30 is outside 60..86400
+problem: guest db01: heir2 is set without an heir
+FAIL: 11 problems
