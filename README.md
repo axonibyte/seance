@@ -46,6 +46,34 @@ The configuration file is `$SEANCE_CONF` if set, otherwise
 `$SEANCE_CBSD_WORKDIR/etc/seance.conf` — which is `~cbsd/etc/seance.conf` on a
 node running under CBSD.
 
+## Verbs
+
+Every verb the dispatcher answers to has a section here, and every section
+names a verb the dispatcher answers to. `tests/tier3/t_verb_docs.sh` asserts
+both directions against the source, so a verb added without a section — or a
+section left behind after a verb was removed — fails the suite.
+
+### seance config
+
+Print the effective configuration (fleet defaults, then per-node and per-guest
+values), then a verdict line. With `--check`, print one `problem:` line per
+fault and nothing else. `--file <path>` overrides which file is read.
+
+Exit codes: `0` the configuration is valid, `1` it loaded and is invalid, `2`
+it could not be found or could not be parsed.
+
+### seance version
+
+Print `seance <version>`, from the `VERSION` file beside the module. Exit `1`
+if that file is missing or empty — a version seance cannot state is not a
+version it may guess.
+
+### seance help
+
+Print the usage summary: the verbs, where the configuration file is looked
+for, and what the exit codes mean. `seance --help` and `seance -h` are the
+same verb.
+
 ## Running the tests
 
 On a FreeBSD workstation, tiers 1–4 (pure sh, milliseconds):

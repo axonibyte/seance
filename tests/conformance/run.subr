@@ -1,0 +1,164 @@
+# seance -- the adapter conformance runner (TESTING.md §6).
+#
+# ONE suite, run against EVERY adapter: the mock in tier 4 (workstation), the
+# real CBSD adapter in tier 5 (reaper, shape B), the pseudo-cluster adapter in
+# tier 6 (reaper, shape A). "Same contract for every adapter" is a sentence
+# until something mechanical checks it; this is that thing, and it exists from
+# the first adapter onwards rather than after the second one has already
+# drifted.
+#
+# Sourced by a test file that has already sourced the harness and the adapter
+# under test:
+#
+#     SEANCE_ADAPTER=tests/mock-adapter.subr
+#     . "${T_ROOT}/${SEANCE_ADAPTER}"
+#     . "${T_ROOT}/tests/conformance/run.subr"
+#     t_plan "$( conformance_count "${VECTORS}" )"
+#     conformance_run "${VECTORS}"
+#
+# THE WORLD THE VECTORS ASSUME is named by placeholders, not by fixture names,
+# so that one vector file can be run against three adapters whose guests have
+# different names. Each is an environment variable with the mock's fixture as
+# its default:
+#
+#   %JAIL%     SEANCE_CONF_JAIL     a jail-type guest that exists  (web01)
+#   %VM%       SEANCE_CONF_VM       a bhyve guest that exists      (db01)
+#   %HELD%     SEANCE_CONF_HELD     a guest held in slave mode     (arc01)
+#   %ABSENT%   SEANCE_CONF_ABSENT   a name no guest has      (nosuchguest)
+#   %BADNAME%  SEANCE_CONF_BADNAME  a name no guest may have       (UPPER)
+#
+# WHAT EACH ROW ASSERTS, and why there are three assertions in it and not one:
+# the exit status, that stdout has the shape the contract promises, and -- when
+# a row expects output at all -- that stdout is NOT EMPTY. The last one is the
+# crashed-verifier rule (TESTING.md §5) written where every adapter meets it:
+# a function that promised output and exited 0 having printed none has violated
+# its contract, and no caller may read that as a "no".
+#
+# There is no timeout wrapper here. These vectors are the unscripted contract;
+# a hang is what the scripted 'timeout' outcome is for, in tier 4, where the
+# caller's wrapper is part of what is being tested.
+#
+# shellcheck shell=sh
+# shellcheck disable=SC3043
+#   'local' is not in POSIX sh but is implemented by FreeBSD /bin/sh (sh(1),
+#   "local"); seance targets FreeBSD sh and nothing else (handoff §5).
+
+CONFORMANCE_TAB=$( printf '\t' )
+
+# conformance_rows <vectors-file>
+#
+# The vector file with comments and blank lines removed and the world's names
+# substituted. One row per line, four tab-separated fields.
+conformance_rows()
+{
+    sed \
+        -e '/^#/d' \
+        -e '/^[ 	]*$/d' \
+        -e "s|%JAIL%|${SEANCE_CONF_JAIL:-web01}|g" \
+        -e "s|%VM%|${SEANCE_CONF_VM:-db01}|g" \
+        -e "s|%HELD%|${SEANCE_CONF_HELD:-arc01}|g" \
+        -e "s|%ABSENT%|${SEANCE_CONF_ABSENT:-nosuchguest}|g" \
+        -e "s|%BADNAME%|${SEANCE_CONF_BADNAME:-UPPER}|g" \
+        "$1"
+}
+
+# conformance_count <vectors-file>  -- how many assertions conformance_run makes.
+conformance_count()
+{
+    local _rows
+
+    _rows=$( conformance_rows "$1" | wc -l | tr -d ' ' )
+
+    printf '%s\n' "$(( _rows * 3 ))"
+}
+
+# conformance_run <vectors-file>
+#
+# Three harness assertions per row. Reads the rows into memory first: the
+# adapter functions under test are free to read stdin (a listing parser does),
+# and a loop that fed them its own vector file would be a bug that looked like
+# a contract violation.
+conformance_run()
+{
+    local _rows _row _fn _args _shape _rc _dir _got _out _line _bad _oifs
+
+    _rows=$( conformance_rows "$1" )
+
+    _oifs=$IFS
+    IFS='
+'
+    # shellcheck disable=SC2086
+    #   Deliberate word splitting on newline: one vector row per element.
+    for _row in ${_rows}; do
+        IFS=$_oifs
+
+        _fn=$( printf '%s\n' "${_row}" | cut -f 1 )
+        _args=$( printf '%s\n' "${_row}" | cut -f 2 )
+        _shape=$( printf '%s\n' "${_row}" | cut -f 3 )
+        _rc=$( printf '%s\n' "${_row}" | cut -f 4 )
+
+        [ "${_args}" = "-" ] && _args=""
+
+        _dir=$( t_tmpdir )
+
+        # shellcheck disable=SC2086
+        #   Deliberate word splitting: the args field is an argument list.
+        "${_fn}" ${_args} > "${_dir}/out" 2> "${_dir}/err" < /dev/null
+        _got=$?
+
+        if [ "${_got}" -eq "${_rc}" ]; then
+            t_ok "${_fn} ${_args}: exit ${_rc}"
+        else
+            t_not_ok "${_fn} ${_args}: exit ${_rc}"
+            t_diag "got exit ${_got}, want ${_rc}"
+            sed -e 's/^/# stderr: /' "${_dir}/err"
+        fi
+
+        _out=$( cat "${_dir}/out" )
+
+        if [ "${_shape}" = "-" ]; then
+            if [ -z "${_out}" ]; then
+                t_ok "${_fn} ${_args}: prints nothing"
+            else
+                t_not_ok "${_fn} ${_args}: prints nothing"
+                t_diag "stdout: [${_out}]"
+            fi
+            t_ok "${_fn} ${_args}: no shape to check"
+            IFS='
+'
+            continue
+        fi
+
+        if [ -n "${_out}" ]; then
+            t_ok "${_fn} ${_args}: promised output and produced some"
+        else
+            t_not_ok "${_fn} ${_args}: promised output and produced some"
+            t_diag "empty stdout with exit ${_got}: a contract violation, never a no"
+        fi
+
+        # Every line, not just the first: a listing whose second record is
+        # malformed is a listing that will be misread exactly once.
+        _bad=""
+        while IFS= read -r _line; do
+            printf '%s\n' "${_line}" |
+                grep -Eq -- "$( printf '%s' "${_shape}" |
+                    sed -e "s|\\\\t|${CONFORMANCE_TAB}|g" )" && continue
+            _bad="${_bad}${_line}
+"
+        done < "${_dir}/out"
+
+        if [ -z "${_bad}" ]; then
+            t_ok "${_fn} ${_args}: every line matches the contract's shape"
+        else
+            t_not_ok "${_fn} ${_args}: every line matches the contract's shape"
+            t_diag "shape: [${_shape}]"
+            printf '%s' "${_bad}" | sed -e 's/^/# unmatched: /'
+        fi
+
+        IFS='
+'
+    done
+    IFS=$_oifs
+
+    return 0
+}

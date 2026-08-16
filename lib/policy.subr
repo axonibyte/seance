@@ -965,3 +965,64 @@ pol_lineage_disposition()
     printf 'force-only\n'
     return 1
 }
+
+# pol_newest_for_node <nodekey>
+#
+# Read snapshot names on stdin -- either full "<dataset>@<shortname>"
+# references as a zfs listing prints them, or bare short names -- and print the
+# newest timestamp belonging to <nodekey>, nothing else.
+#
+#   rc 0  a timestamp was found and printed
+#   rc 1  nothing on stdin belongs to that node: no lineage, and NO OUTPUT
+#   rc 2  no node key was given
+#
+# Names that do not parse are FOREIGN AND IGNORED, not errors (handoff §2.1):
+# other tools' snapshots live in the same datasets, and a promotion that
+# refused to read a replica because zrepl had been there too would be a worse
+# failure than the one it was avoiding. Names that parse but name a different
+# node are skipped in the same silence -- this function answers exactly one
+# question, "how fresh is what we hold for X".
+#
+# The comparison is pol_ts_cmp rather than a string compare, so that the
+# ordering is the wire protocol's and not the locale's collation table.
+pol_newest_for_node()
+{
+    local _node _line _short _parsed _pnode _ts _best _cmp
+
+    _node=${1:-}
+    [ -n "${_node}" ] || return 2
+
+    _best=""
+
+    while IFS= read -r _line || [ -n "${_line}" ]; do
+        [ -n "${_line}" ] || continue
+
+        case "${_line}" in
+            *@*)
+                _parsed=$( pol_snap_split "${_line}" ) || continue
+                _short=${_parsed#*	}
+                ;;
+            *)
+                _short=${_line}
+                ;;
+        esac
+
+        _parsed=$( pol_snap_parse "${_short}" ) || continue
+        _pnode=${_parsed%	*}
+        _ts=${_parsed#*	}
+
+        [ "${_pnode}" = "${_node}" ] || continue
+
+        if [ -z "${_best}" ]; then
+            _best=${_ts}
+            continue
+        fi
+
+        _cmp=$( pol_ts_cmp "${_ts}" "${_best}" ) || return 2
+        [ "${_cmp}" = "1" ] && _best=${_ts}
+    done
+
+    [ -n "${_best}" ] || return 1
+
+    printf '%s\n' "${_best}"
+}

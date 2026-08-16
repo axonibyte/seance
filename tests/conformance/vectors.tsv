@@ -1,0 +1,53 @@
+# seance -- adapter conformance vectors.
+#
+# function<TAB>args<TAB>stdout-shape<TAB>expected-rc
+#
+#   args     '-' for none, otherwise an argument list split on spaces
+#   shape    an extended regular expression EVERY line of stdout must match,
+#            with \t standing for a tab; '-' means stdout must be EMPTY
+#   rc       the exit status the contract promises
+#
+# The names %JAIL% %VM% %HELD% %ABSENT% %BADNAME% are filled in by
+# tests/conformance/run.subr from the world of the adapter under test; see its
+# header. Nothing here may be destructive: these vectors run against a real
+# node in tier 5. The mutating verbs appear only with a name their contract
+# requires them to refuse before they touch anything.
+#
+# Field order comes from the '# contract:' line above each function in
+# lib/adapter.subr, and tests/tier3/t_adapter_contract_shape.sh asserts that
+# every adapter states the same one.
+adapter_init	-	-	0
+adapter_node_self	-	^[a-z0-9][a-z0-9._-]*$	0
+adapter_fact	workdir	^/.+$	0
+adapter_fact	nodename	^[a-z0-9][a-z0-9._-]*$	0
+adapter_fact	jailsysdir	^/.+$	0
+adapter_fact	dbdir	^/.+$	0
+adapter_fact	bogus	-	2
+adapter_kernel_version	-	^[0-9]+\.[0-9]+-[A-Za-z0-9.-]+$	0
+adapter_guest_list	-	^[a-z0-9][a-z0-9._-]*\t(jail|bhyve)\t[01]\t[0-3]\t[01]$	0
+adapter_guest_type	%JAIL%	^jail$	0
+adapter_guest_type	%VM%	^bhyve$	0
+adapter_guest_type	%ABSENT%	-	1
+adapter_guest_type	%BADNAME%	-	2
+adapter_guest_running	%JAIL%	^[01]$	0
+adapter_guest_running	%ABSENT%	-	1
+adapter_guest_running	%BADNAME%	-	2
+adapter_guest_held	%HELD%	^1$	0
+adapter_guest_held	%JAIL%	^0$	0
+adapter_guest_held	%ABSENT%	-	1
+adapter_guest_held	%BADNAME%	-	2
+adapter_guest_sysdir	%JAIL%	^/.+/%JAIL%$	0
+adapter_guest_sysdir	%BADNAME%	-	2
+adapter_guest_datasets	%JAIL%	^[a-z0-9][a-z0-9._:/-]*$	0
+adapter_guest_datasets	%ABSENT%	-	1
+adapter_guest_datasets	%BADNAME%	-	2
+adapter_carp_state	1	^(MASTER|BACKUP|INIT|absent)$	0
+adapter_carp_state	256	-	2
+adapter_carp_state	0	-	2
+adapter_carp_state	x	-	2
+adapter_guest_start	%BADNAME%	-	2
+adapter_guest_stop	%BADNAME%	-	2
+adapter_guest_hold	%BADNAME%	-	2
+adapter_guest_release	%BADNAME%	-	2
+adapter_guest_register	%BADNAME% /nonexistent	-	2
+adapter_guest_unregister	%BADNAME%	-	2

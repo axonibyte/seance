@@ -1,0 +1,999 @@
+# seance -- the adapter: the only file that knows CBSD and the host exist.
+#
+# Sourced, never executed, and sourceable standalone: sourcing this file
+# defines functions and initialises variables and does nothing else. The
+# dispatcher sources ${SEANCE_ADAPTER:-lib/adapter.subr}, so the mock
+# (tests/mock-adapter.subr) and the pseudo-cluster adapter are drop-in
+# replacements -- which is only true if none of them acts at source time.
+#
+# THE CONTRACT (design §2, handoff §2.3), identical for every adapter:
+#
+#   * stdout is data, stderr is diagnostics, the exit status is the verdict:
+#     0 ok, 1 the operation failed or its answer is negative, 2 a usage or
+#     contract error (the caller passed something impossible, or CBSD answered
+#     in a shape this adapter does not understand).
+#   * list-returning functions emit one record per line, fields separated by a
+#     single tab, no header, field order fixed by the '# contract:' comment
+#     above the function and by tests/conformance/vectors.tsv. No field may
+#     contain a tab.
+#   * every function carries exactly one '# contract:' line, ending in one of
+#     three markers that say what empty stdout means:
+#       [promises output]     empty stdout with rc 0 is a CONTRACT VIOLATION
+#                             and callers must treat it as one -- the
+#                             crashed-verifier lesson (TESTING.md §5).
+#       [list: may be empty]  no records is a valid answer; rc 0, no output.
+#       [no output]           this function answers with its exit status.
+#   * names are validated on the way in, before they reach a command line.
+#
+# EVIDENCE. Every CBSD behaviour relied on below is read out of the installed
+# CBSD 15.0.9 source and cited file:line. Nothing here is remembered.
+#
+# shellcheck shell=sh
+# shellcheck disable=SC3043
+#   'local' is not in POSIX sh but is implemented by FreeBSD /bin/sh (sh(1),
+#   "local"); seance targets FreeBSD sh and nothing else (handoff §5).
+
+# ---------------------------------------------------------------------------
+# State, all of it set by adapter_init and read-only thereafter.
+# ---------------------------------------------------------------------------
+
+ADAPTER_READY=0
+ADAPTER_DISTDIR=""
+ADAPTER_WORKDIR=""
+ADAPTER_NODENAME=""
+ADAPTER_JAILSYSDIR=""
+ADAPTER_JAILDATADIR=""
+ADAPTER_DBDIR=""
+ADAPTER_ETCDIR=""
+
+# The tab and newline this file splits on, spelled once.
+ADAPTER_TAB=$( printf '\t' )
+
+# ---------------------------------------------------------------------------
+# Diagnostics
+# ---------------------------------------------------------------------------
+
+# _adapter_diag <message...>  -- one diagnostic line on stderr. Never stdout:
+# a diagnostic that lands in a TSV record is a corrupt record.
+_adapter_diag()
+{
+    printf 'adapter: %s\n' "$*" >&2
+}
+
+# ---------------------------------------------------------------------------
+# Validation
+# ---------------------------------------------------------------------------
+
+# _adapter_name_ok <name>
+#
+# rc 0 if the name is a guest name seance is willing to put on a command line,
+# in a tab-separated record and in a dataset path: [a-z0-9][a-z0-9._-]*.
+#
+# CBSD's own rule is wider -- subr/nc.subr:733-737 validate_jname accepts
+# ^[a-zA-Z0-9_@%:][-a-zA-Z0-9_@%:]*$ -- so seance is deliberately stricter in
+# four places (no upper case, no '_@%:' beyond '_', no leading dash) and wider
+# in exactly one ('.', which CBSD rejects and which therefore cannot reach a
+# real guest). Decision D-45 records why and what it costs.
+#
+# Character classes are written out rather than ranged, as everywhere in
+# seance: POSIX leaves bracket ranges outside the C locale unspecified.
+_adapter_name_ok()
+{
+    local _n
+
+    _n=${1:-}
+
+    case "${_n}" in
+        ''|[!abcdefghijklmnopqrstuvwxyz0123456789]*) return 1 ;;
+        *[!abcdefghijklmnopqrstuvwxyz0123456789._-]*) return 1 ;;
+    esac
+
+    return 0
+}
+
+# _adapter_vhid_ok <vhid>  -- rc 0 for a CARP vhid, 1 to 255 (carp(4); the
+# ifconfig(8) manual pins the range: "Acceptable values for vhid are 1 to 255").
+_adapter_vhid_ok()
+{
+    local _v
+
+    _v=${1:-}
+
+    case "${_v}" in
+        ''|*[!0123456789]*) return 1 ;;
+    esac
+
+    # Leading zeros would make $(( )) read an octal constant; reject rather
+    # than normalise, because a vhid is written by a human in a config file.
+    case "${_v}" in
+        0*) return 1 ;;
+    esac
+
+    [ "${_v}" -ge 1 ] && [ "${_v}" -le 255 ]
+}
+
+# ---------------------------------------------------------------------------
+# Initialisation
+# ---------------------------------------------------------------------------
+
+# adapter_init
+#
+# Learn where CBSD keeps its things, once. Under the cbsdsh wrapper (D-2) the
+# facts arrive in the environment as SEANCE_CBSD_*; from cron, from devd and
+# from the test tiers there is no wrapper, so they are derived the way CBSD
+# itself derives them:
+#
+#   workdir     $cbsd_workdir from rc.conf. cbsd.conf:28-36 sources
+#               /etc/rc.conf and takes $cbsd_workdir; seance asks sysrc(8)
+#               for the same variable instead, because seance parses
+#               configuration and never sources it.
+#   nodename    one line in ${workdir}/nodename (cbsd.conf:52, nodenamefile).
+#   the rest    CBSD's fixed layout: jailsysdir ${workdir}/jails-system
+#               (cbsd.conf:71), jaildatadir ${workdir}/jails-data
+#               (cbsd.conf:65), etcdir ${workdir}/etc (cbsd.conf:73), dbdir
+#               ${workdir}/var/db (cbsd.conf:84,92).
+#   distdir     /usr/local/cbsd (cbsd.conf:24).
+#
+# rc 2 when CBSD is not present or its facts cannot be established. Idempotent.
+#
+# contract: adapter_init() -> nothing [no output]
+adapter_init()
+{
+    local _wd _nn
+
+    [ "${ADAPTER_READY}" -eq 1 ] && return 0
+
+    if ! command -v cbsd > /dev/null 2>&1; then
+        _adapter_diag "CBSD is not present (no runnable 'cbsd' in PATH)"
+        return 2
+    fi
+
+    ADAPTER_DISTDIR=${SEANCE_CBSD_DISTDIR:-/usr/local/cbsd}
+
+    _wd=${SEANCE_CBSD_WORKDIR:-}
+    if [ -z "${_wd}" ]; then
+        if ! command -v sysrc > /dev/null 2>&1; then
+            _adapter_diag "no SEANCE_CBSD_WORKDIR and no sysrc(8) to ask for cbsd_workdir"
+            return 2
+        fi
+        _wd=$( sysrc -n cbsd_workdir 2>/dev/null ) || _wd=""
+    fi
+
+    if [ -z "${_wd}" ]; then
+        _adapter_diag "cannot determine the CBSD workdir: cbsd_workdir is not set in rc.conf"
+        return 2
+    fi
+
+    if [ ! -d "${_wd}" ]; then
+        _adapter_diag "CBSD workdir is not a directory: ${_wd}"
+        return 2
+    fi
+
+    _nn=${SEANCE_CBSD_NODENAME:-}
+    if [ -z "${_nn}" ]; then
+        if [ ! -r "${_wd}/nodename" ]; then
+            _adapter_diag "no readable nodename file at ${_wd}/nodename"
+            return 2
+        fi
+        # read(1) returns non-zero on a last line without a newline and still
+        # assigns, so emptiness is the verdict here, not read's status.
+        _nn=""
+        read -r _nn < "${_wd}/nodename"
+    fi
+
+    if [ -z "${_nn}" ]; then
+        _adapter_diag "the CBSD nodename is empty"
+        return 2
+    fi
+
+    case "${_nn}" in
+        *"${ADAPTER_TAB}"*|*' '*)
+            _adapter_diag "the CBSD nodename contains whitespace: [${_nn}]"
+            return 2
+            ;;
+    esac
+
+    ADAPTER_WORKDIR=${_wd}
+    ADAPTER_NODENAME=${_nn}
+    ADAPTER_JAILSYSDIR=${SEANCE_CBSD_JAILSYSDIR:-${_wd}/jails-system}
+    ADAPTER_JAILDATADIR=${SEANCE_CBSD_JAILDATADIR:-${_wd}/jails-data}
+    ADAPTER_DBDIR=${SEANCE_CBSD_DBDIR:-${_wd}/var/db}
+    ADAPTER_ETCDIR=${SEANCE_CBSD_ETCDIR:-${_wd}/etc}
+    ADAPTER_READY=1
+
+    return 0
+}
+
+# _adapter_ready  -- initialise on first use; rc 2 if that is not possible.
+_adapter_ready()
+{
+    [ "${ADAPTER_READY}" -eq 1 ] && return 0
+    adapter_init
+}
+
+# _adapter_cbsd <verb> [args...]
+#
+# The one place seance runs CBSD. Two things happen here and nowhere else:
+#
+#   NOCOLOR=1  -- cbsd.conf:159-163 and 177-189: the ANSI colour variables are
+#                 only loaded when NOCOLOR is empty, so without this every
+#                 field of every listing may arrive wrapped in escapes.
+#   cd         -- jstop, jstart, jget and their bhyve twins read a CBSDfile
+#                 from the *caller's* working directory and silently change
+#                 which environments they act on when they find one
+#                 (sudoexec/jstop:38-40, sudoexec/bstop:44-46,
+#                 jailctl/jget:51-52). A promotion must not depend on where
+#                 cron happened to be standing, so every invocation is made
+#                 from a directory chosen for having nothing in it.
+_adapter_cbsd()
+{
+    local _cwd
+
+    _cwd=${SEANCE_ADAPTER_CWD:-/var/empty}
+
+    if [ ! -d "${_cwd}" ]; then
+        _adapter_diag "no such directory to run cbsd from: ${_cwd} (set SEANCE_ADAPTER_CWD)"
+        return 2
+    fi
+
+    (
+        cd "${_cwd}" || exit 2
+        NOCOLOR=1
+        export NOCOLOR
+        exec cbsd "$@"
+    )
+}
+
+# ---------------------------------------------------------------------------
+# Node identity
+# ---------------------------------------------------------------------------
+
+# contract: adapter_node_self() -> nodename [promises output]
+adapter_node_self()
+{
+    _adapter_ready || return 2
+
+    printf '%s\n' "${ADAPTER_NODENAME}"
+}
+
+# contract: adapter_fact(key) -> value [promises output]
+#
+# The node facts adapter_init established, one at a time, by key:
+# workdir, nodename, jailsysdir, jaildatadir, dbdir, etcdir, distdir.
+#
+# This exists so that the seam holds for paths as well as for commands. seance
+# keeps its state under ${workdir}/var/db/seance and its config at
+# ${workdir}/etc/seance.conf (decision D-3, confirmed by observation in D-17);
+# without an accessor every verb that wants those would have to work out where
+# CBSD's workdir is, and there would be six places that know instead of one.
+#
+# rc 2 for an unknown key: a typo'd fact must not read as an empty one.
+adapter_fact()
+{
+    _adapter_ready || return 2
+
+    case "${1:-}" in
+        workdir)     printf '%s\n' "${ADAPTER_WORKDIR}" ;;
+        nodename)    printf '%s\n' "${ADAPTER_NODENAME}" ;;
+        jailsysdir)  printf '%s\n' "${ADAPTER_JAILSYSDIR}" ;;
+        jaildatadir) printf '%s\n' "${ADAPTER_JAILDATADIR}" ;;
+        dbdir)       printf '%s\n' "${ADAPTER_DBDIR}" ;;
+        etcdir)      printf '%s\n' "${ADAPTER_ETCDIR}" ;;
+        distdir)     printf '%s\n' "${ADAPTER_DISTDIR}" ;;
+        *)
+            _adapter_diag "adapter_fact: no such fact: [${1:-}]"
+            return 2
+            ;;
+    esac
+
+    return 0
+}
+
+# contract: adapter_kernel_version() -> uname-style kernel version [promises output]
+#
+# freebsd-version(1) -k is the *installed* kernel's version, which is the
+# homogeneity precondition jails care about (design §3): a jail promoted onto
+# a node runs that node's kernel.
+adapter_kernel_version()
+{
+    local _v
+
+    _v=$( freebsd-version -k 2>/dev/null ) || _v=""
+
+    if [ -z "${_v}" ]; then
+        _adapter_diag "freebsd-version -k produced nothing"
+        return 1
+    fi
+
+    printf '%s\n' "${_v}"
+}
+
+# ---------------------------------------------------------------------------
+# Guests: enumeration
+# ---------------------------------------------------------------------------
+
+# _adapter_status_int <status-word>
+#
+# CBSD prints the jails.status column as a word, not as the integer it stores:
+# conv_status (subr/strings.subr:27-46) maps 0 Off, 1 On, 2 Slave,
+# 3 Maintenance, anything else Unknown, and both jls and bls call it before
+# printing a row (jailctl/jls:267, bhyvectl/bls:401). The listing's unregistered
+# area prints the literal "Unregister" instead (jailctl/jls:287-295, populated
+# with -u 1). This maps the word back to the integer the contract promises.
+#
+# rc 1 for "Unregister" (a guest CBSD's database does not know), rc 2 for
+# "Unknown" (a status integer CBSD itself cannot name).
+_adapter_status_int()
+{
+    case "${1:-}" in
+        Off)         printf '0\n' ;;
+        On)          printf '1\n' ;;
+        Slave)       printf '2\n' ;;
+        Maintenance) printf '3\n' ;;
+        Unregister)  return 1 ;;
+        *)           return 2 ;;
+    esac
+
+    return 0
+}
+
+# _adapter_list_rows
+#
+# Read a `cbsd jls`/`cbsd bls` listing produced with
+# `header=0 display=jname,emulator,astart,status` on stdin and print
+# "name<TAB>type<TAB>astart<TAB>status" per guest.
+#
+# The listing is whitespace-aligned, not tab-separated: both scripts end in
+# `show_jails | ${COLUMN_CMD} -t` (jailctl/jls:353, bhyvectl/bls:508), and each
+# field is printed with a trailing space (jailctl/jls:226, bhyvectl/bls:221).
+# None of the four fields can contain whitespace, so splitting on it is exact.
+#
+# Rows that are understood but out of scope are skipped with a diagnostic:
+#   * an emulator other than jail or bhyve (seance supports two, design §1);
+#   * an unregistered guest, which cannot be started or held until it has been
+#     through adapter_guest_register.
+# A row that is NOT understood -- too few fields, or a status word CBSD itself
+# calls Unknown -- fails the whole call with rc 2. A listing this function
+# quietly shortened is an estate with a guest missing from it, and that is the
+# shape of a promotion that leaves a guest behind.
+_adapter_list_rows()
+{
+    local _name _emu _astart _status _rest _int _rc
+
+    _rc=0
+
+    while read -r _name _emu _astart _status _rest; do
+        [ -n "${_name}" ] || continue
+
+        if [ -z "${_emu}" ] || [ -z "${_astart}" ] || [ -z "${_status}" ]; then
+            _adapter_diag "unreadable listing row: [${_name} ${_emu} ${_astart} ${_status}]"
+            _rc=2
+            continue
+        fi
+
+        case "${_emu}" in
+            jail|bhyve) ;;
+            *)
+                _adapter_diag "skipping ${_name}: emulator ${_emu} is not supported by seance"
+                continue
+                ;;
+        esac
+
+        if ! _adapter_name_ok "${_name}"; then
+            _adapter_diag "unusable guest name in listing: [${_name}]"
+            _rc=2
+            continue
+        fi
+
+        case "${_astart}" in
+            0|1) ;;
+            *)
+                _adapter_diag "unreadable astart for ${_name}: [${_astart}]"
+                _rc=2
+                continue
+                ;;
+        esac
+
+        _int=$( _adapter_status_int "${_status}" )
+        case $? in
+            0) ;;
+            1)
+                _adapter_diag "skipping ${_name}: CBSD's database does not know it (status ${_status})"
+                continue
+                ;;
+            *)
+                _adapter_diag "unreadable status for ${_name}: [${_status}]"
+                _rc=2
+                continue
+                ;;
+        esac
+
+        printf '%s\t%s\t%s\t%s\n' "${_name}" "${_emu}" "${_astart}" "${_int}"
+    done
+
+    return "${_rc}"
+}
+
+# contract: adapter_guest_list() -> name<TAB>type<TAB>astart<TAB>status<TAB>running [list: may be empty]
+#
+# Every guest this node has, jails and bhyve VMs together. A node with no
+# guests prints nothing and exits 0: this is a list, and an empty list is an
+# answer, not a crash (which is why the contract marker above says so).
+#
+# TWO listings, not one. `cbsd jls` shows only jail-shaped emulators -- its
+# query is `WHERE ( emulator='jail' OR emulator='qemu-*-static' )`
+# (jailctl/jls:244) and it `continue`s over bhyve and virtualbox rows
+# (jailctl/jls:264-265) -- while `cbsd bls` shows only `WHERE emulator='bhyve'`
+# (bhyvectl/bls:367). Listing guests with jls alone is how a fleet of VMs comes
+# to look empty.
+#
+# `running` is asked per guest through adapter_guest_running rather than
+# inferred from `status`, because a guest held in slave mode reports status 2
+# whether it is running or not (subr/rcconf.subr:195-203 corrects the stored
+# status against reality only when it is 0 or 1). A guest whose running state
+# cannot be determined fails the whole listing: an estate in which one guest is
+# reported stopped because the question could not be answered is the estate a
+# split brain is built on.
+adapter_guest_list()
+{
+    local _cmd _out _rc _rows _row _name _running _prc _oifs
+
+    _adapter_ready || return 2
+
+    _rows=""
+    _rc=0
+
+    for _cmd in jls bls; do
+        _out=$( _adapter_cbsd "${_cmd}" header=0 \
+            display=jname,emulator,astart,status )
+        _prc=$?
+
+        if [ "${_prc}" -ne 0 ]; then
+            _adapter_diag "cbsd ${_cmd} failed (exit ${_prc})"
+            return 1
+        fi
+
+        [ -n "${_out}" ] || continue
+
+        _out=$( printf '%s\n' "${_out}" | _adapter_list_rows ) || _rc=2
+        [ -n "${_out}" ] || continue
+
+        if [ -z "${_rows}" ]; then
+            _rows=${_out}
+        else
+            _rows="${_rows}
+${_out}"
+        fi
+    done
+
+    [ "${_rc}" -eq 0 ] || return "${_rc}"
+    [ -n "${_rows}" ] || return 0
+
+    # A 'for' over newline-split records rather than a 'while read' pipeline:
+    # the running probe's verdict has to reach this shell, and the left-hand
+    # side of a pipeline runs in a subshell that cannot report anything but its
+    # own output. No field can contain a space or a newline -- every one of them
+    # was validated by _adapter_list_rows -- so the split is exact.
+    _oifs=$IFS
+    IFS='
+'
+    # shellcheck disable=SC2086
+    #   Deliberate word splitting on newline: ${_rows} is a list of records.
+    for _row in ${_rows}; do
+        IFS=$_oifs
+        _name=${_row%%"${ADAPTER_TAB}"*}
+
+        _running=$( adapter_guest_running "${_name}" )
+        _prc=$?
+        if [ "${_prc}" -ne 0 ]; then
+            _adapter_diag "cannot determine whether ${_name} is running (exit ${_prc})"
+            IFS=$_oifs
+            return "${_prc}"
+        fi
+
+        printf '%s\t%s\n' "${_row}" "${_running}"
+        IFS='
+'
+    done
+    IFS=$_oifs
+
+    return 0
+}
+
+# contract: adapter_guest_type(name) -> bhyve|jail [promises output]
+#
+# `cbsd emulator <name>` reads the emulator column and prints it, or fails with
+# "No such instance" (tools/emulator:10-19). rc 1 both for a guest this node
+# does not have and for a guest running under an emulator seance does not
+# support -- in either case there is nothing here for seance to promote.
+adapter_guest_type()
+{
+    local _name _emu
+
+    _adapter_ready || return 2
+
+    _name=${1:-}
+    if ! _adapter_name_ok "${_name}"; then
+        _adapter_diag "adapter_guest_type: not a usable guest name: [${_name}]"
+        return 2
+    fi
+
+    _emu=$( _adapter_cbsd emulator "${_name}" 2>/dev/null ) || _emu=""
+
+    case "${_emu}" in
+        jail|bhyve)
+            printf '%s\n' "${_emu}"
+            return 0
+            ;;
+        '')
+            _adapter_diag "no such guest on this node: ${_name}"
+            return 1
+            ;;
+        *)
+            _adapter_diag "${_name}: emulator ${_emu} is not supported by seance"
+            return 1
+            ;;
+    esac
+}
+
+# contract: adapter_guest_running(name) -> 1|0 [promises output]
+#
+# CBSD's own view of liveness, for both types, from one command.
+# `cbsd jstatus jname=<n>` sources rcconf.subr and prints ${myjid}
+# (jailctl/jstatus:41-47). rcconf.subr computes that jid against reality
+# rather than against the database: for a jail from cbsdjls
+# (subr/nc.subr:19-45, get_jid), for a bhyve VM from the existence of
+# /dev/vmm/<name> (subr/rcconf.subr:117-127). A non-zero jid is a running
+# guest.
+#
+# THE EXIT CODE IS INVERTED. jstatus documents "0: no jail, 1: jail exist"
+# (jailctl/jstatus:5) -- so `invert=1`, which swaps them (jailctl/jstatus:27-33),
+# is used here to get the ordinary meaning back: 0 the guest exists, 1 it does
+# not. Relying on the inverted form is how a caller comes to read "absent" as
+# success.
+#
+# rc 1 when this node has no such guest; rc 2 when jstatus claims the guest
+# exists and prints nothing -- empty output with a success status, which is a
+# contract violation and never a "no".
+adapter_guest_running()
+{
+    local _name _out _rc
+
+    _adapter_ready || return 2
+
+    _name=${1:-}
+    if ! _adapter_name_ok "${_name}"; then
+        _adapter_diag "adapter_guest_running: not a usable guest name: [${_name}]"
+        return 2
+    fi
+
+    _out=$( _adapter_cbsd jstatus jname="${_name}" invert=1 )
+    _rc=$?
+
+    if [ "${_rc}" -eq 1 ]; then
+        _adapter_diag "no such guest on this node: ${_name}"
+        return 1
+    fi
+
+    if [ "${_rc}" -ne 0 ]; then
+        _adapter_diag "cbsd jstatus failed for ${_name} (exit ${_rc})"
+        return 2
+    fi
+
+    case "${_out}" in
+        ''|*[!0123456789]*)
+            _adapter_diag "cbsd jstatus said ${_name} exists and printed [${_out}] instead of a jid"
+            return 2
+            ;;
+    esac
+
+    if [ "${_out}" = "0" ]; then
+        printf '0\n'
+    else
+        printf '1\n'
+    fi
+
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# Guests: lifecycle
+# ---------------------------------------------------------------------------
+
+# _adapter_lifecycle <jail-verb> <bhyve-verb> <name>
+#
+# Dispatch a lifecycle verb by guest type. inter=0 everywhere: CBSD's start and
+# stop scripts open an interactive selector when they are given no target
+# (sudoexec/jstop:38-40, sudoexec/bstop:44-46), and a promotion that stops to
+# ask a question is a promotion that never finishes.
+_adapter_lifecycle()
+{
+    local _jverb _bverb _name _type _verb _rc
+
+    _jverb=$1
+    _bverb=$2
+    _name=${3:-}
+
+    if ! _adapter_name_ok "${_name}"; then
+        _adapter_diag "${_jverb}: not a usable guest name: [${_name}]"
+        return 2
+    fi
+
+    _type=$( adapter_guest_type "${_name}" ) || return 1
+
+    case "${_type}" in
+        jail)  _verb=${_jverb} ;;
+        bhyve) _verb=${_bverb} ;;
+        *)
+            _adapter_diag "${_name}: unsupported type ${_type}"
+            return 1
+            ;;
+    esac
+
+    _adapter_cbsd "${_verb}" jname="${_name}" inter=0
+    _rc=$?
+
+    if [ "${_rc}" -ne 0 ]; then
+        _adapter_diag "cbsd ${_verb} ${_name} failed (exit ${_rc})"
+        return 1
+    fi
+
+    return 0
+}
+
+# contract: adapter_guest_start(name) -> nothing [no output]
+adapter_guest_start()
+{
+    _adapter_ready || return 2
+
+    _adapter_lifecycle jstart bstart "${1:-}"
+}
+
+# contract: adapter_guest_stop(name) -> nothing [no output]
+#
+# Graceful by construction on both paths: `cbsd bstop` sends the ACPI signal
+# and waits hard_timeout seconds (30 by default) before killing the bhyve
+# process -- `noacpi=0` is the default (sudoexec/bstop:11-14,49-50) -- and
+# `cbsd jstop` runs the jail's shutdown sequence unless it is asked for
+# `fast=1` (sudoexec/jstop:16). seance asks for neither escape hatch.
+adapter_guest_stop()
+{
+    _adapter_ready || return 2
+
+    _adapter_lifecycle jstop bstop "${1:-}"
+}
+
+# contract: adapter_guest_register(name,rcfile) -> nothing [no output]
+#
+# `cbsd jregister jname=<n> rcfile=<f>` inserts the environment's settings into
+# the node's database from a plain-text rc.conf (sudoexec/jregister:5,20-31) --
+# which is exactly what a replicated jails-system directory carries. It is used
+# for bhyve guests too: `cbsd bregister` is a stub that execs a sudoexec script
+# the distribution does not ship (docs/cbsd-module-notes.md §8.1), so it cannot
+# be part of any path seance takes.
+adapter_guest_register()
+{
+    local _name _rcfile _rc
+
+    _adapter_ready || return 2
+
+    _name=${1:-}
+    _rcfile=${2:-}
+
+    if ! _adapter_name_ok "${_name}"; then
+        _adapter_diag "adapter_guest_register: not a usable guest name: [${_name}]"
+        return 2
+    fi
+
+    if [ -z "${_rcfile}" ]; then
+        _adapter_diag "adapter_guest_register: no rcfile given for ${_name}"
+        return 2
+    fi
+
+    if [ ! -r "${_rcfile}" ]; then
+        _adapter_diag "adapter_guest_register: no readable rcfile at ${_rcfile}"
+        return 1
+    fi
+
+    _adapter_cbsd jregister jname="${_name}" rcfile="${_rcfile}"
+    _rc=$?
+
+    if [ "${_rc}" -ne 0 ]; then
+        _adapter_diag "cbsd jregister ${_name} failed (exit ${_rc})"
+        return 1
+    fi
+
+    return 0
+}
+
+# contract: adapter_guest_unregister(name) -> nothing [no output]
+adapter_guest_unregister()
+{
+    local _name _rc
+
+    _adapter_ready || return 2
+
+    _name=${1:-}
+    if ! _adapter_name_ok "${_name}"; then
+        _adapter_diag "adapter_guest_unregister: not a usable guest name: [${_name}]"
+        return 2
+    fi
+
+    _adapter_cbsd junregister jname="${_name}"
+    _rc=$?
+
+    if [ "${_rc}" -ne 0 ]; then
+        _adapter_diag "cbsd junregister ${_name} failed (exit ${_rc})"
+        return 1
+    fi
+
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# Guests: the boot gate (decision D-21)
+# ---------------------------------------------------------------------------
+
+# _adapter_swmode <name> <master|slave>
+#
+# `cbsd jswmode jname=<n> mode=slave` is UPDATE jails SET status=2, and
+# mode=master is status=0 (jailctl/jswmode:87-102). A guest at status 2 cannot
+# be started -- sudoexec/jstart:367 and sudoexec/bstart:1321 refuse it with
+# "Jail in slave mode" -- and CBSD's own autostart ordering selects only
+# status<2 (jailctl/jorder:35, bhyvectl/border:35). That is the lever, and it
+# survives a reboot because it is in the database.
+_adapter_swmode()
+{
+    local _name _mode _rc
+
+    _name=${1:-}
+    _mode=${2:-}
+
+    if ! _adapter_name_ok "${_name}"; then
+        _adapter_diag "jswmode: not a usable guest name: [${_name}]"
+        return 2
+    fi
+
+    _adapter_cbsd jswmode jname="${_name}" mode="${_mode}" inter=0
+    _rc=$?
+
+    if [ "${_rc}" -ne 0 ]; then
+        _adapter_diag "cbsd jswmode ${_name} mode=${_mode} failed (exit ${_rc})"
+        return 1
+    fi
+
+    return 0
+}
+
+# contract: adapter_guest_hold(name) -> nothing [no output]
+adapter_guest_hold()
+{
+    _adapter_ready || return 2
+
+    _adapter_swmode "${1:-}" slave
+}
+
+# contract: adapter_guest_release(name) -> nothing [no output]
+adapter_guest_release()
+{
+    _adapter_ready || return 2
+
+    _adapter_swmode "${1:-}" master
+}
+
+# contract: adapter_guest_held(name) -> 1|0 [promises output]
+#
+# Held means status 2, which is what mode=slave writes. The status is read back
+# through `cbsd jls`/`cbsd bls` rather than from the database directly, so that
+# there is exactly one place in seance that knows how CBSD spells a status.
+adapter_guest_held()
+{
+    local _name _type _cmd _out _status
+
+    _adapter_ready || return 2
+
+    _name=${1:-}
+    if ! _adapter_name_ok "${_name}"; then
+        _adapter_diag "adapter_guest_held: not a usable guest name: [${_name}]"
+        return 2
+    fi
+
+    _type=$( adapter_guest_type "${_name}" ) || return 1
+
+    case "${_type}" in
+        bhyve) _cmd=bls ;;
+        *)     _cmd=jls ;;
+    esac
+
+    _out=$( _adapter_cbsd "${_cmd}" header=0 \
+        display=jname,emulator,astart,status jname="${_name}" ) || _out=""
+
+    if [ -z "${_out}" ]; then
+        _adapter_diag "cbsd ${_cmd} said nothing about ${_name}"
+        return 2
+    fi
+
+    _out=$( printf '%s\n' "${_out}" | _adapter_list_rows ) || return 2
+
+    if [ -z "${_out}" ]; then
+        _adapter_diag "cbsd ${_cmd} listed no usable row for ${_name}"
+        return 2
+    fi
+
+    _status=${_out##*"${ADAPTER_TAB}"}
+
+    if [ "${_status}" = "2" ]; then
+        printf '1\n'
+    else
+        printf '0\n'
+    fi
+
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# Guests: storage
+# ---------------------------------------------------------------------------
+
+# contract: adapter_guest_sysdir(name) -> path [promises output]
+#
+# ${jailsysdir}/<name>: the per-guest system directory CBSD creates at
+# jcreate time and fills with rc.conf_<name>, the hook directories and
+# local.sqlite (sudoexec/jcreate:710-729). It is the directory that has to
+# travel with a guest for a survivor to be able to register it, so seance
+# replicates it and promote reads it back from here.
+#
+# The path is derived, not probed: this function answers "where would it be",
+# and the caller that needs it to exist says so itself.
+adapter_guest_sysdir()
+{
+    local _name
+
+    _adapter_ready || return 2
+
+    _name=${1:-}
+    if ! _adapter_name_ok "${_name}"; then
+        _adapter_diag "adapter_guest_sysdir: not a usable guest name: [${_name}]"
+        return 2
+    fi
+
+    printf '%s/%s\n' "${ADAPTER_JAILSYSDIR}" "${_name}"
+}
+
+# contract: adapter_guest_datasets(name) -> dataset per line, root first [promises output]
+#
+# Every ZFS dataset belonging to the guest -- filesystems and volumes, the
+# root of the tree first, then its children in ZFS's own order.
+#
+# The root is <parent>/<name> where <parent> is the dataset holding CBSD's
+# jails-data directory, which is precisely how CBSD derives it when it creates
+# a guest: `ZPOOL=$( zfs list -Ho name ${jaildatadir} )` then
+# `zfs create -o mountpoint=${jaildatadir}/${jname}-data ${ZPOOL}/${jname}`
+# for a jail (sudoexec/mkdatadir:14-23), and the same parent with
+# `-o mountpoint=${workdir}/vm/${jname}` for a VM, whose disks are zvols
+# underneath it (sudoexec/bcreate:573-590). Deriving it the same way means the
+# adapter cannot disagree with CBSD about where a guest lives, and no pool name
+# is ever written down (the tenant guard forbids one; decision D-6).
+#
+# rc 1 when the guest has no dataset -- a zfsfeat=0 node (mkdatadir:15-18
+# makes a plain directory instead). seance requires ZFS-backed guests, and
+# saying so loudly is the entire response.
+adapter_guest_datasets()
+{
+    local _name _parent _root _out
+
+    _adapter_ready || return 2
+
+    _name=${1:-}
+    if ! _adapter_name_ok "${_name}"; then
+        _adapter_diag "adapter_guest_datasets: not a usable guest name: [${_name}]"
+        return 2
+    fi
+
+    _parent=$( zfs list -H -o name "${ADAPTER_JAILDATADIR}" 2>/dev/null ) ||
+        _parent=""
+
+    if [ -z "${_parent}" ]; then
+        _adapter_diag "${ADAPTER_JAILDATADIR} is not on ZFS: this node cannot host seance guests"
+        return 1
+    fi
+
+    _root="${_parent}/${_name}"
+
+    _out=$( zfs list -H -r -o name -t filesystem,volume "${_root}" 2>/dev/null ) ||
+        _out=""
+
+    if [ -z "${_out}" ]; then
+        _adapter_diag "no dataset ${_root} for guest ${_name}"
+        return 1
+    fi
+
+    printf '%s\n' "${_out}"
+}
+
+# ---------------------------------------------------------------------------
+# CARP
+# ---------------------------------------------------------------------------
+
+# _adapter_carp_scan <vhid>
+#
+# Read ifconfig(8) output on stdin; print one line per carp block naming that
+# vhid, "<STATE>", and one line "vrrp" per VRRPv3 block naming it.
+#
+# The format is pinned by ifconfig's source, not by memory:
+# /usr/src/sbin/ifconfig/carp.c:86-90 prints
+#     "\tcarp: %s vhid %d advbase %d advskew %d"
+# and :102-105 prints "\tvrrp: %s vrid %d prio %d interval %d" for a vhid
+# running VRRPv3 instead. The state word is carp_states[], defined in
+# /usr/src/sys/netinet/ip_carp.h:171 as exactly "INIT", "BACKUP", "MASTER".
+# What follows the advskew field has changed between releases (older ifconfig
+# put the peer address at the end of the same line, newer prints a "peer" line
+# of its own), so the match is anchored on the front of the line and reads no
+# further than the vhid.
+_adapter_carp_scan()
+{
+    awk -v vhid="$1" '
+        $1 == "carp:" && $3 == "vhid" && $4 == vhid { print $2 }
+        $1 == "vrrp:" && $3 == "vrid" && $4 == vhid { print "vrrp" }
+    '
+}
+
+# contract: adapter_carp_state(vhid) -> MASTER|BACKUP|INIT|absent [promises output]
+#
+# What this node currently thinks it is for a CARP virtual host. `status` and
+# `verify` read it; M1 ships no CARP *actions* of any kind.
+#
+# "absent" is a real answer -- the vhid is not configured on this node -- and
+# is not an error. rc 1 is reserved for a vhid this node reports in two
+# different states at once, which is a fault worth stopping for rather than
+# averaging away.
+adapter_carp_state()
+{
+    local _vhid _out _states _n
+
+    _vhid=${1:-}
+
+    if ! _adapter_vhid_ok "${_vhid}"; then
+        _adapter_diag "adapter_carp_state: not a CARP vhid (1-255): [${_vhid}]"
+        return 2
+    fi
+
+    _out=$( ifconfig -a 2>/dev/null ) || _out=""
+
+    if [ -z "${_out}" ]; then
+        _adapter_diag "ifconfig -a produced nothing"
+        return 1
+    fi
+
+    _states=$( printf '%s\n' "${_out}" | _adapter_carp_scan "${_vhid}" |
+        LC_ALL=C sort -u )
+
+    case "${_states}" in
+        *vrrp*)
+            _adapter_diag "vhid ${_vhid} is running VRRPv3 on this node, not CARP"
+            _states=$( printf '%s\n' "${_states}" | grep -v '^vrrp$' ) ||
+                _states=""
+            ;;
+    esac
+
+    if [ -z "${_states}" ]; then
+        printf 'absent\n'
+        return 0
+    fi
+
+    _n=$( printf '%s\n' "${_states}" | wc -l | tr -d ' ' )
+    if [ "${_n}" -ne 1 ]; then
+        _adapter_diag "vhid ${_vhid} is in more than one state on this node: $( printf '%s' "${_states}" | tr '\n' ' ' )"
+        return 1
+    fi
+
+    case "${_states}" in
+        MASTER|BACKUP|INIT)
+            printf '%s\n' "${_states}"
+            return 0
+            ;;
+    esac
+
+    _adapter_diag "ifconfig reported an unknown CARP state for vhid ${_vhid}: [${_states}]"
+    return 2
+}

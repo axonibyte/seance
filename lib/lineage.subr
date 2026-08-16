@@ -1,0 +1,134 @@
+# seance -- lineage: what we hold for a node, and whether it may be promoted.
+#
+# Sourced, never executed. This file is deliberately tiny. It is the two lines
+# of glue between a snapshot listing and the policy engine, and everything that
+# could be a decision has been left in lib/policy.subr where it can be tested
+# without a disk:
+#
+#   lineage_probe        run the listing, hand the names to the parser
+#   lineage_disposition  hand the answer to pol_lineage_disposition
+#
+# It needs lib/policy.subr sourced first (pol_newest_for_node,
+# pol_lineage_disposition).
+#
+# THE LISTING IS INJECTABLE. SEANCE_ZFS_LIST_CMD replaces the zfs invocation
+# with anything else -- the tier-4 mock, a recorded fixture -- and the dataset
+# is appended to it as the last argument. Without it the command is
+# `zfs list -H -o name -t snapshot -r <dataset>`, which is the only thing in
+# this file that touches the host.
+#
+# EMPTY OUTPUT IS NEVER FRESHNESS. A listing that exits 0 having printed
+# nothing means there is nothing to promote, and it is reported as loudly as a
+# listing that failed -- the two are equally fatal to a promotion, and the one
+# thing neither may become is a quiet "proceed" (TESTING.md §5, and the
+# crashed-verifier row in tests/tier4/t_ladder_lineage.sh).
+#
+# There is no timeout wrapper here on purpose: bounding a command's runtime is
+# transport's job, one layer up, and a second half-implementation of it here
+# would be one more thing to keep in step. What this file guarantees is that
+# nothing it returns can be mistaken for a fresh replica.
+#
+# shellcheck shell=sh
+# shellcheck disable=SC3043
+#   'local' is not in POSIX sh but is implemented by FreeBSD /bin/sh (sh(1),
+#   "local"); seance targets FreeBSD sh and nothing else (handoff §5).
+
+# lineage_probe <nodekey> <dataset>
+#
+# Print the newest replica timestamp held for <nodekey> under <dataset>.
+#
+#   rc 0  a timestamp, printed
+#   rc 1  no lineage: the listing failed, or was empty, or held nothing of
+#         that node's. Nothing is printed.
+#   rc 2  a malformed call.
+lineage_probe()
+{
+    local _node _ds _out _rc _ts
+
+    _node=${1:-}
+    _ds=${2:-}
+
+    if [ -z "${_node}" ] || [ -z "${_ds}" ]; then
+        printf 'lineage: usage: lineage_probe <nodekey> <dataset>\n' >&2
+        return 2
+    fi
+
+    if [ -n "${SEANCE_ZFS_LIST_CMD:-}" ]; then
+        # shellcheck disable=SC2086
+        #   Deliberate word splitting: SEANCE_ZFS_LIST_CMD is a command and
+        #   its arguments, and the dataset is appended to them.
+        _out=$( ${SEANCE_ZFS_LIST_CMD} "${_ds}" )
+    else
+        _out=$( zfs list -H -o name -t snapshot -r "${_ds}" )
+    fi
+    _rc=$?
+
+    if [ "${_rc}" -eq 2 ]; then
+        printf 'lineage: %s: the snapshot listing was invoked wrongly (exit 2)\n' \
+            "${_ds}" >&2
+        return 2
+    fi
+
+    if [ "${_rc}" -ne 0 ]; then
+        printf 'lineage: %s: snapshot listing failed (exit %s)\n' \
+            "${_ds}" "${_rc}" >&2
+        return 1
+    fi
+
+    if [ -z "${_out}" ]; then
+        printf 'lineage: %s: the snapshot listing exited 0 and printed nothing: no replica lineage for %s (empty output is never read as freshness)\n' \
+            "${_ds}" "${_node}" >&2
+        return 1
+    fi
+
+    _ts=$( printf '%s\n' "${_out}" | pol_newest_for_node "${_node}" )
+    _rc=$?
+
+    if [ "${_rc}" -eq 2 ]; then
+        printf 'lineage: %s: cannot read the snapshot listing\n' "${_ds}" >&2
+        return 2
+    fi
+
+    if [ "${_rc}" -ne 0 ] || [ -z "${_ts}" ]; then
+        printf 'lineage: %s: no @seance-%s-* snapshot in the listing\n' \
+            "${_ds}" "${_node}" >&2
+        return 1
+    fi
+
+    printf '%s\n' "${_ts}"
+}
+
+# lineage_disposition <nodekey> <dataset> <now_epoch> <staleness_max>
+#                     <skew_tolerance> <force 0|1>
+#
+# The staleness/lineage rungs of the promotion ladder for one guest, end to
+# end: probe, then decide. Prints exactly what pol_lineage_disposition prints
+# -- proceed, proceed-forced, force-only or abort -- and returns its status.
+#
+# A probe that could not answer becomes an ABSENT replica, which
+# pol_lineage_disposition turns into "abort" and which --force cannot reach.
+# That is the whole safety property of this file: every way of not knowing
+# arrives at the same place, and it is not "proceed".
+lineage_disposition()
+{
+    local _node _ds _now _max _skew _force _ts _rc
+
+    _node=${1:-}
+    _ds=${2:-}
+    _now=${3:-}
+    _max=${4:-}
+    _skew=${5:-}
+    _force=${6:-}
+
+    _ts=$( lineage_probe "${_node}" "${_ds}" )
+    _rc=$?
+
+    if [ "${_rc}" -eq 2 ]; then
+        printf 'abort\n'
+        return 2
+    fi
+
+    [ "${_rc}" -eq 0 ] || _ts=""
+
+    pol_lineage_disposition "${_ts}" "${_now}" "${_max}" "${_skew}" "${_force}"
+}

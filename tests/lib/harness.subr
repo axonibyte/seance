@@ -240,6 +240,78 @@ t_stdout_is()
     return 0
 }
 
+# t_run_timeout <seconds> <command...>
+#
+# Run the command with a bound on how long it may take. Returns the command's
+# own exit status, or 124 -- timeout(1)'s convention -- if the bound was
+# reached and the command was killed.
+#
+# This is the caller's timeout wrapper that the mock adapter's "timeout"
+# outcome exists to provoke (TESTING.md §5): the mock sleeps past
+# SEANCE_MOCK_TIMEOUT and never answers, and the test asserts that a caller so
+# wrapped stops rather than hangs, and that nothing it printed was a
+# permission to proceed.
+#
+# Not timeout(1) itself, deliberately: timeout(1) execs a program, and what is
+# under test here is a shell function in this shell, sourced along with the
+# library it belongs to. A background subshell inherits those functions; an
+# exec'd program does not.
+#
+# Whatever the command printed before it was killed is still printed here, on
+# the descriptor it was written to -- so a caller can assert not only that the
+# wrapper fired but that nothing said before it fired was a permission to act.
+# The command's output goes to files rather than straight through: a hung
+# grandchild (the sleep inside the mock) inherits any pipe this function is
+# writing into and holds a $( ) capture open long after the command it belongs
+# to was killed, which would make a timeout test wait for exactly the thing it
+# just stopped waiting for.
+t_run_timeout()
+{
+    local _secs _tenths _waited _pid _rc _dir
+
+    _secs=$1
+    shift
+
+    case "${_secs}" in
+        ''|*[!0123456789]*)
+            t_diag "t_run_timeout: not a whole number of seconds: [${_secs}]"
+            return 2
+            ;;
+    esac
+
+    _dir=$( t_tmpdir )
+    _tenths=$(( _secs * 10 ))
+    _waited=0
+    _rc=124
+
+    "$@" > "${_dir}/out" 2> "${_dir}/err" &
+    _pid=$!
+
+    while kill -0 "${_pid}" 2>/dev/null; do
+        if [ "${_waited}" -ge "${_tenths}" ]; then
+            kill -TERM "${_pid}" 2>/dev/null
+            pkill -P "${_pid}" 2>/dev/null
+            sleep 0.2
+            kill -KILL "${_pid}" 2>/dev/null
+            wait "${_pid}" 2>/dev/null
+            _waited=-1
+            break
+        fi
+        sleep 0.1
+        _waited=$(( _waited + 1 ))
+    done
+
+    if [ "${_waited}" -ge 0 ]; then
+        wait "${_pid}"
+        _rc=$?
+    fi
+
+    cat "${_dir}/out"
+    cat "${_dir}/err" >&2
+
+    return "${_rc}"
+}
+
 # t_tmpdir  -- print a fresh temporary directory, removed at exit.
 t_tmpdir()
 {

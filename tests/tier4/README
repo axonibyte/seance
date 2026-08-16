@@ -1,11 +1,29 @@
 Tier 4 -- policy against a fault-injecting mock adapter (workstation).
 
-The full promotion ladder driven against a scripted mock that can return, per
-call: success, failure, timeout, garbage, and empty output with a success
-status -- the crashed-verifier lesson encoded as a test class. Every rung x
-every outcome has an expected disposition, asserted as a truth table. See
-TESTING.md §5.
+The fake-API tier. Every rung of the ladder is driven against tests/mock-
+adapter.subr, which can return, per call: success, failure, timeout, garbage,
+and empty output with a success status -- the crashed-verifier lesson encoded
+as a test class. Every rung x every outcome has an expected disposition,
+asserted as a truth table. See TESTING.md §5.
 
-Empty at M0: there is no ladder yet (M2) and no policy (M1).
+At M1 the ladder is fenced to its lineage and staleness rungs; quorum,
+fencing, promotion proper and --force's rung-by-rung semantics arrive with M2
+and M3, and their rows belong in this directory beside the ones that are here.
+
+  t_mock_selftest.sh      the injector's own self-test: each scripted outcome
+                          does what it says. An injector whose 'fail' silently
+                          succeeded would turn every other row in this tier
+                          green while proving nothing.
+  t_ladder_lineage.sh     the M1 truth table: fresh / stale / skewed / absent
+                          crossed with empty-with-success, garbage, failure,
+                          usage error and no answer at all. Nothing but a
+                          readable, fresh replica reaches "proceed".
+  t_conformance_mock.sh   tests/conformance/vectors.tsv against the mock --
+                          the same file tier 5 runs against real CBSD and
+                          tier 6 against the pseudo-cluster adapter.
+  t_adapter_parse.sh      the real adapter's parsers fed injected CBSD
+                          listings. lib/adapter.subr cannot run here, but the
+                          part of it that reads CBSD's output can, and that is
+                          the part that breaks when CBSD changes a format.
 
 Files named t_*.sh are tests; anything else here is ignored.

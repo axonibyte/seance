@@ -1,0 +1,618 @@
+# seance -- the scripted, fault-injecting mock adapter (TESTING.md §5).
+#
+# Sourced instead of lib/adapter.subr: SEANCE_ADAPTER=tests/mock-adapter.subr.
+# Like the real adapter it is sourceable standalone and does nothing at source
+# time but define functions -- except that it imports the real parsers, which
+# is the whole point of it:
+#
+#   THE MOCK MAY NOT REIMPLEMENT ANYTHING seance SHIPS. It sources
+#   lib/policy.subr and lib/conf.subr and calls them. A mock that grew its own
+#   snapshot-name formatter would drift from the wire protocol and the tier-4
+#   suite would then be testing the mock's opinion of seance instead of
+#   seance. tests/tier3/t_mock_imports_real.sh is the guard.
+#
+# It implements exactly the adapter contract -- same function set, same field
+# order, same exit-code discipline, same '# contract:' lines, asserted
+# mechanically by tests/tier3/t_adapter_contract_shape.sh and by the
+# conformance vectors in tests/conformance/.
+#
+# SCRIPTING. Every call consults ${SEANCE_MOCK_SCRIPT}, a file of lines
+#
+#     <function>[ <arg>]<TAB><outcome>[<TAB>payload]
+#
+# most specific key first: a line keyed "adapter_guest_type web01" beats one
+# keyed "adapter_guest_type". Blank lines and lines beginning '#' are ignored.
+# The outcomes are the five ways infrastructure lies to you, plus the truth:
+#
+#   ok       payload on stdout, rc 0. Payload "-" means no output at all.
+#   fail     payload on stderr, rc 1.
+#   timeout  sleep past ${SEANCE_MOCK_TIMEOUT} seconds and never answer. The
+#            CALLER's timeout wrapper is what must fire; a caller that has none
+#            hangs, which is the defect being hunted.
+#   garbage  payload on stdout verbatim, rc 0 -- the right shape of nothing.
+#   empty0   no output, rc 0. THE CRASHED-VERIFIER ROW: a function that
+#            promises output and returns success having printed none.
+#   usage    payload on stderr, rc 2.
+#
+# Payloads are printed with printf '%b', so "\n" in a payload is a line break
+# and "\t" is a field separator -- which is how a multi-record listing or a
+# tab-separated row is written on one line of the script file.
+#
+# With no matching line every function answers from a fixed fictional world
+# (nodes alpha, bravo, charlie; guests web01, db01, arc01 on alpha), so that a
+# tier-4 test scripts only the deviation it is about.
+#
+# LOGGING. Every call appends "<function><TAB><arg>..." to ${SEANCE_MOCK_LOG}
+# when that is set, so a test can assert what was invoked, in what order, and
+# how many times -- which is how "exactly one node acted" gets asserted from
+# the resource rather than from exit codes.
+#
+# shellcheck shell=sh
+# shellcheck disable=SC3043
+#   'local' is not in POSIX sh but is implemented by FreeBSD /bin/sh (sh(1),
+#   "local"); seance targets FreeBSD sh and nothing else (handoff §5).
+
+# The repository root. The harness exports T_ROOT and tests/run.sh exports
+# SEANCE_ROOT; a sourced file has no reliable path of its own in sh, so one of
+# them must be set. Failing loudly here beats sourcing nothing and then
+# reimplementing the parsers by accident.
+if [ -n "${SEANCE_ROOT:-}" ]; then
+    MOCK_ROOT=${SEANCE_ROOT}
+elif [ -n "${T_ROOT:-}" ]; then
+    MOCK_ROOT=${T_ROOT}
+else
+    # exit, not return: a mock that could not find the real parsers must not
+    # go on to answer questions with half a contract, and the caller here is
+    # always a test file whose failure is the correct outcome.
+    echo "mock-adapter: neither SEANCE_ROOT nor T_ROOT is set" >&2
+    exit 2
+fi
+
+# The real parsers. Not a convenience: a contract.
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=../lib/policy.subr
+. "${MOCK_ROOT}/lib/policy.subr"
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=../lib/conf.subr
+. "${MOCK_ROOT}/lib/conf.subr"
+
+MOCK_TAB=$( printf '\t' )
+
+# The fictional world, one record per line, exactly the field order of
+# adapter_guest_list: name, type, astart, status, running.
+MOCK_GUESTS="web01	jail	1	1	1
+db01	bhyve	1	1	1
+arc01	jail	0	2	0"
+
+# ---------------------------------------------------------------------------
+# Plumbing
+# ---------------------------------------------------------------------------
+
+_mock_diag()
+{
+    printf 'mock-adapter: %s\n' "$*" >&2
+}
+
+# _mock_log <function> <args...>
+_mock_log()
+{
+    [ -n "${SEANCE_MOCK_LOG:-}" ] || return 0
+
+    printf '%s\n' "$*" >> "${SEANCE_MOCK_LOG}"
+}
+
+# _mock_script_line <key>
+#
+# The rest of the script line whose first tab-separated field is exactly <key>,
+# or nothing. The key is matched whole, never as a prefix: "adapter_guest_type"
+# must not answer for "adapter_guest_type_of_something_else".
+_mock_script_line()
+{
+    local _key _line _lkey
+
+    _key=$1
+
+    [ -n "${SEANCE_MOCK_SCRIPT:-}" ] || return 1
+    [ -r "${SEANCE_MOCK_SCRIPT}" ] || return 1
+
+    while IFS= read -r _line || [ -n "${_line}" ]; do
+        case "${_line}" in
+            ''|'#'*) continue ;;
+        esac
+
+        _lkey=${_line%%"${MOCK_TAB}"*}
+        [ "${_lkey}" = "${_key}" ] || continue
+
+        printf '%s\n' "${_line#*"${MOCK_TAB}"}"
+        return 0
+    done < "${SEANCE_MOCK_SCRIPT}"
+
+    return 1
+}
+
+# _mock_scripted <function> <args...>
+#
+# Play the scripted outcome for this call if there is one. rc 100 -- a value no
+# adapter function may return -- means "nothing scripted, answer from the
+# fixtures", so that a scripted rc of 0, 1 or 2 is never confused with the
+# absence of a script.
+_mock_scripted()
+{
+    local _fn _rest _outcome _payload
+
+    _fn=$1
+    shift
+
+    _rest=""
+    if [ $# -gt 0 ]; then
+        _rest=$( _mock_script_line "${_fn} $1" ) || _rest=""
+    fi
+
+    if [ -z "${_rest}" ]; then
+        _rest=$( _mock_script_line "${_fn}" ) || return 100
+    fi
+
+    _outcome=${_rest%%"${MOCK_TAB}"*}
+    if [ "${_rest}" = "${_outcome}" ]; then
+        _payload=""
+    else
+        _payload=${_rest#*"${MOCK_TAB}"}
+    fi
+
+    case "${_outcome}" in
+        ok)
+            [ -z "${_payload}" ] || [ "${_payload}" = "-" ] ||
+                printf '%b\n' "${_payload}"
+            return 0
+            ;;
+        fail)
+            [ -z "${_payload}" ] || printf '%b\n' "${_payload}" >&2
+            return 1
+            ;;
+        garbage)
+            [ -n "${_payload}" ] || _payload='<html>500 Internal Server Error'
+            printf '%b\n' "${_payload}"
+            return 0
+            ;;
+        empty0)
+            return 0
+            ;;
+        usage)
+            [ -z "${_payload}" ] || printf '%b\n' "${_payload}" >&2
+            return 2
+            ;;
+        timeout)
+            sleep "$(( ${SEANCE_MOCK_TIMEOUT:-5} + 1 ))"
+            return 1
+            ;;
+        *)
+            _mock_diag "unknown outcome in ${SEANCE_MOCK_SCRIPT:-<no script>}: [${_outcome}]"
+            return 2
+            ;;
+    esac
+}
+
+# _mock_name_ok <name>
+#
+# The same guest-name rule the real adapter applies ([a-z0-9][a-z0-9._-]*).
+# Deliberately restated rather than imported: importing lib/adapter.subr would
+# make the mock depend on the file it exists to stand in for. Parity is not
+# assumed either -- tests/conformance/vectors.tsv drives a rejected name
+# through both adapters and requires the same answer from each.
+_mock_name_ok()
+{
+    case "${1:-}" in
+        ''|[!abcdefghijklmnopqrstuvwxyz0123456789]*) return 1 ;;
+        *[!abcdefghijklmnopqrstuvwxyz0123456789._-]*) return 1 ;;
+    esac
+
+    return 0
+}
+
+# _mock_guest_field <name> <field-number>
+#
+# One field of the fictional world's record for a guest; rc 1 if there is no
+# such guest.
+_mock_guest_field()
+{
+    local _name _field _row _oifs
+
+    _name=$1
+    _field=$2
+
+    _oifs=$IFS
+    IFS='
+'
+    # shellcheck disable=SC2086
+    #   Deliberate word splitting on newline: one record per element, and no
+    #   field of a record contains a space or a newline.
+    for _row in ${MOCK_GUESTS}; do
+        IFS=$_oifs
+        case "${_row}" in
+            "${_name}${MOCK_TAB}"*)
+                printf '%s\n' "${_row}" | cut -f "${_field}"
+                return 0
+                ;;
+        esac
+        IFS='
+'
+    done
+    IFS=$_oifs
+
+    return 1
+}
+
+# ---------------------------------------------------------------------------
+# The adapter contract
+# ---------------------------------------------------------------------------
+
+# contract: adapter_init() -> nothing [no output]
+adapter_init()
+{
+    local _rc
+
+    _mock_log adapter_init
+    _mock_scripted adapter_init
+    _rc=$?
+    [ "${_rc}" -ne 100 ] && return "${_rc}"
+
+    return 0
+}
+
+# contract: adapter_node_self() -> nodename [promises output]
+adapter_node_self()
+{
+    local _rc
+
+    _mock_log adapter_node_self
+    _mock_scripted adapter_node_self
+    _rc=$?
+    [ "${_rc}" -ne 100 ] && return "${_rc}"
+
+    printf '%s\n' "${SEANCE_MOCK_NODE:-alpha}"
+}
+
+# contract: adapter_fact(key) -> value [promises output]
+adapter_fact()
+{
+    local _rc _wd
+
+    _mock_log adapter_fact "$@"
+    _mock_scripted adapter_fact "$@"
+    _rc=$?
+    [ "${_rc}" -ne 100 ] && return "${_rc}"
+
+    _wd=${SEANCE_MOCK_WORKDIR:-/nonexistent/mock}
+
+    case "${1:-}" in
+        workdir)     printf '%s\n' "${_wd}" ;;
+        nodename)    printf '%s\n' "${SEANCE_MOCK_NODE:-alpha}" ;;
+        jailsysdir)  printf '%s/jails-system\n' "${_wd}" ;;
+        jaildatadir) printf '%s/jails-data\n' "${_wd}" ;;
+        dbdir)       printf '%s/var/db\n' "${_wd}" ;;
+        etcdir)      printf '%s/etc\n' "${_wd}" ;;
+        distdir)     printf '%s\n' "/usr/local/cbsd" ;;
+        *)
+            _mock_diag "adapter_fact: no such fact: [${1:-}]"
+            return 2
+            ;;
+    esac
+
+    return 0
+}
+
+# contract: adapter_kernel_version() -> uname-style kernel version [promises output]
+adapter_kernel_version()
+{
+    local _rc
+
+    _mock_log adapter_kernel_version
+    _mock_scripted adapter_kernel_version
+    _rc=$?
+    [ "${_rc}" -ne 100 ] && return "${_rc}"
+
+    printf '%s\n' "${SEANCE_MOCK_KERNEL:-15.1-RELEASE-p2}"
+}
+
+# contract: adapter_guest_list() -> name<TAB>type<TAB>astart<TAB>status<TAB>running [list: may be empty]
+adapter_guest_list()
+{
+    local _rc
+
+    _mock_log adapter_guest_list
+    _mock_scripted adapter_guest_list
+    _rc=$?
+    [ "${_rc}" -ne 100 ] && return "${_rc}"
+
+    [ -n "${MOCK_GUESTS}" ] || return 0
+
+    printf '%s\n' "${MOCK_GUESTS}"
+}
+
+# contract: adapter_guest_type(name) -> bhyve|jail [promises output]
+adapter_guest_type()
+{
+    local _rc _v
+
+    _mock_log adapter_guest_type "$@"
+    _mock_scripted adapter_guest_type "$@"
+    _rc=$?
+    [ "${_rc}" -ne 100 ] && return "${_rc}"
+
+    if ! _mock_name_ok "${1:-}"; then
+        _mock_diag "adapter_guest_type: not a usable guest name: [${1:-}]"
+        return 2
+    fi
+
+    _v=$( _mock_guest_field "$1" 2 ) || {
+        _mock_diag "no such guest on this node: $1"
+        return 1
+    }
+
+    printf '%s\n' "${_v}"
+}
+
+# contract: adapter_guest_running(name) -> 1|0 [promises output]
+adapter_guest_running()
+{
+    local _rc _v
+
+    _mock_log adapter_guest_running "$@"
+    _mock_scripted adapter_guest_running "$@"
+    _rc=$?
+    [ "${_rc}" -ne 100 ] && return "${_rc}"
+
+    if ! _mock_name_ok "${1:-}"; then
+        _mock_diag "adapter_guest_running: not a usable guest name: [${1:-}]"
+        return 2
+    fi
+
+    _v=$( _mock_guest_field "$1" 5 ) || {
+        _mock_diag "no such guest on this node: $1"
+        return 1
+    }
+
+    printf '%s\n' "${_v}"
+}
+
+# contract: adapter_guest_start(name) -> nothing [no output]
+adapter_guest_start()
+{
+    local _rc
+
+    _mock_log adapter_guest_start "$@"
+    _mock_scripted adapter_guest_start "$@"
+    _rc=$?
+    [ "${_rc}" -ne 100 ] && return "${_rc}"
+
+    _mock_name_ok "${1:-}" || return 2
+    _mock_guest_field "$1" 1 > /dev/null || return 1
+
+    return 0
+}
+
+# contract: adapter_guest_stop(name) -> nothing [no output]
+adapter_guest_stop()
+{
+    local _rc
+
+    _mock_log adapter_guest_stop "$@"
+    _mock_scripted adapter_guest_stop "$@"
+    _rc=$?
+    [ "${_rc}" -ne 100 ] && return "${_rc}"
+
+    _mock_name_ok "${1:-}" || return 2
+    _mock_guest_field "$1" 1 > /dev/null || return 1
+
+    return 0
+}
+
+# contract: adapter_guest_register(name,rcfile) -> nothing [no output]
+adapter_guest_register()
+{
+    local _rc
+
+    _mock_log adapter_guest_register "$@"
+    _mock_scripted adapter_guest_register "$@"
+    _rc=$?
+    [ "${_rc}" -ne 100 ] && return "${_rc}"
+
+    _mock_name_ok "${1:-}" || return 2
+    [ -n "${2:-}" ] || return 2
+    [ -r "${2}" ] || return 1
+
+    return 0
+}
+
+# contract: adapter_guest_unregister(name) -> nothing [no output]
+adapter_guest_unregister()
+{
+    local _rc
+
+    _mock_log adapter_guest_unregister "$@"
+    _mock_scripted adapter_guest_unregister "$@"
+    _rc=$?
+    [ "${_rc}" -ne 100 ] && return "${_rc}"
+
+    _mock_name_ok "${1:-}" || return 2
+    _mock_guest_field "$1" 1 > /dev/null || return 1
+
+    return 0
+}
+
+# contract: adapter_guest_hold(name) -> nothing [no output]
+adapter_guest_hold()
+{
+    local _rc
+
+    _mock_log adapter_guest_hold "$@"
+    _mock_scripted adapter_guest_hold "$@"
+    _rc=$?
+    [ "${_rc}" -ne 100 ] && return "${_rc}"
+
+    _mock_name_ok "${1:-}" || return 2
+    _mock_guest_field "$1" 1 > /dev/null || return 1
+
+    return 0
+}
+
+# contract: adapter_guest_release(name) -> nothing [no output]
+adapter_guest_release()
+{
+    local _rc
+
+    _mock_log adapter_guest_release "$@"
+    _mock_scripted adapter_guest_release "$@"
+    _rc=$?
+    [ "${_rc}" -ne 100 ] && return "${_rc}"
+
+    _mock_name_ok "${1:-}" || return 2
+    _mock_guest_field "$1" 1 > /dev/null || return 1
+
+    return 0
+}
+
+# contract: adapter_guest_held(name) -> 1|0 [promises output]
+adapter_guest_held()
+{
+    local _rc _v
+
+    _mock_log adapter_guest_held "$@"
+    _mock_scripted adapter_guest_held "$@"
+    _rc=$?
+    [ "${_rc}" -ne 100 ] && return "${_rc}"
+
+    if ! _mock_name_ok "${1:-}"; then
+        _mock_diag "adapter_guest_held: not a usable guest name: [${1:-}]"
+        return 2
+    fi
+
+    _v=$( _mock_guest_field "$1" 4 ) || {
+        _mock_diag "no such guest on this node: $1"
+        return 1
+    }
+
+    if [ "${_v}" = "2" ]; then
+        printf '1\n'
+    else
+        printf '0\n'
+    fi
+}
+
+# contract: adapter_guest_sysdir(name) -> path [promises output]
+adapter_guest_sysdir()
+{
+    local _rc
+
+    _mock_log adapter_guest_sysdir "$@"
+    _mock_scripted adapter_guest_sysdir "$@"
+    _rc=$?
+    [ "${_rc}" -ne 100 ] && return "${_rc}"
+
+    if ! _mock_name_ok "${1:-}"; then
+        _mock_diag "adapter_guest_sysdir: not a usable guest name: [${1:-}]"
+        return 2
+    fi
+
+    printf '%s/jails-system/%s\n' "${SEANCE_MOCK_WORKDIR:-/nonexistent/mock}" "$1"
+}
+
+# contract: adapter_guest_datasets(name) -> dataset per line, root first [promises output]
+adapter_guest_datasets()
+{
+    local _rc _type
+
+    _mock_log adapter_guest_datasets "$@"
+    _mock_scripted adapter_guest_datasets "$@"
+    _rc=$?
+    [ "${_rc}" -ne 100 ] && return "${_rc}"
+
+    if ! _mock_name_ok "${1:-}"; then
+        _mock_diag "adapter_guest_datasets: not a usable guest name: [${1:-}]"
+        return 2
+    fi
+
+    _type=$( _mock_guest_field "$1" 2 ) || {
+        _mock_diag "no dataset for guest $1"
+        return 1
+    }
+
+    printf '%s/%s\n' "${MOCK_POOL:-pool0}" "$1"
+    if [ "${_type}" = "bhyve" ]; then
+        printf '%s/%s/dsk1.vhd\n' "${MOCK_POOL:-pool0}" "$1"
+    fi
+
+    return 0
+}
+
+# contract: adapter_carp_state(vhid) -> MASTER|BACKUP|INIT|absent [promises output]
+adapter_carp_state()
+{
+    local _rc
+
+    _mock_log adapter_carp_state "$@"
+    _mock_scripted adapter_carp_state "$@"
+    _rc=$?
+    [ "${_rc}" -ne 100 ] && return "${_rc}"
+
+    case "${1:-}" in
+        ''|*[!0123456789]*) return 2 ;;
+        0*) return 2 ;;
+    esac
+    [ "$1" -ge 1 ] && [ "$1" -le 255 ] || return 2
+
+    case "$1" in
+        1) printf 'MASTER\n' ;;
+        2) printf 'BACKUP\n' ;;
+        3) printf 'INIT\n' ;;
+        *) printf 'absent\n' ;;
+    esac
+
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# Beyond the adapter contract: the ZFS listing seam
+# ---------------------------------------------------------------------------
+
+# mock_zfs_list <dataset>
+#
+# Stands in for the snapshot listing lib/lineage.subr runs through
+# SEANCE_ZFS_LIST_CMD. Deliberately NOT named adapter_* : it is not part of
+# the adapter contract, because the replication layer talks to ZFS directly
+# (design §2 puts zfs in repl.subr, not in the adapter).
+#
+# Scriptable exactly like the adapter functions, under the key "mock_zfs_list".
+# Its default answer is a lineage generated by the REAL formatter --
+# pol_snap_format, at the REAL default cadence from conf_default -- so that a
+# fixture can never be a name seance would not itself have written.
+#
+#   SEANCE_MOCK_LINEAGE_NODE   node key in the names            (default alpha)
+#   SEANCE_MOCK_LINEAGE_NOW    epoch of the newest snapshot     (default 0)
+#   SEANCE_MOCK_LINEAGE_N      how many snapshots               (default 3)
+mock_zfs_list()
+{
+    local _rc _ds _node _now _n _i _cadence _ts _short
+
+    _mock_log mock_zfs_list "$@"
+    _mock_scripted mock_zfs_list "$@"
+    _rc=$?
+    [ "${_rc}" -ne 100 ] && return "${_rc}"
+
+    _ds=${1:-pool0/web01}
+    _node=${SEANCE_MOCK_LINEAGE_NODE:-alpha}
+    _now=${SEANCE_MOCK_LINEAGE_NOW:-0}
+    _n=${SEANCE_MOCK_LINEAGE_N:-3}
+
+    _cadence=$( conf_default cadence ) || _cadence=900
+
+    _i=0
+    while [ "${_i}" -lt "${_n}" ]; do
+        _ts=$( pol_epoch_to_ts $(( _now - _i * _cadence )) ) || return 2
+        _short=$( pol_snap_format "${_node}" "${_ts}" ) || return 2
+        printf '%s@%s\n' "${_ds}" "${_short}"
+        _i=$(( _i + 1 ))
+    done
+
+    return 0
+}
