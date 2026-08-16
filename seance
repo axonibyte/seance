@@ -1,5 +1,5 @@
 #!/usr/local/bin/cbsd
-#v0.0.0-m0
+#v0.1.0
 # seance -- CBSD verb wrapper (decision D-2).
 #
 # This is the only file in the project that runs under cbsdsh. It does no
@@ -52,9 +52,9 @@ ${H3_COLOR}Options${N0_COLOR}:
    version - print the seance version;
    help    - print dispatcher usage;
 
- A verb that takes arguments of its own must be given bare rather than as
- mode=<verb>: only the bare form is known to carry the remaining arguments
- through to the dispatcher.
+ Both spellings carry the arguments that follow the verb: 'mode=config --check'
+ does the same thing as the bare 'config --check'. Bare is shorter; the mode=
+ form is the framework's own idiom. The Examples below show each in full.
 
  The configuration file is \${SEANCE_CONF} if set, otherwise
  \${workdir}/etc/seance.conf; 'config --file <path>' overrides both.
@@ -107,12 +107,24 @@ export SEANCE_CBSD_DISTDIR SEANCE_CBSD_VERSION
 # 'cbsd seance mode=version' and 'cbsd seance version' must both work: CBSD has
 # no two-level dispatch (PATH only, cbsd.conf:122), so a bare verb arrives in
 # CIX_OTHER_ARGS.
+#
+# BOTH are passed on, in that order, and that is the whole of the fix this line
+# once needed. CBSD turns every 'key=value' word named in CIXARG/CIXOPTARG into
+# a shell variable and drops everything else into CIX_OTHER_ARGS
+# (tools/getinfo:13, tools/task:53-60), so the two spellings arrive as:
+#
+#     cbsd seance config --check       mode=''        CIX_OTHER_ARGS='config --check'
+#     cbsd seance mode=config --check  mode='config'  CIX_OTHER_ARGS='--check'
+#
+# Reading ${mode} alone answered the second by running 'config' without
+# '--check': an operator asked for a validation, got a dump and exit 0, and
+# nothing anywhere said the flag had gone nowhere. A verb that silently drops
+# an argument is worse than one that refuses it. Pinned by
+# tests/tier1/t_verb_wrapper.sh, which drives this file with a faked cbsdsh
+# environment, and observed against real CBSD in docs/cbsd-module-notes.md §2.
+#
 # shellcheck disable=SC2086
 #   Deliberate word splitting: ${mode} is one word and ${CIX_OTHER_ARGS} is the
 #   whole bare argument list, which must reach the dispatcher as separate
 #   arguments rather than as one.
-if [ -n "${mode}" ]; then
-    exec ${_MYDIR}/bin/seance ${mode}
-else
-    exec ${_MYDIR}/bin/seance ${CIX_OTHER_ARGS}
-fi
+exec ${_MYDIR}/bin/seance ${mode} ${CIX_OTHER_ARGS}

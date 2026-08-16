@@ -231,9 +231,18 @@ seance_verify()
     verify_report
 }
 
+# seance_version
+#
+# Print "seance <version>" and nothing else -- this verb is data, not a report,
+# so that `seance version` is usable inside a shell substitution. It takes no
+# arguments, and says so rather than ignoring them: a verb that accepts an
+# argument it does not implement is a verb that will one day be given
+# `--tsv` by somebody who then believes the output is TSV.
 seance_version()
 {
     local _v
+
+    [ $# -eq 0 ] || seance_die 2 "version: takes no arguments (got: $*)"
 
     [ -r "${SEANCE_ROOT}/VERSION" ] ||
         seance_die 1 "no readable VERSION file at ${SEANCE_ROOT}/VERSION"
@@ -360,7 +369,7 @@ case "${_verb}" in
         exit $?
         ;;
     version)
-        seance_version
+        seance_version "$@"
         ;;
     help|--help|-h)
         seance_usage

@@ -85,3 +85,24 @@ seance-のーど-20260816T101500Z	foreign	-	-
 seance-node/child-20260816T101500Z	foreign	-	-
 seance-node@x-20260816T101500Z	foreign	-	-
 seance-node%s-20260816T101500Z	foreign	-	-
+# --- boundaries: the node field at its extremes, and the node named after the tool
+#
+# A node key may be as long as an operator cares to type, and a fleet whose
+# node is literally called 'seance' must still parse: the prefix is stripped
+# once, from the left, and the node field is whatever is left of the final
+# dash. Both are read from the RIGHT, which is what makes them work at all.
+seance-seance-20260816T101500Z	ok	seance	20260816T101500Z
+seance-seance-alpha-20260816T101500Z	ok	seance-alpha	20260816T101500Z
+seance-alpha-seance-20260816T101500Z	ok	alpha-seance	20260816T101500Z
+seance-seance	foreign	-	-
+seance-seance-20260816T101560Z	foreign	-	-
+seance-n0123456789.abcdefghij:klmnopqrst-uvwxyz0123_ABCDEFGHIJKLMNOPQR-20260816T101500Z	ok	n0123456789.abcdefghij:klmnopqrst-uvwxyz0123_ABCDEFGHIJKLMNOPQR	20260816T101500Z
+seance-n0123456789.abcdefghij:klmnopqrst-uvwxyz0123_ABCDEFGHIJKLMNOPQRs-20260816T101500Z	ok	n0123456789.abcdefghij:klmnopqrst-uvwxyz0123_ABCDEFGHIJKLMNOPQRs	20260816T101500Z
+seance-n0123456789.abcdefghij:klmnopqrst-uvwxyz0123_ABCDEFGHIJKLMNOPQR-20260229T101500Z	foreign	-	-
+seance-a-99991231T235959Z	ok	a	99991231T235959Z
+seance-a-00010101T000000Z	ok	a	00010101T000000Z
+seance-alpha-20380119T031407Z	ok	alpha	20380119T031407Z
+seance-alpha-20380119T031408Z	ok	alpha	20380119T031408Z
+seance-alpha-19700101T000000Z	ok	alpha	19700101T000000Z
+seance-alpha-20260816T235960Z	foreign	-	-
+seance-alpha-99991231T235960Z	foreign	-	-

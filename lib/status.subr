@@ -295,8 +295,17 @@ status_report()
         if ! status_peer_facts "${_peer}" "${_conf}" "${_tmp}/facts"; then
             status_warn "peer ${_peer} did not answer"
             if [ "${_tsv}" -eq 1 ]; then
-                printf 'peer%s%s%sunreachable\n' \
-                    "${STATUS_TAB}" "${_peer}" "${STATUS_TAB}"
+                # Four columns, the same four a reachable peer prints. --tsv is
+                # what a script reads, and a record type whose column count
+                # moves with the fleet's state is a parser that breaks on the
+                # day it matters -- which is always the day a peer went away.
+                # The kernel is genuinely unknown; the column that would carry
+                # the configuration checksum carries the reason there is none,
+                # beside the "none" a reachable peer with no readable config
+                # already prints there.
+                printf 'peer%s%s%sunknown%sunreachable\n' \
+                    "${STATUS_TAB}" "${_peer}" \
+                    "${STATUS_TAB}" "${STATUS_TAB}"
             else
                 printf 'peer %-10s unreachable\n' "${_peer}"
             fi

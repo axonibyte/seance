@@ -172,6 +172,88 @@ wrong_defaults()
     printf '%s\n' "${_out}"
 }
 
+# ---------------------------------------------------------------------------
+# Doc liveness: a document that names a key seance no longer has
+# ---------------------------------------------------------------------------
+#
+# The sample is not the only file that names configuration keys, and a
+# document naming one that has been renamed is the same rot as a README naming
+# a verb that has been renamed -- worse, because the operator's edit will then
+# be refused by conf_load with "unknown key" at three in the morning.
+#
+# The scan is deliberately narrow and stated: a backticked span, OUTSIDE fenced
+# code blocks, that is entirely lowercase-with-underscores. In these documents
+# such a token is a configuration key -- with one exception that has to be
+# subtracted rather than tolerated, because it is real: seance's own shell
+# functions have the same shape (`repl_standby_root` beside `standby_root`).
+# So a token that lib/ defines as a function is not a key mention, and the
+# subtraction is computed from the source rather than written out here, so that
+# a new function cannot quietly become a new exception.
+DOC_SET="docs/repl-wire.md docs/DRILLS.md README.md"
+
+# doc_key_tokens <file>
+doc_key_tokens()
+{
+    awk '
+        /^```/ { fence = 1 - fence; next }
+        fence  { next }
+        {
+            line = $0
+            while (match(line, /`[^`]*`/)) {
+                print substr(line, RSTART + 1, RLENGTH - 2)
+                line = substr(line, RSTART + RLENGTH)
+            }
+        }
+    ' "$1" | grep -E '^[a-z][a-z0-9]*(_[a-z0-9]+)+$' | LC_ALL=C sort -u
+}
+
+# lib_functions -- every shell function lib/ defines, space separated.
+lib_functions()
+{
+    sed -n -e 's/^\([a-z_][a-z0-9_]*\)()$/\1/p' "${T_ROOT}"/lib/*.subr |
+        LC_ALL=C sort -u | tr '\n' ' '
+}
+
+# unknown_doc_keys <file> <fleet> <node-fields> <guest-fields> <functions>
+#
+# The tokens that are neither a function nor a key of any shape seance knows.
+unknown_doc_keys()
+{
+    local _file _fleet _node _guest _fn _tok _rest _out
+
+    _file=$1
+    _fleet=$2
+    _node=$3
+    _guest=$4
+    _fn=$5
+    _out=""
+
+    for _tok in $( doc_key_tokens "${_file}" ); do
+        contains "${_fn}" "${_tok}" && continue
+
+        case "${_tok}" in
+            node_*)
+                _rest=${_tok#node_}
+                contains "${_node}" "${_rest#*_}" && continue
+                ;;
+            guest_*)
+                _rest=${_tok#guest_}
+                contains "${_guest}" "${_rest#*_}" && continue
+                ;;
+            names_*)
+                continue
+                ;;
+            *)
+                contains "${_fleet}" "${_tok}" && continue
+                ;;
+        esac
+
+        _out="${_out} ${_tok}"
+    done
+
+    printf '%s\n' "${_out}"
+}
+
 WORK=$( t_tmpdir )
 
 FLEET=$( list_from_source CONF_FLEET_KEYS "${CONF_SRC}" )
@@ -207,7 +289,7 @@ while IFS= read -r row; do
     esac
 done < "${WORK}/sample.rows"
 
-t_plan 22
+t_plan 27
 
 # --- the guard is scanning something ---------------------------------------
 
@@ -312,5 +394,27 @@ sed -e 's/^CONF_NODE_KEYS="nodename /CONF_NODE_KEYS="nodename newfield /' \
 t_is "$( missing_from "$( list_from_source CONF_NODE_KEYS "${MUT}" )" \
                       "${S_NODE}" )" " newfield" \
     "mutation: an undocumented node field is caught"
+
+# --- doc liveness ----------------------------------------------------------
+
+FUNCS=$( lib_functions )
+t_isnt "${FUNCS}" "" "lib/ defines functions, so the subtraction is real"
+
+for doc in ${DOC_SET}; do
+    t_is "$( unknown_doc_keys "${T_ROOT}/${doc}" \
+            "${FLEET}" "${NODEK}" "${GUESTK}" "${FUNCS}" )" "" \
+        "every configuration key ${doc} names is one seance knows"
+done
+
+# The mutation: a document goes on naming a key that has been renamed.
+cp "${T_ROOT}/docs/repl-wire.md" "${WORK}/repl-wire.md"
+# shellcheck disable=SC2016
+#   The single quotes are the point: the backticks are Markdown being written
+#   into a document, not a command substitution to expand.
+printf '\nThe fleet key `standby_rooot` is where replicas land.\n' \
+    >> "${WORK}/repl-wire.md"
+t_is "$( unknown_doc_keys "${WORK}/repl-wire.md" \
+        "${FLEET}" "${NODEK}" "${GUESTK}" "${FUNCS}" )" " standby_rooot" \
+    "mutation: a document naming a key that does not exist is caught"
 
 t_done

@@ -237,7 +237,10 @@ other CBSD 15.0.9 defects worth knowing before relying on any of this.
 ## Exit codes
 
 `0` ok, `1` operation failed, `2` usage or contract error. stdout is data,
-stderr is diagnostics, and every verb ends in a verdict line.
+stderr is diagnostics, and every verb that *acts* on the fleet — `repl`,
+`status`, `verify`, `config` — ends in a verdict line. `version` and `help`
+are data-only: they print the version and the usage summary and nothing else,
+which is what makes `seance version` usable inside a shell substitution.
 
 ## Documents
 

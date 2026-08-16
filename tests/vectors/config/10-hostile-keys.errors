@@ -1,0 +1,9 @@
+CONF:1: bad key "﻿cadence": keys are [a-z0-9_]+
+CONF:2: bad key "CADENCE": keys are [a-z0-9_]+
+CONF:3: bad key "cadence ": keys are [a-z0-9_]+
+CONF:4: bad key "": keys are [a-z0-9_]+
+CONF:5: bad key "node_ALPHA_nodename": keys are [a-z0-9_]+
+CONF:7: duplicate key "names_alpha"
+CONF:8: bad key "nodè_alpha_mgmt": keys are [a-z0-9_]+
+CONF:9: unknown key "node__nodename"
+CONF:10: unknown key "guest_web01_heir3"

@@ -23,7 +23,7 @@
 # Every stage name tier 6 and tier 7 may carry. Adding a stage script means
 # adding its name here; the alternative -- accepting any name -- is the typo
 # that turns a skipped suite into a green one.
-STAGE_KNOWN="substrate repl interrupt promote quorum concurrency failback resurrection hostile sim"
+STAGE_KNOWN="substrate repl replfail replconc replevidence report retention hostileenv interrupt promote quorum concurrency failback resurrection hostile sim"
 
 # stage_diag <message...> -- a TAP comment, independent of the harness so
 # that the order in which a test file sources the two does not matter.
