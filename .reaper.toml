@@ -33,7 +33,7 @@ datasets = ["state"]
 
 [resources]
 cores = 4
-ram_gb = 8
+ram_gb = 16
 
 # Long tier-7 hunts: opt-in, and given a TTL that outlives them.
 [profiles.hunt]
