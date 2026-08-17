@@ -2,8 +2,31 @@ Tier 6 -- pseudo-cluster staged integration, shape A (reaper guest).
 
 Three vnet jails as nodes on an internal bridge, real ZFS lineage, real ssh,
 real CARP, and a fence driver whose "power off" stops the target jail. Named
-stages, individually runnable: substrate, repl, interrupt, promote, quorum,
-concurrency, failback, resurrection, hostile. See TESTING.md §7.
+stages, individually runnable: substrate, repl, interrupt, promote, carp,
+quorum, concurrency, flap, failback, resurrection, hostile (and the M1 loop's
+replfail, replconc, replevidence, report, retention, hostileenv). See
+TESTING.md §7.
+
+The M3 stages, and what each is for:
+
+    carp         the advskews ARE the succession map. Each node MASTER for its
+                 own identity and BACKUP for the ones it may inherit, applied
+                 from what `seance verify --render carp` printed and read back
+                 by `verify`.
+    quorum       an isolated node is not a dead node. It freezes at rung 2 and
+                 fences nobody, while the connected heir succeeds it.
+    concurrency  two heirs told about one death at the same instant; exactly
+                 one acts, and the loser is stopped by CARP first and by the
+                 claim check afterwards.
+    flap         a link that comes back inside the debounce window. Rung 1
+                 re-reads CARP, finds the transition gone, and nothing changes.
+
+WHAT SHAPE A CANNOT PROVE ABOUT M3, stated so nobody looks for it here: devd(8)
+is KEYWORD: nojail and does not run in a vnet jail, so the rules are rendered,
+installed and recognised by `verify` but never FIRE. Every CARP stage therefore
+invokes `seance promote-event <vhid>@<if>` itself -- the same command the rule's
+action names -- and the firing is tier 8's, measured by docs/DRILLS.md
+drill-node as T1 to T2.
 
 The substrate itself lives in tests/cluster/lib/cluster.subr and is asserted
 by t_substrate.sh (stage 'substrate'): jails up, ssh mesh, delegated ZFS,

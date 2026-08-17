@@ -145,7 +145,10 @@ status_report()
         return 2
     fi
 
-    _now=$( pol_now )
+    _now=$( pol_now ) || {
+        printf 'status: FAIL (this node cannot read its own clock)\n'
+        return 2
+    }
     _skew=$( conf_effective skew_tolerance ) || _skew=120
     _conf=$( conf_file )
     _tmp=$( seance_tmpdir ) || return 2

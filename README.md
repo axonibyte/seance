@@ -12,7 +12,7 @@ file that is not in this repository.
 Design rationale is in `DESIGN.md`; the testing contract is in `TESTING.md`;
 the implementation brief is in `HANDOFF.md`.
 
-## Status: M2 — manual promotion, failback, the boot gate
+## Status: M3 — CARP detection, the devd hook, `--auto`
 
 Layer 1 is live: `repl` snapshots, sends and prunes; `status` is the one screen;
 `verify` renders the configuration seance expects and diffs it against reality.
@@ -20,9 +20,21 @@ On top of it, the succession ladder: `promote` walks it by hand, `failback`
 runs it in reverse, `gate` withholds a returning node's estate until the living
 have been asked, and `placement` is the record they answer from.
 
-CARP detection, `--auto` and the shipped `drivers/fence_ipmi` driver are later
-milestones and are deliberately absent: M2 ships the fence-driver *contract*
-and drives it with test drivers only.
+M3 adds detection. One CARP vhid per node identity, with the advskew encoding
+the succession map — owner 0, heir 100, second heir 200 — so the survivor CARP
+hands a dead node's vhid to is the survivor the configuration already named.
+`verify --render carp` prints the `rc.conf(5)` that arranges it and
+`verify --render devd` prints the `devd(8)` rule that acts on it; `verify`
+diffs both against the node. When the rule fires, `promote-event` maps the vhid
+to a node and either detaches `promote <node> --auto` or notifies.
+
+**Automation needs two switches, and both of them**: the fleet key `auto` and
+the node's own `auto_promote` list. Either alone is notify-only. `--force` is
+not expressible with `--auto` — a force is a human accepting a rung that could
+not answer, and there is no human on the automatic path.
+
+The shipped `drivers/fence_ipmi` driver against real hardware is M4's, and
+seance still never writes a line of host network configuration.
 
 What is here:
 
@@ -40,7 +52,8 @@ What is here:
 | `lib/zfs.subr` | every local `zfs` invocation seance makes, in one file |
 | `lib/lineage.subr` | what this node holds for another, and whether it may be promoted |
 | `lib/repl.subr` | layer 1: snapshot, resume, send, hold the shadow-mount law, prune both ends, record lag |
-| `lib/promote.subr` | the seven-rung succession ladder |
+| `lib/promote.subr` | the succession ladder, and `promote-event` — the devd target |
+| `lib/carp.subr` | the succession map expressed as advskews, and what devd is told to do with it |
 | `lib/failback.subr` | the ladder in reverse, plus the interim host's `failback-assist` half |
 | `lib/gate.subr` | placement records and the resurrection gate |
 | `lib/status.subr`, `lib/verify.subr` | the two reporting verbs |
@@ -137,9 +150,34 @@ peer, and the crontab line.
 
 ```sh
 seance verify
-seance verify --render cron        # print the expected crontab(5) line
+seance verify --render cron        # the expected crontab(5) line
+seance verify --render carp        # the expected rc.conf(5) CARP configuration
+seance verify --render devd        # the expected devd(8) rules
 seance verify --render cron > /usr/local/etc/cron.d/seance
+seance verify --render devd > /usr/local/etc/devd/seance.conf
 ```
+
+`--render cron` needs nothing but the configuration. `--render carp` and
+`--render devd` render **for this node** — which vhids a node carries and at
+what advskew depends on which node it is — so they need the platform to say
+what node that is.
+
+What the CARP check compares, and against what:
+
+| Check | Against |
+| --- | --- |
+| one `ifconfig_<if>_alias<n>` per vhid this node takes part in | every `ifconfig_<if>_alias*` variable `sysrc(8)` reports, at any index |
+| the advskew on each: 0 own, 100 heir-of, 200 second-heir-of | the same |
+| the vhid is live and in the state it should be | `ifconfig(8)`, through the adapter |
+| `carp` loads at boot | `kld_list` or `/boot/loader.conf`; neither is a warning, because the module may be in the kernel |
+| the file carrying `carp_pass` is not group- or world-readable | `stat(1)` |
+| a `devd(8)` rule per vhid this node may **inherit** | `/usr/local/etc/devd/seance.conf` or `/etc/devd/seance.conf` |
+| `devd` is running | `service devd status` |
+
+A missing devd rule is a **FAIL** when this node's `auto_promote` names the
+node whose vhid it is, and a warning otherwise: a node told to act by itself
+and unable to hear about the death is an arrangement somebody believes is in
+place, and a node that would only have notified has merely lost a notification.
 
 **`verify` never writes anything** — not the crontab, not a ZFS property, not a
 configuration file. It prints what it expects and where reality differs,
@@ -159,11 +197,13 @@ seance promote alpha --guest web01         # one guest of it
 seance promote alpha --force=fence         # accept a fence that could not confirm
 seance promote alpha --force=quorum,lineage
 seance promote alpha --force               # every forceable rung
+seance promote alpha --auto                # what devd runs; no human anywhere
 ```
 
 | Rung | What it asks | What stops it |
 | --- | --- | --- |
-| 1 debounce | is the trigger still true? | M2 is manual, so `n/a`; the CARP re-check hangs off this rung at M3 |
+| 0 arming | `--auto` only: is the fleet key `auto` 1 **and** does this node's `auto_promote` name the corpse? | either switch off aborts, before anything waits or fences |
+| 1 debounce | is the trigger still true? | manual: `n/a`. `--auto`: wait `debounce`, then this node must still be CARP MASTER for the dead node's vhid, or it was a link that flapped |
 | 2 quorum | `1 + reachable_others > N/2`? | a freeze is `notify`, and `--force=quorum` is the documented N=2 / even-N escape |
 | 3 probes | does the dead node answer ping or ssh? | **any** answer aborts, and no `--force` can reach this rung |
 | 4 fence | did the driver verify it off? | refused/still-on aborts and pages; cannot-determine notifies |
@@ -191,6 +231,40 @@ exactly what the promotion cost.
 
 Exit `0` when the estate was promoted or correctly stood down, `1` when the
 ladder stopped, `2` on a usage or configuration error.
+
+**`--auto` is the devd path, and rungs 1–4 must all be green on it.** That is
+true by construction rather than by inspection: `--force` may not be combined
+with `--auto` (exit `2`), so there is no way to reach rung 5 past a quorum that
+did not form, a host that answered, or a fence that could not confirm. When an
+automatic run stops anywhere past fencing, one notification goes out at
+`crit` — rungs 2, 3 and 4 already page for themselves, and rung 1's transient
+master deliberately does not, because a link that flapped and a seance that did
+nothing is the rung working.
+
+### seance promote-event
+
+**Internal.** What a `devd(8)` rule runs, once per CARP MASTER transition. It
+is documented because an operator debugging a rule will run it by hand.
+
+```sh
+seance promote-event 1@vtnet0
+```
+
+It maps the vhid to a node and then either detaches `seance promote <node>
+--auto` with `daemon(8)`, logging to syslog under the tag `seance`, or notifies
+at `crit` and does nothing. A vhid no node in the configuration claims, and
+this node's own vhid, are both "nothing to do" and not errors — CARP is a
+broadcast protocol and somebody else's cluster may share the segment, and
+becoming MASTER for one's own identity is what booting looks like.
+
+**It is bounded, and that is a requirement.** `devd(8)` runs an action by
+forking `sh -c` and *waiting* for it, so its whole event loop is blocked until
+this verb returns — which is why the promotion is detached rather than run here.
+The one path that can take tens of seconds is a `notify_cmd` that hangs; it is
+bounded at 30 s.
+
+Exit `0` for any event it understood, whatever it decided. `2` is reserved for
+an argument that is not a CARP subsystem at all.
 
 ### seance failback
 
@@ -344,7 +418,16 @@ Tier 6 is a set of named stages; one at a time:
 
 ```sh
 SEANCE_TIERS=6 SEANCE_STAGES=repl sh tests/run.sh
+SEANCE_TIERS=6 SEANCE_STAGES=carp,quorum,concurrency,flap sh tests/run.sh
 ```
+
+The four M3 stages run real CARP in the vnet jails: `carp` applies what
+`verify --render carp` printed and reads the map back off the interfaces,
+`quorum` isolates a node and requires it to freeze while its heir succeeds it,
+`concurrency` tells both heirs about one death at the same instant, and `flap`
+heals a link inside the debounce window and requires nothing to change. What
+they cannot do is make a rule FIRE — `devd(8)` is `KEYWORD: nojail` — so they
+invoke `seance promote-event` themselves and the firing is `drill-node`'s.
 
 And the harness's own acceptance test — revert each protection this project has
 already paid for once, and require the suite to rediscover it. Run before a
@@ -356,8 +439,9 @@ sh tests/rediscovery/run.sh --tier 6      # reaper session, minutes per row
 ```
 
 The tier-4 rows are the cheap half — promotion without fencing, stale-lineage
-promotion without a threshold, and the boot gate removed all have to fail a
-workstation test before they are allowed to fail a cluster one.
+promotion without a threshold, the boot gate removed, the quorum rule removed
+and the debounce removed all have to fail a workstation test before they are
+allowed to fail a cluster one.
 
 ## Installing as a CBSD module
 

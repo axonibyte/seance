@@ -38,6 +38,10 @@ PSEUDO_DB="${PSEUDO_DIR}/guests.tsv"
 PSEUDO_MOUNT=${SEANCE_PSEUDO_MOUNT:-/seance}
 PSEUDO_ROOT=""
 
+# How a pseudo-cluster node is asked to run a seance verb: the wrapper the
+# estate fixture puts on PATH, which is the same one a peer reaches over ssh.
+PSEUDO_VERB=${SEANCE_PSEUDO_VERB:-/usr/local/bin/seance}
+
 PSEUDO_TAB=$( printf '\t.' )
 PSEUDO_TAB=${PSEUDO_TAB%.}
 
@@ -160,8 +164,8 @@ adapter_node_self()
 # contract: adapter_fact(key) -> value [promises output]
 #
 # The node facts, one at a time, by key: workdir, nodename, jailsysdir,
-# jaildatadir, dbdir, etcdir, distdir. rc 2 for an unknown key -- a typo'd fact
-# must not read as an empty one.
+# jaildatadir, dbdir, etcdir, distdir, verb. rc 2 for an unknown key -- a
+# typo'd fact must not read as an empty one.
 #
 # A pseudo-cluster node has no CBSD, so these are the jail-local equivalents of
 # what CBSD would answer, and they are answered rather than refused because the
@@ -175,6 +179,10 @@ adapter_node_self()
 #   dbdir        this adapter's records
 #   etcdir       where the node's configuration lives
 #   distdir      the seance tree this node runs from
+#   verb         how this node is asked to run a seance verb. On CBSD that is
+#                the platform's own verb; here it is the wrapper the estate
+#                fixture installs on PATH, which is the same wrapper a peer
+#                reaches over ssh and the same one a devd rule would name.
 adapter_fact()
 {
     case "${1:-}" in
@@ -185,6 +193,7 @@ adapter_fact()
         dbdir)       printf '%s\n' "${PSEUDO_DIR}" ;;
         etcdir)      printf '%s\n' "/etc" ;;
         distdir)     printf '%s\n' "${SEANCE_ROOT:-/usr/local/seance}" ;;
+        verb)        printf '%s\n' "${PSEUDO_VERB}" ;;
         *)
             pseudo_diag "adapter_fact: no such fact: [${1:-}]"
             return 2

@@ -1,0 +1,12 @@
+--- a/lib/promote.subr	2026-08-16 18:31:35.035796000 -0400
++++ b/lib/promote.subr	2026-08-16 18:31:45.384821000 -0400
+@@ -286,6 +286,9 @@
+ 
+     _s=$( conf_effective debounce ) || _s=45
+ 
++    promote_rung 1 debounce pass "no wait, no re-check"
++    return 0
++
+     if ! promote_debounce_wait "${_s}"; then
+         promote_rung 1 debounce abort \
+             "the debounce wait could not be taken (debounce=${_s})"

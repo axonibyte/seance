@@ -183,12 +183,24 @@ wrong_defaults()
 #
 # The scan is deliberately narrow and stated: a backticked span, OUTSIDE fenced
 # code blocks, that is entirely lowercase-with-underscores. In these documents
-# such a token is a configuration key -- with one exception that has to be
-# subtracted rather than tolerated, because it is real: seance's own shell
-# functions have the same shape (`repl_standby_root` beside `standby_root`).
-# So a token that lib/ defines as a function is not a key mention, and the
-# subtraction is computed from the source rather than written out here, so that
-# a new function cannot quietly become a new exception.
+# such a token is a configuration key -- with two exceptions, each of which has
+# to be subtracted rather than tolerated, because each is real.
+#
+#   1. seance's own shell functions have the same shape (`repl_standby_root`
+#      beside `standby_root`). The subtraction is computed from the source
+#      rather than written out here, so that a new function cannot quietly
+#      become a new exception.
+#
+#   2. THE HOST'S OWN VARIABLES. From M3 seance prescribes host configuration
+#      it does not own (design §1: "seance verifies CARP, it does not own it"),
+#      so its documents have to be able to name rc.conf(5)'s and
+#      loader.conf(5)'s variables. This list is written out, not computed,
+#      because it is exactly the set of foreign names the documents may use and
+#      the point is that it stays small: a name added to it is a name this
+#      guard stops checking, so adding one is a decision and not a convenience.
+#      Every entry is a variable of the base system, cited where it is used.
+DOC_FOREIGN_VARS="kld_list carp_load"
+
 DOC_SET="docs/repl-wire.md docs/DRILLS.md docs/RUNBOOK-failback.md README.md"
 
 # doc_key_tokens <file>
@@ -216,7 +228,14 @@ lib_functions()
 
 # unknown_doc_keys <file> <fleet> <node-fields> <guest-fields> <functions>
 #
-# The tokens that are neither a function nor a key of any shape seance knows.
+# The tokens that are neither a function, nor a variable of the host's own
+# configuration, nor a key of any shape seance knows.
+#
+# A BARE node or guest field counts as known. Prose names a key the way a
+# person says it -- "this node's auto_promote" -- and the prefixed spelling is
+# a fact about where it lives in the file, not about whether seance has it. The
+# question this guard asks is whether the document names something that exists,
+# and node_<key>_auto_promote existing is the answer to it.
 unknown_doc_keys()
 {
     local _file _fleet _node _guest _fn _tok _rest _out
@@ -230,6 +249,7 @@ unknown_doc_keys()
 
     for _tok in $( doc_key_tokens "${_file}" ); do
         contains "${_fn}" "${_tok}" && continue
+        contains "${DOC_FOREIGN_VARS}" "${_tok}" && continue
 
         case "${_tok}" in
             node_*)
@@ -245,6 +265,8 @@ unknown_doc_keys()
                 ;;
             *)
                 contains "${_fleet}" "${_tok}" && continue
+                contains "${_node}" "${_tok}" && continue
+                contains "${_guest}" "${_tok}" && continue
                 ;;
         esac
 
@@ -289,7 +311,7 @@ while IFS= read -r row; do
     esac
 done < "${WORK}/sample.rows"
 
-t_plan 28
+t_plan 30
 
 # --- the guard is scanning something ---------------------------------------
 
@@ -416,5 +438,20 @@ printf '\nThe fleet key `standby_rooot` is where replicas land.\n' \
 t_is "$( unknown_doc_keys "${WORK}/repl-wire.md" \
         "${FLEET}" "${NODEK}" "${GUESTK}" "${FUNCS}" )" " standby_rooot" \
     "mutation: a document naming a key that does not exist is caught"
+
+# The two allowances are allowances and not holes: a MISSPELT node field and a
+# MISSPELT foreign variable are both still caught, which is what makes them
+# subtractions of exactly what they name.
+cp "${T_ROOT}/docs/repl-wire.md" "${WORK}/allow.md"
+# shellcheck disable=SC2016
+#   As above: Markdown being written into a document, not shell to expand.
+printf '\nThis node names `auto_promote` and `kld_list`, and also `auto_promot` and `kld_lst`.\n' \
+    >> "${WORK}/allow.md"
+t_is "$( unknown_doc_keys "${WORK}/allow.md" \
+        "${FLEET}" "${NODEK}" "${GUESTK}" "${FUNCS}" )" " auto_promot kld_lst" \
+    "mutation: a bare node field and a foreign variable pass, and their typos do not"
+
+t_isnt "${DOC_FOREIGN_VARS}" "" \
+    "the foreign-variable allowance is a list, and it is written down here"
 
 t_done

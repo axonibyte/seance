@@ -68,7 +68,7 @@ rule()
     t_like "${_out}" "${_want}" "${_name}"
 }
 
-t_plan 85
+t_plan 126
 
 # --- the positive control --------------------------------------------------
 
@@ -319,6 +319,234 @@ node_alpha_fence_target=alpha-bmc.example.net
 EOF
 conf_load "${DIR}/fence-ok.conf" || t_diag "fence-ok.conf failed to load"
 t_stdout_is "PASS" "well-formed fencing keys are accepted" -- conf_check
+
+# --- CARP: the vhids, and who may act on whose death ------------------------
+#
+# Every rule here is about an arrangement that would otherwise be believed and
+# not be true: a vhid two nodes share, a vhid with no address, an automatic
+# promotion a node is not in the succession for. None of them stops seance
+# working; all of them stop it working the way the file says.
+
+rule "a vhid outside 1..255 fails" \
+    'problem: node alpha: vhid "0" is not a CARP vhid' <<'EOF'
+carp_interface=vtnet0
+node_alpha_vhid=0
+node_alpha_vhid_ip=192.0.2.101/32
+EOF
+
+rule "a vhid that is not a number fails" \
+    'problem: node alpha: vhid "one" is not a CARP vhid' <<'EOF'
+carp_interface=vtnet0
+node_alpha_vhid=one
+node_alpha_vhid_ip=192.0.2.101/32
+EOF
+
+rule "two nodes claiming one vhid fails" \
+    'problem: node bravo: vhid 7 is claimed by more than one node' <<'EOF'
+carp_interface=vtnet0
+node_alpha_vhid=7
+node_alpha_vhid_ip=192.0.2.101/32
+node_bravo_vhid=7
+node_bravo_vhid_ip=192.0.2.102/32
+EOF
+
+rule "a vhid without an address fails" \
+    'problem: node alpha: vhid is set without a vhid_ip' <<'EOF'
+carp_interface=vtnet0
+node_alpha_vhid=1
+EOF
+
+rule "an address without a vhid fails" \
+    'problem: node alpha: vhid_ip is set without a vhid' <<'EOF'
+carp_interface=vtnet0
+node_alpha_vhid_ip=192.0.2.101/32
+EOF
+
+rule "a vhid_ip with no prefix length fails" \
+    'problem: node alpha: vhid_ip "192.0.2.101" is not <dotted-quad>/<prefix-length>' <<'EOF'
+carp_interface=vtnet0
+node_alpha_vhid=1
+node_alpha_vhid_ip=192.0.2.101
+EOF
+
+rule "a vhid_ip with a bad octet fails" \
+    'problem: node alpha: vhid_ip "192.0.2.256/32" is not <dotted-quad>' <<'EOF'
+carp_interface=vtnet0
+node_alpha_vhid=1
+node_alpha_vhid_ip=192.0.2.256/32
+EOF
+
+# inet_aton(3) reads a leading-zero octet as octal, so 010 is 8 and the
+# operator's file means something other than what it says.
+rule "a vhid_ip octet with a leading zero fails" \
+    'problem: node alpha: vhid_ip "010.0.2.101/32" is not <dotted-quad>' <<'EOF'
+carp_interface=vtnet0
+node_alpha_vhid=1
+node_alpha_vhid_ip=010.0.2.101/32
+EOF
+
+rule "a vhid_ip with a prefix length over 32 fails" \
+    'problem: node alpha: vhid_ip "192.0.2.101/33" is not <dotted-quad>' <<'EOF'
+carp_interface=vtnet0
+node_alpha_vhid=1
+node_alpha_vhid_ip=192.0.2.101/33
+EOF
+
+rule "a vhid with no carp_interface anywhere fails" \
+    'problem: node alpha: carries a vhid and nothing says which interface' <<'EOF'
+node_alpha_vhid=1
+node_alpha_vhid_ip=192.0.2.101/32
+EOF
+
+# ... and the per-node override satisfies it, which is the only way a fleet
+# whose nodes name their interfaces differently can be expressed at all.
+cat > "${DIR}/carp-perif.conf" <<'EOF'
+node_alpha_nodename=alpha.example.net
+node_alpha_mgmt=alpha-mgmt.example.net
+node_alpha_heir=bravo
+node_alpha_vhid=1
+node_alpha_vhid_ip=192.0.2.101/32
+node_alpha_carp_interface=epair0b
+node_bravo_nodename=bravo.example.net
+node_bravo_mgmt=bravo-mgmt.example.net
+node_bravo_heir=alpha
+node_bravo_vhid=2
+node_bravo_vhid_ip=192.0.2.102/32
+node_bravo_carp_interface=epair1b
+EOF
+conf_load "${DIR}/carp-perif.conf" || t_diag "carp-perif.conf failed to load"
+t_stdout_is "PASS" \
+    "a per-node carp_interface satisfies the requirement, with no fleet key at all" \
+    -- conf_check
+
+rule "a per-node carp_interface with a space in it fails" \
+    'problem: node alpha: carp_interface must be a single non-empty word' <<'EOF'
+node_alpha_carp_interface=vtnet0 vtnet1
+EOF
+
+rule "a carp_interface with a space in it fails" \
+    'problem: carp_interface must be a single non-empty word' <<'EOF'
+carp_interface=vtnet0 vtnet1
+EOF
+
+rule "a carp_pass with a space in it fails" \
+    'problem: carp_pass must be a single non-empty word' <<'EOF'
+carp_pass=two words
+EOF
+
+rule "auto outside 0..1 fails" \
+    'problem: auto: 2 is outside 0..1' <<'EOF'
+auto=2
+EOF
+
+rule "auto_promote naming a node that does not exist fails" \
+    'problem: node bravo: auto_promote names "delta", which is not a configured node' <<'EOF'
+node_bravo_auto_promote=delta
+EOF
+
+rule "auto_promote naming the node itself fails" \
+    'problem: node bravo: auto_promote names the node itself' <<'EOF'
+node_bravo_auto_promote=bravo
+EOF
+
+# The rule that matters most: a node may only auto-promote a peer it is in the
+# succession for. GOOD has alpha_heir=bravo and bravo_heir=alpha, so charlie is
+# in the succession for neither.
+rule "auto_promote for a node this one is not heir to fails" \
+    'problem: node charlie: auto_promote names alpha, but charlie is neither node_alpha_heir nor node_alpha_heir2' <<'EOF'
+carp_interface=vtnet0
+node_charlie_nodename=charlie.example.net
+node_charlie_mgmt=charlie-mgmt.example.net
+node_alpha_vhid=1
+node_alpha_vhid_ip=192.0.2.101/32
+node_charlie_auto_promote=alpha
+EOF
+
+rule "auto_promote for a node with no vhid fails" \
+    'problem: node bravo: auto_promote names alpha, which has no node_alpha_vhid' <<'EOF'
+node_bravo_auto_promote=alpha
+EOF
+
+# The positive control: a ring with CARP arranged and one heir relationship
+# armed -- which is exactly what design §12 says M3 ships -- validates.
+cat > "${DIR}/carp-ok.conf" <<'EOF'
+carp_interface=vtnet0
+carp_pass=notthepassword
+auto=1
+node_alpha_nodename=alpha.example.net
+node_alpha_mgmt=alpha-mgmt.example.net
+node_alpha_heir=bravo
+node_alpha_vhid=1
+node_alpha_vhid_ip=192.0.2.101/32
+node_bravo_nodename=bravo.example.net
+node_bravo_mgmt=bravo-mgmt.example.net
+node_bravo_heir=alpha
+node_bravo_vhid=2
+node_bravo_vhid_ip=192.0.2.102/32
+node_bravo_auto_promote=alpha
+EOF
+conf_load "${DIR}/carp-ok.conf" || t_diag "carp-ok.conf failed to load"
+t_stdout_is "PASS" "a CARP-configured, half-armed fleet validates" -- conf_check
+
+# A second heir may be armed too, and the two words of an auto_promote list are
+# each checked: the membership test refuses a multi-word needle (D-86), so a
+# list has to be walked word by word or it would validate by accident.
+cat > "${DIR}/carp-two.conf" <<'EOF'
+carp_interface=vtnet0
+node_alpha_nodename=alpha.example.net
+node_alpha_mgmt=alpha-mgmt.example.net
+node_alpha_heir=bravo
+node_alpha_heir2=charlie
+node_alpha_vhid=1
+node_alpha_vhid_ip=192.0.2.101/32
+node_bravo_nodename=bravo.example.net
+node_bravo_mgmt=bravo-mgmt.example.net
+node_bravo_heir=charlie
+node_bravo_heir2=alpha
+node_bravo_vhid=2
+node_bravo_vhid_ip=192.0.2.102/32
+node_charlie_nodename=charlie.example.net
+node_charlie_mgmt=charlie-mgmt.example.net
+node_charlie_heir=alpha
+node_charlie_heir2=bravo
+node_charlie_vhid=3
+node_charlie_vhid_ip=192.0.2.103/32
+node_charlie_auto_promote=alpha bravo
+EOF
+conf_load "${DIR}/carp-two.conf" || t_diag "carp-two.conf failed to load"
+t_stdout_is "PASS" \
+    "a two-word auto_promote validates when this node is in both successions" -- \
+    conf_check
+
+# And the same list with one word wrong is caught on that word alone.
+cat > "${DIR}/carp-two-bad.conf" <<'EOF'
+carp_interface=vtnet0
+node_alpha_nodename=alpha.example.net
+node_alpha_mgmt=alpha-mgmt.example.net
+node_alpha_heir=bravo
+node_alpha_heir2=charlie
+node_alpha_vhid=1
+node_alpha_vhid_ip=192.0.2.101/32
+node_bravo_nodename=bravo.example.net
+node_bravo_mgmt=bravo-mgmt.example.net
+node_bravo_heir=charlie
+node_bravo_heir2=alpha
+node_bravo_vhid=2
+node_bravo_vhid_ip=192.0.2.102/32
+node_charlie_nodename=charlie.example.net
+node_charlie_mgmt=charlie-mgmt.example.net
+node_charlie_heir=alpha
+node_charlie_heir2=bravo
+node_charlie_vhid=3
+node_charlie_vhid_ip=192.0.2.103/32
+node_alpha_auto_promote=bravo delta
+EOF
+conf_load "${DIR}/carp-two-bad.conf" || t_diag "carp-two-bad.conf failed to load"
+out=$( conf_check )
+t_like "${out}" 'auto_promote names "delta", which is not a configured node' \
+    "the bad word of a two-word auto_promote is named"
+t_unlike "${out}" 'auto_promote names "bravo"' \
+    "and the good word beside it is not"
 
 # --- the verdict line ------------------------------------------------------
 

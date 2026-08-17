@@ -19,9 +19,18 @@
 #              kernel=<same|differs>
 #              guest=<web01|db01> web01 is a jail, db01 a bhyve VM
 #              notify=<none|ok|missing|crash|hang>
+#                                 tree=<coherent|child-ahead|child-foreign>
+#                                 sysdir=<present|absent>, mirror=<ok|absent|empty>
+#              auto=<0|1>         drive the ladder as devd would (--auto)
+#              fleetauto=<0|1>    the fleet key `auto`
+#              armed=<yes|no>     whether node_bravo_auto_promote names alpha
+#              carp=<state>       what adapter_carp_state says AFTER the
+#                                 debounce: MASTER is a death, anything else
+#                                 is a link that flapped
+#              vhid=<yes|no>      whether the dead node has a vhid at all
 #   force    the --force value, or '-' for no --force at all; '' (empty) is
 #            not expressible here, so 'all' means a bare --force
-#   disp     expected PROMOTE_DISPOSITION
+#   disp     expected PROMOTE_DISPOSITION, or '-' for none set
 #   evidence expected PROMOTE_EVIDENCE, with %OP% standing for the operator
 #   stopped  expected PROMOTE_STOPPED_RUNG, or '-' for "the ladder finished"
 #   exit     expected exit status of promote_run
@@ -91,3 +100,18 @@ notify-missing	fence=unknown notify=missing	-	notify	-	4 fence	1
 notify-crash	fence=unknown notify=crash	-	notify	-	4 fence	1
 notify-hang	fence=unknown notify=hang	-	notify	-	4 fence	1
 notify-hang-happy	notify=hang	-	proceed	fence:mock	-	0
+# --- the automatic path: devd is the trigger and no human is anywhere -------
+auto-happy	auto=1	-	proceed	fence:mock	-	0
+auto-transient	auto=1 carp=BACKUP	-	abort	-	1 debounce	1
+auto-transient-absent	auto=1 carp=absent	-	abort	-	1 debounce	1
+auto-transient-init	auto=1 carp=INIT	-	abort	-	1 debounce	1
+auto-no-vhid	auto=1 vhid=no	-	abort	-	1 debounce	1
+auto-fleet-off	auto=1 fleetauto=0	-	abort	-	0 arming	1
+auto-not-armed	auto=1 armed=no	-	abort	-	0 arming	1
+auto-force-refused	auto=1	all	-	-	-	2
+auto-force-fence-refused	auto=1	fence	-	-	-	2
+# and the rungs that stop a manual promotion stop an automatic one identically
+auto-probes	auto=1 dead=ping	-	abort	-	3 probes	1
+auto-fence-unknown	auto=1 fence=unknown	-	notify	-	4 fence	1
+auto-quorum-n2	auto=1 nodes=2 reach=0	-	notify	-	2 quorum	1
+auto-lineage-stale	auto=1 lineage=stale	-	force-only	fence:mock	-	1

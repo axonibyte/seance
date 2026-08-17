@@ -292,6 +292,7 @@ adapter_fact()
         dbdir)       printf '%s/var/db\n' "${_wd}" ;;
         etcdir)      printf '%s/etc\n' "${_wd}" ;;
         distdir)     printf '%s\n' "/usr/local/cbsd" ;;
+        verb)        printf '%s\n' "${SEANCE_MOCK_VERB:-/usr/local/bin/cbsd seance}" ;;
         *)
             _mock_diag "adapter_fact: no such fact: [${1:-}]"
             return 2

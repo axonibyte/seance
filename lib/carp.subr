@@ -1,0 +1,550 @@
+# seance -- CARP: what detection should look like, and what devd does with it.
+#
+# Sourced, never executed. seance PRESCRIBES the host's CARP configuration and
+# never writes it (design §1: "seance verifies CARP, it does not own it").
+# Everything here either derives what a node's configuration ought to be, or
+# reads what it actually is and says where the two differ. Nothing in this file
+# runs ifconfig(8), sysrc(8) with a value, or writes a file.
+#
+# THE MODEL, from design §6. There is one vhid per NODE IDENTITY, not per
+# guest, and the vhid's address is a heartbeat token: nothing connects to it,
+# and guests keep their own addresses wherever they run. Every node runs every
+# vhid it may inherit, and the advskew IS the succession map:
+#
+#     advskew 0     the node the vhid stands for -- its owner
+#     advskew 100   that node's heir
+#     advskew 200   that node's second heir
+#
+# so when a node dies, the survivor CARP hands its vhid to is the survivor the
+# configured succession already named. That is the whole trick: the network
+# reaches the same answer the ladder would, half a second after the death,
+# without anybody having to ask the corpse.
+#
+# WHAT THE KERNEL SENDS, cited rather than recalled. carp(4), STATE CHANGE
+# NOTIFICATIONS: "Master/slave events are signalled under system CARP. The
+# subsystem specifies the vhid and name of the interface where the master/slave
+# event occurred. The type of the message displays the new state of the vhid."
+# The subsystem's exact spelling comes from the source: sys/netinet/ip_carp.c's
+# carp_set_state builds it as
+#
+#     snprintf(subsys, IFNAMSIZ+5, "%u@%s", sc->sc_vhid, if_name(sc->sc_carpdev));
+#
+# and emits devctl_notify("CARP", subsys, carp_states[state], NULL), where
+# carp_states[] is CARP_STATES from sys/netinet/ip_carp.h -- exactly "INIT",
+# "BACKUP", "MASTER". devd.conf(5) documents the same triple in its table of
+# systems: "CARP  vhid@inet  MASTER  Node become the master for a virtual
+# host."
+#
+# AND IT WAS WATCHED HAPPENING, on the reaper guest (FreeBSD 15.1-RELEASE-p2),
+# rather than only read. Bringing a vhid up on an epair while reading devd's
+# own socket gave two events, each one line, quoted here whole:
+# "!system=CARP subsystem=42@epair3a type=BACKUP", and then the same line with
+# "type=MASTER". The rule THIS FILE RENDERS, installed in /usr/local/etc/devd
+# with only its action replaced by a logger, then FIRED on that transition with
+# $subsystem expanded to 42@epair3a -- which is exactly what
+# `seance promote-event` takes.
+#
+# shellcheck shell=sh
+# shellcheck disable=SC3043
+#   'local' is not in POSIX sh but is implemented by FreeBSD /bin/sh (sh(1),
+#   "local"); seance targets FreeBSD sh and nothing else (handoff §5).
+
+# The advskews, which are the succession map (design §6). Named rather than
+# written as literals in four places, because they are one decision.
+CARP_SKEW_OWNER=0
+CARP_SKEW_HEIR=100
+CARP_SKEW_HEIR2=200
+
+# Where devd(8) reads third-party rules. devd.conf(5) FILES names two
+# directories beside the main file -- "/etc/devd A directory that devd searches
+# for additional configuration files" and "/usr/local/etc/devd" -- and the
+# installed /etc/devd.conf lists both in its options block. seance ships out of
+# /usr/local, so the rendering names the third-party one and the check accepts
+# either, which is exactly the shape D-63 settled for the crontab fragment.
+CARP_DEVD_PREFERRED="/usr/local/etc/devd/seance.conf"
+CARP_DEVD_ALSO="/etc/devd/seance.conf"
+
+# carp_devd_files  -- every path devd(8) would read seance's rules from, in the
+# order the check prefers them. One function rather than two constants read
+# separately, so that a third directory could never be added to the rendering
+# and forgotten by the check.
+carp_devd_files()
+{
+    printf '%s\n%s\n' "${CARP_DEVD_PREFERRED}" "${CARP_DEVD_ALSO}"
+}
+
+# Where the module may be arranged to load at boot. Either satisfies the check,
+# and so does a kernel with carp compiled in -- which is why a node carrying
+# neither is a WARN and not a FAIL.
+CARP_LOADER_CONF="/boot/loader.conf"
+
+# Where a sysctl(8) setting survives a reboot, and the two oids CARP's part of
+# this design actually depends on. Both are CTLFLAG_VNET
+# (sys/netinet/ip_carp.c:255, :247), so on a node they are the host's and in a
+# vnet jail they are that jail's.
+#
+#   net.inet.carp.allow    carp packets are processed at all.
+#   net.inet.carp.preempt  A NODE THAT RETURNS RECLAIMS ITS OWN VHID.
+#
+# The second one is load-bearing and is not the default. sys/netinet/ip_carp.c
+# carp_input_c, BACKUP case:
+#
+#     if (V_carp_preempt && timevalcmp(&sc_tv, &ch_tv, <)) {
+#             carp_master_down_locked(sc, "preempting a slower master");
+#
+# -- a backup takes over from a master advertising more slowly ONLY when
+# preempt is set. With it at its default of 0, a node that comes back after any
+# transient stays BACKUP for its own identity behind whichever heir took it,
+# the advskews stop describing who holds what, and the next death is decided by
+# an arrangement nobody wrote down. seance therefore prescribes preempt=1 and
+# `verify` FAILS a node without it.
+CARP_SYSCTL_CONF="/etc/sysctl.conf"
+CARP_OID_PREEMPT="net.inet.carp.preempt"
+CARP_OID_ALLOW="net.inet.carp.allow"
+
+# carp_sysctls  -- "<oid> <required value>" per line, in the order to report.
+#
+# A function rather than two constants read separately, so that an oid this
+# design depends on cannot be added to the rendering and forgotten by the
+# check, or the other way round.
+carp_sysctls()
+{
+    printf '%s 1\n%s 1\n' "${CARP_OID_ALLOW}" "${CARP_OID_PREEMPT}"
+}
+
+# ---------------------------------------------------------------------------
+# Derivation: what this node's CARP configuration ought to be
+#
+# Every function below is a pure function of the loaded configuration and its
+# arguments. None of them asks the host anything, which is what lets tier 1
+# drive the whole rendering with no adapter, no interfaces and no root.
+# ---------------------------------------------------------------------------
+
+# carp_configured  -- rc 0 if any node in the loaded configuration has a vhid.
+#
+# The question "is CARP part of this fleet's arrangement at all" has to be
+# answerable before anything else, because a fleet at M2 has no vhids and every
+# check below must then say nothing rather than fail.
+carp_configured()
+{
+    local _n
+
+    for _n in $( conf_nodes ); do
+        conf_has "node_${_n}_vhid" && return 0
+    done
+
+    return 1
+}
+
+# carp_interface <nodekey>
+#
+# The interface THAT NODE runs its vhids on: its own node_<k>_carp_interface if
+# it has one, otherwise the fleet's. rc 1 when neither is set.
+#
+# A per-node override with a fleet default, for the reason D-59 gave and D-67
+# acted on: the configuration file is byte-identical across the mesh by
+# decision, so a fleet whose nodes do not all name their interface the same
+# thing -- different NICs, a lagg on one node, a pseudo-cluster where every
+# node's epair has a different number -- can only say so in each node's own
+# block. A fleet of identical hardware never meets it and sets the fleet key.
+carp_interface()
+{
+    # A missing argument is a caller bug and is answered with a contract error
+    # rather than with ${1:?}, which would take the caller's shell down with it
+    # -- and this function is read from inside a command substitution in one
+    # place and called directly in another.
+    [ -n "${1:-}" ] || return 2
+
+    conf_get "node_$1_carp_interface" && return 0
+
+    conf_effective carp_interface
+}
+
+# carp_vhid <nodekey>  -- the vhid that stands for that node. rc 1 if it has none.
+carp_vhid()
+{
+    local _v
+
+    _v=$( conf_get "node_${1:?}_vhid" "" )
+    [ -n "${_v}" ] || return 1
+
+    printf '%s\n' "${_v}"
+}
+
+# carp_vhid_ip <nodekey>  -- the address that vhid carries. rc 1 if unset.
+carp_vhid_ip()
+{
+    local _v
+
+    _v=$( conf_get "node_${1:?}_vhid_ip" "" )
+    [ -n "${_v}" ] || return 1
+
+    printf '%s\n' "${_v}"
+}
+
+# carp_node_for_vhid <vhid>
+#
+# The node key a vhid stands for. rc 1 when no node claims it -- which is what
+# an event for a vhid belonging to some other cluster on the same segment looks
+# like, and is a refusal rather than a guess.
+carp_node_for_vhid()
+{
+    local _want _n
+
+    _want=${1:-}
+    [ -n "${_want}" ] || return 1
+
+    for _n in $( conf_nodes ); do
+        [ "$( conf_get "node_${_n}_vhid" "" )" = "${_want}" ] || continue
+        printf '%s\n' "${_n}"
+        return 0
+    done
+
+    return 1
+}
+
+# carp_skew <selfkey> <ownerkey>
+#
+# What advskew <selfkey> should advertise for <ownerkey>'s vhid, or rc 1 if it
+# takes no part in that vhid at all. In a three-node ring every node takes part
+# in all three; in a larger fleet a node is heir to only some of its peers, and
+# running a vhid it could never inherit would put it in a succession nobody
+# wrote down.
+carp_skew()
+{
+    local _self _owner
+
+    _self=${1:?}
+    _owner=${2:?}
+
+    if [ "${_self}" = "${_owner}" ]; then
+        printf '%s\n' "${CARP_SKEW_OWNER}"
+        return 0
+    fi
+
+    if [ "$( conf_get "node_${_owner}_heir" "" )" = "${_self}" ]; then
+        printf '%s\n' "${CARP_SKEW_HEIR}"
+        return 0
+    fi
+
+    if [ "$( conf_get "node_${_owner}_heir2" "" )" = "${_self}" ]; then
+        printf '%s\n' "${CARP_SKEW_HEIR2}"
+        return 0
+    fi
+
+    return 1
+}
+
+# _carp_row <selfkey> <ownerkey>
+#
+# One participation record -- "<owner> <vhid> <vhid_ip> <advskew>" -- or rc 1
+# when this node takes no part in that node's vhid, or that node has none.
+_carp_row()
+{
+    local _self _owner _v _ip _s
+
+    _self=$1
+    _owner=$2
+
+    _v=$( carp_vhid "${_owner}" ) || return 1
+    _ip=$( carp_vhid_ip "${_owner}" ) || return 1
+    _s=$( carp_skew "${_self}" "${_owner}" ) || return 1
+
+    printf '%s %s %s %s\n' "${_owner}" "${_v}" "${_ip}" "${_s}"
+}
+
+# carp_participation <selfkey>
+#
+# Every vhid this node takes part in, one record per line, THIS NODE'S OWN
+# FIRST and the rest in configuration order. rc 1 when there are none.
+#
+# The order is fixed rather than incidental because it decides the alias
+# indices the rendering prints, and a rendering that shuffled between runs
+# would make `verify` report a difference every time somebody added a node.
+carp_participation()
+{
+    local _self _n _rc
+
+    _self=${1:?}
+    _rc=1
+
+    _carp_row "${_self}" "${_self}" && _rc=0
+
+    for _n in $( conf_nodes ); do
+        [ "${_n}" = "${_self}" ] && continue
+        _carp_row "${_self}" "${_n}" && _rc=0
+    done
+
+    return "${_rc}"
+}
+
+# carp_alias_value <vhid_ip> <vhid> <advskew>
+#
+# The value of one ifconfig_<if>_alias<n> variable. rc.conf(5): "It is possible
+# to add IP alias entries using ifconfig(8) syntax with the address family
+# keyword such as inet", and "For each ifconfig_<interface>_alias<n> entry with
+# an address family keyword, its contents are passed to ifconfig(8)" -- so the
+# value is an ifconfig argument list with `inet` in front, and /etc/network.subr
+# appends the `alias` action to it (ifalias_af_common_handler).
+#
+# `pass` is omitted when carp_pass is unset. carp(4) makes the parameter
+# optional; seance renders what the configuration says and `verify` is where
+# the opinion about unauthenticated advertisements is expressed.
+carp_alias_value()
+{
+    local _pass
+
+    _pass=$( conf_effective carp_pass ) || _pass=""
+
+    if [ -n "${_pass}" ]; then
+        printf 'inet %s vhid %s advskew %s pass %s\n' "$1" "$2" "$3" "${_pass}"
+    else
+        printf 'inet %s vhid %s advskew %s\n' "$1" "$2" "$3"
+    fi
+}
+
+# carp_rcvar_if <ifname>
+#
+# The interface name as it appears INSIDE an rc.conf variable name.
+# /etc/network.subr's ifalias_af_common normalises the punctuation set ".-/+"
+# to "_" before it builds the variable name --
+#
+#     local _vif _punct=".-/+"
+#     ltr "$_if" "$_punct" "_" _vif
+#
+# -- so a vlan interface named vlan0.10 is configured by
+# ifconfig_vlan0_10_alias0 and not by ifconfig_vlan0.10_alias0. Rendering the
+# undernormalised name would produce a file rc(8) silently ignores.
+carp_rcvar_if()
+{
+    printf '%s\n' "${1:?}" | tr './+-' '____'
+}
+
+# carp_devd_action
+#
+# The command a devd(8) rule runs. The platform's own verb, from the adapter,
+# because devd execs its actions with sh -c (sbin/devd/devd.cc:262-266) and an
+# environment that carries none of the module wrapper's variables -- so the
+# rule has to name an absolute command that establishes them for itself.
+#
+# $subsystem is devd's own variable and is expanded by devd before the shell
+# ever sees it; it arrives as "<vhid>@<ifname>", which is exactly what
+# `seance promote-event` takes.
+carp_devd_action()
+{
+    local _verb
+
+    _verb=$( adapter_fact verb ) || return 1
+    [ -n "${_verb}" ] || return 1
+
+    # shellcheck disable=SC2016
+    #   The single quotes are the point: $subsystem is devd(8)'s variable, to
+    #   be written into the file literally, not expanded by this shell.
+    printf '%s promote-event $subsystem\n' "${_verb}"
+}
+
+# carp_devd_pattern <vhid> <ifname>
+#
+# The subsystem pattern for one vhid. devd(8) compiles a match value as an
+# extended regular expression wrapped in ^ and $ (sbin/devd/devd.cc, match's
+# constructor: expand_string(re, "^", "$") then regcomp with REG_EXTENDED), so
+# the interface's dots have to be escaped or vlan0.10 would also match
+# vlan0X10.
+carp_devd_pattern()
+{
+    local _if
+
+    _if=$( printf '%s\n' "${2:?}" | sed -e 's/[.]/\\./g' )
+
+    printf '%s@%s\n' "${1:?}" "${_if}"
+}
+
+# ---------------------------------------------------------------------------
+# Rendering
+# ---------------------------------------------------------------------------
+
+# carp_render_rc <selfkey>
+#
+# The rc.conf(5) this node should carry. rc 1 when CARP is not configured for
+# this node, with the reason on stderr.
+carp_render_rc()
+{
+    local _self _if _vif _row _n _owner _v _ip _s
+
+    _self=${1:?}
+
+    if ! _if=$( carp_interface "${_self}" ); then
+        seance_log err "verify --render carp: no carp_interface for node ${_self};" \
+            "there is nothing to render"
+        return 1
+    fi
+
+    _vif=$( carp_rcvar_if "${_if}" )
+
+    if ! carp_participation "${_self}" > /dev/null; then
+        seance_log err "verify --render carp: node ${_self} takes part in no vhid;" \
+            "no node it is heir to has one, and neither has it"
+        return 1
+    fi
+
+    cat <<EOF
+# seance verify --render carp -- node ${_self}, from ${CONF_FILE}
+#
+# One vhid per node identity, and the advskew IS the succession map: 0 for the
+# node the vhid stands for, ${CARP_SKEW_HEIR} for its heir, ${CARP_SKEW_HEIR2} for its second heir
+# (design §6). seance NEVER WRITES ANY OF THIS -- it renders what it expects
+# and says where reality differs.
+#
+# THE INDICES MUST BE CONTIGUOUS FROM 0. rc.conf(5): "Execution stops at the
+# first unsuccessful access", so an ifconfig_<if>_alias<n> with a gap below it
+# is never applied. If ${_if} already carries aliases of this node's own,
+# RENUMBER these to follow them -- \`verify\` reads every
+# ifconfig_${_vif}_alias* variable and does not mind which index carries which
+# vhid.
+#
+# kld_list is a whitespace-separated list: if this node already loads modules
+# through it, APPEND carp to the existing value rather than replacing it. The
+# equivalent is carp_load="YES" in ${CARP_LOADER_CONF}, and a kernel with carp
+# compiled in needs neither; \`verify\` accepts all three.
+#
+# AND ONE SETTING THAT IS NOT AN rc.conf(5) VARIABLE. Put this in
+# ${CARP_SYSCTL_CONF}, and set it now with sysctl(8):
+#
+#     ${CARP_OID_PREEMPT}=1
+#
+# Without it a node that comes back stays BACKUP for its OWN vhid behind
+# whichever heir took it, and the advskews stop describing who holds what.
+# \`verify\` FAILS a node whose live value is 0.
+EOF
+
+    if [ -n "$( conf_effective carp_pass 2>/dev/null )" ]; then
+        cat <<EOF
+#
+# THE CARP PASSWORD IS IN THE TEXT BELOW. Whatever rc.conf(5) file it lands in
+# should be mode 0600 root:wheel; \`verify\` says so when it is not.
+EOF
+    fi
+
+    printf '\n'
+    printf 'kld_list="carp"\n'
+
+    _n=0
+    carp_participation "${_self}" |
+    while read -r _owner _v _ip _s; do
+        [ -n "${_owner}" ] || continue
+        printf 'ifconfig_%s_alias%d="%s"\t# %s\n' \
+            "${_vif}" "${_n}" "$( carp_alias_value "${_ip}" "${_v}" "${_s}" )" \
+            "$( _carp_role_word "${_s}" ) of ${_owner}"
+        _n=$(( _n + 1 ))
+    done | _carp_align
+
+    return 0
+}
+
+# _carp_role_word <advskew>  -- what a skew means, for the rendering's comments.
+_carp_role_word()
+{
+    case "$1" in
+        "${CARP_SKEW_OWNER}") printf 'owner' ;;
+        "${CARP_SKEW_HEIR}")  printf 'heir' ;;
+        "${CARP_SKEW_HEIR2}") printf 'second heir' ;;
+        *)                    printf 'skew %s' "$1" ;;
+    esac
+}
+
+# _carp_align  -- turn the tab in each rendered line into aligned padding.
+#
+# A tab would be a tab in rc.conf, which is legal and unreadable; column(1) is
+# not in the base system's guaranteed set for a jailed node, so the padding is
+# computed here.
+_carp_align()
+{
+    awk -F '\t' '
+        { line[NR] = $1; note[NR] = $2; if (length($1) > w) w = length($1) }
+        END {
+            for (i = 1; i <= NR; i++) {
+                if (note[i] == "") { print line[i]; continue }
+                printf "%-*s  %s\n", w, line[i], note[i]
+            }
+        }
+    '
+}
+
+# carp_render_devd <selfkey>
+#
+# The devd(8) rules this node should carry, one per vhid it may INHERIT.
+#
+# Deliberately NOT this node's own vhid. A node becoming MASTER for its own
+# identity is a node that has just booted or whose link has come back -- it is
+# not a node whose peer has died -- and `promote <self>` is refused anyway. A
+# rule that fired on it would turn every reboot into a promotion attempt in the
+# log, which is how an operator learns to stop reading the log.
+carp_render_devd()
+{
+    local _self _if _owner _v _ip _s _action _armed
+
+    _self=${1:?}
+
+    if ! _if=$( carp_interface "${_self}" ); then
+        seance_log err "verify --render devd: no carp_interface for node ${_self};" \
+            "there is nothing to render"
+        return 1
+    fi
+
+    if ! _action=$( carp_devd_action ); then
+        seance_log err "verify --render devd: the adapter cannot say how this" \
+            "platform runs a seance verb, so there is no action to render"
+        return 1
+    fi
+
+    _armed=$( conf_get "node_${_self}_auto_promote" "" )
+
+    cat <<EOF
+# ${CARP_DEVD_PREFERRED} -- rendered by seance verify --render devd
+# for node ${_self}, from ${CONF_FILE}. seance NEVER WRITES THIS FILE.
+#
+# carp(4), STATE CHANGE NOTIFICATIONS: "Master/slave events are signalled under
+# system CARP. The subsystem specifies the vhid and name of the interface where
+# the master/slave event occurred. The type of the message displays the new
+# state of the vhid." The subsystem is "<vhid>@<ifname>"
+# (sys/netinet/ip_carp.c, carp_set_state) and the states are INIT, BACKUP and
+# MASTER (sys/netinet/ip_carp.h, CARP_STATES).
+#
+# One rule per vhid this node may INHERIT. This node's own vhid is deliberately
+# absent: becoming MASTER for one's own identity is what a reboot looks like,
+# not what a peer's death looks like.
+#
+# devd(8) runs an action with sh -c AND WAITS FOR IT (sbin/devd/devd.cc,
+# my_system + do_action), so the whole event loop is blocked until the action
+# returns. \`seance promote-event\` is bounded for exactly that reason: it maps
+# the vhid to a node, decides whether this node is armed for it, and either
+# detaches the promotion with daemon(8) or notifies -- and returns either way.
+#
+# Fleet automation is auto=$( conf_effective auto ), and this node's
+# auto_promote is "${_armed:-}" -- empty means every rule below notifies and
+# nothing else. Both switches have to be set before anything acts by itself.
+#
+# After installing this file:  service devd restart
+EOF
+
+    carp_participation "${_self}" > /dev/null || return 0
+
+    carp_participation "${_self}" |
+    while read -r _owner _v _ip _s; do
+        [ -n "${_owner}" ] || continue
+        [ "${_s}" = "${CARP_SKEW_OWNER}" ] && continue
+
+        cat <<EOF
+
+# ${_owner} -- this node is its $( _carp_role_word "${_s}" ) (advskew ${_s})
+notify 0 {
+	match "system"		"CARP";
+	match "subsystem"	"$( carp_devd_pattern "${_v}" "${_if}" )";
+	match "type"		"MASTER";
+	action "${_action}";
+};
+EOF
+    done
+
+    return 0
+}

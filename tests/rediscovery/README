@@ -44,6 +44,28 @@ The rows, and what each is about:
       repair. Defence in depth means one reverted layer is caught by the layer
       that notices it working.
 
+  quorum-rule-removed.patch
+      Makes rung 2 act whatever the arithmetic said. The quorum rule is what
+      stops an ISOLATED node -- one that is perfectly alive and can reach
+      nobody -- from concluding that everybody else has died and promoting
+      their estates on top of them. TESTING.md §8 names `concurrency` for this
+      row; it is pointed at `quorum` instead, because that is the stage where
+      the rule is load-bearing. In `concurrency` two heirs are told about one
+      real death and the thing that stops the second one is CARP and the claim
+      check, not quorum -- both survivors form a majority there, so reverting
+      the rule changes nothing and a row pointing at it would be a row that can
+      never fail. In `quorum` the isolated node freezes for this reason and no
+      other, and reverting it produces the two actors the methodology asks for.
+
+  debounce-removed.patch
+      Makes rung 1 report a pass without waiting and without re-reading CARP.
+      The debounce is what tells a death from a link that flapped: a transition
+      that was true when devd fired and is not true `debounce` seconds later is
+      a node that never died. Caught by the `flap` stage, which heals the link
+      inside the window -- with the wait removed the ladder runs straight past
+      the healing node, fences it, and promotes an estate that was never
+      orphaned.
+
   repl-skip-resume-token.patch
       Makes the engine ignore the peer's receive_resume_token. A dataset
       holding a token refuses every other stream -- "destination contains

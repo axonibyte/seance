@@ -45,6 +45,7 @@ ADAPTER_JAILSYSDIR=""
 ADAPTER_JAILDATADIR=""
 ADAPTER_DBDIR=""
 ADAPTER_ETCDIR=""
+ADAPTER_VERB=""
 
 # The tab and newline this file splits on, spelled once.
 ADAPTER_TAB=$( printf '\t' )
@@ -139,14 +140,23 @@ _adapter_vhid_ok()
 # contract: adapter_init() -> nothing [no output]
 adapter_init()
 {
-    local _wd _nn
+    local _wd _nn _bin
 
     [ "${ADAPTER_READY}" -eq 1 ] && return 0
 
-    if ! command -v cbsd > /dev/null 2>&1; then
+    _bin=$( command -v cbsd 2>/dev/null ) || _bin=""
+    if [ -z "${_bin}" ]; then
         _adapter_diag "CBSD is not present (no runnable 'cbsd' in PATH)"
         return 2
     fi
+
+    # How this platform is asked to run one of seance's own verbs, as an
+    # absolute command line. devd(8) execs its actions with sh -c and an
+    # environment of its own (sbin/devd/devd.cc:262-266), so the rule
+    # `verify --render devd` prints cannot rely on PATH or on any variable
+    # the module's wrapper would otherwise have set; the platform's verb is
+    # what carries this node's facts into the dispatcher (D-2).
+    ADAPTER_VERB="${_bin} seance"
 
     ADAPTER_DISTDIR=${SEANCE_CBSD_DISTDIR:-/usr/local/cbsd}
 
@@ -281,7 +291,13 @@ adapter_node_self()
 # contract: adapter_fact(key) -> value [promises output]
 #
 # The node facts adapter_init established, one at a time, by key:
-# workdir, nodename, jailsysdir, jaildatadir, dbdir, etcdir, distdir.
+# workdir, nodename, jailsysdir, jaildatadir, dbdir, etcdir, distdir, verb.
+#
+# `verb` is the command line that runs a seance verb on this platform. It is a
+# fact of the platform in exactly the way the paths are -- only the adapter
+# knows how this host is asked to run the module's own entry point -- and
+# `verify --render devd` needs it, because a devd(8) action is executed by
+# sh -c with none of the module wrapper's environment.
 #
 # This exists so that the seam holds for paths as well as for commands. seance
 # keeps its state under ${workdir}/var/db/seance and its config at
@@ -302,6 +318,7 @@ adapter_fact()
         dbdir)       printf '%s\n' "${ADAPTER_DBDIR}" ;;
         etcdir)      printf '%s\n' "${ADAPTER_ETCDIR}" ;;
         distdir)     printf '%s\n' "${ADAPTER_DISTDIR}" ;;
+        verb)        printf '%s\n' "${ADAPTER_VERB}" ;;
         *)
             _adapter_diag "adapter_fact: no such fact: [${1:-}]"
             return 2

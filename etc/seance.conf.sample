@@ -90,6 +90,38 @@
 #witness=witness.example.net
 
 # ---------------------------------------------------------------------------
+# CARP: how a node learns that another one has died
+#
+# One vhid per NODE IDENTITY (not per guest), carrying an address that is a
+# heartbeat token and nothing else -- guests keep their own addresses wherever
+# they run. Each node holds its own vhid at advskew 0, its heir's at 100 and
+# its second heir's at 200, so the survivor CARP promotes is the survivor the
+# succession map already named.
+#
+# seance PRESCRIBES this and never writes it: `seance verify --render carp`
+# prints the rc.conf lines this node should carry and diffs them against
+# sysrc(8) and against live ifconfig(8). Applying them is the administrator's.
+# ---------------------------------------------------------------------------
+
+# The interface the vhids run on. Required as soon as any node has a vhid;
+# there is no default, because guessing which interface carries a cluster's
+# heartbeat is not a guess seance is entitled to make.
+#carp_interface=vtnet0
+
+# The shared secret that authenticates CARP advertisements (carp(4), "pass").
+# One word. It is rendered into rc.conf, so the file that carries it should be
+# mode 0600 -- `verify` says so when it is not. Unset means unauthenticated
+# advertisements, which `verify` warns about and does not refuse.
+#carp_pass=changeme
+
+# Whether this fleet may promote without a human at all. 0 (the default) makes
+# every devd event notify-only whatever else is configured; 1 arms the nodes
+# that also name a peer in their own auto_promote list. Two switches rather
+# than one on purpose: the fleet-wide one is the thing an operator turns off in
+# a hurry.
+#auto=0
+
+# ---------------------------------------------------------------------------
 # Nodes
 #
 # One block per node, keyed by a short name of [a-z0-9]+ -- that key is what
@@ -117,6 +149,32 @@
 #                             unset means the fleet standby_root (with its %n
 #                             substituted for this node's key) applies, and
 #                             failing that, the derived default.
+#   node_<key>_vhid           the CARP virtual host ID that stands for this
+#                             node's identity, 1-255 and unique across the
+#                             fleet. Every node runs every vhid; whose it is
+#                             decides the advskew (0 here, 100 on its heir,
+#                             200 on its second heir).
+#   node_<key>_vhid_ip        the address that vhid carries, with a prefix
+#                             length -- <dotted-quad>/<prefix-length>. A
+#                             heartbeat token, not a service address: nothing
+#                             connects to it, and /32 is the usual answer.
+#                             Written as <addr> below rather than as an example
+#                             address, because no shipped seance file may carry
+#                             an IPv4 literal (TESTING.md §4, the tenant
+#                             guard); the real file has a real address there.
+#   node_<key>_carp_interface overrides the fleet carp_interface (above) for
+#                             THIS node. Optional; a fleet of identical
+#                             hardware never needs it, and a fleet whose nodes
+#                             name their interfaces differently can only say so
+#                             here, because this file is byte-identical across
+#                             the mesh.
+#   node_<key>_auto_promote   the dead-node keys THIS node may promote without
+#                             a human when devd reports it has become CARP
+#                             MASTER for their vhid. Space separated; empty
+#                             (the default) is notify-only. Each name must be a
+#                             node whose heir or heir2 this node is, and the
+#                             fleet key `auto` must be 1 as well -- either
+#                             switch alone leaves automation disarmed.
 #
 # Fencing keys are parsed and shape-checked from v1 but are not used until the
 # fencing milestone. A display name for a node whose real name is not
@@ -135,6 +193,11 @@ node_alpha_heir2=charlie
 #node_alpha_fence_driver=ipmi
 #node_alpha_fence_target=alpha
 #node_alpha_standby_root=mypool/standby
+#node_alpha_vhid=1
+#node_alpha_vhid_ip=<addr>/32
+#node_alpha_carp_interface=vtnet1
+# bravo is alpha's heir, so bravo is the node that may act on alpha's death:
+#node_bravo_auto_promote=alpha
 
 node_bravo_nodename=bravo.example.net
 node_bravo_mgmt=bravo-mgmt.example.net
@@ -142,6 +205,8 @@ node_bravo_heir=charlie
 node_bravo_heir2=alpha
 #node_bravo_fence_driver=ipmi
 #node_bravo_fence_target=bravo
+#node_bravo_vhid=2
+#node_bravo_vhid_ip=<addr>/32
 
 node_charlie_nodename=charlie.example.net
 node_charlie_mgmt=charlie-mgmt.example.net
@@ -149,6 +214,8 @@ node_charlie_heir=alpha
 node_charlie_heir2=bravo
 #node_charlie_fence_driver=ipmi
 #node_charlie_fence_target=charlie
+#node_charlie_vhid=3
+#node_charlie_vhid_ip=<addr>/32
 
 # Display names, for a node or guest whose real name is not [a-z0-9]+.
 #names_alpha=alpha.example.net

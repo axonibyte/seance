@@ -32,6 +32,93 @@ ESTATE_TAB=${ESTATE_TAB%.}
 ESTATE_ADAPTER="/usr/local/seance/tests/cluster/adapter-pseudo.subr"
 ESTATE_BIN="/usr/local/seance/bin/seance"
 
+# ---------------------------------------------------------------------------
+# CARP, and it is OPT-IN
+#
+# Every M2 stage builds this world and none of them has a vhid, so the CARP
+# block is written only when a stage asks for it. That is not tidiness: with
+# vhids in the configuration and nothing applied to an interface, `verify`
+# FAILS -- correctly -- and every stage that asserts a clean verify would start
+# failing for a reason that has nothing to do with what it tests.
+#
+# The addresses are TEST-NET-1 (RFC 5737), like the rest of the substrate's.
+# The INTERFACE is per node, because each jail's epair has a different number
+# and the configuration file is byte-identical across the mesh by decision --
+# which is exactly the case node_<k>_carp_interface exists for.
+# ---------------------------------------------------------------------------
+
+ESTATE_CARP=${ESTATE_CARP:-0}
+ESTATE_AUTO=${ESTATE_AUTO:-0}
+ESTATE_DEBOUNCE=${ESTATE_DEBOUNCE:-5}
+ESTATE_CARP_PASS=${ESTATE_CARP_PASS:-notthepassword}
+
+# Which peers each node may promote without a human. One variable per node
+# rather than a table, because the fixture has three nodes and a table would be
+# a parser to get wrong.
+ESTATE_ARM_ALPHA=${ESTATE_ARM_ALPHA:-}
+ESTATE_ARM_BRAVO=${ESTATE_ARM_BRAVO:-}
+ESTATE_ARM_CHARLIE=${ESTATE_ARM_CHARLIE:-}
+
+# estate_vhid <node>     -- alpha 1, bravo 2, charlie 3.
+estate_vhid()
+{
+    case "$1" in
+        alpha) printf '1\n' ;;
+        bravo) printf '2\n' ;;
+        charlie) printf '3\n' ;;
+        *) return 1 ;;
+    esac
+}
+
+# estate_vhid_ip <node>  -- the heartbeat token that vhid carries.
+estate_vhid_ip()
+{
+    local _v
+
+    _v=$( estate_vhid "$1" ) || return 1
+    printf '%s.%d/32\n' "${CLUSTER_NET}" "$(( 100 + _v ))"
+}
+
+# estate_carp_if <node>  -- the interface inside that node's jail.
+estate_carp_if()
+{
+    printf '%sb\n' "$( cluster_epair "$1" )"
+}
+
+# estate_armed <node>  -- that node's auto_promote value.
+estate_armed()
+{
+    case "$1" in
+        alpha) printf '%s\n' "${ESTATE_ARM_ALPHA}" ;;
+        bravo) printf '%s\n' "${ESTATE_ARM_BRAVO}" ;;
+        charlie) printf '%s\n' "${ESTATE_ARM_CHARLIE}" ;;
+        *) return 1 ;;
+    esac
+}
+
+# estate_carp_conf  -- the CARP half of the configuration, or nothing.
+estate_carp_conf()
+{
+    local _n _armed
+
+    [ "${ESTATE_CARP}" = "1" ] || return 0
+
+    printf 'carp_pass=%s\n' "${ESTATE_CARP_PASS}"
+    printf 'auto=%s\n' "${ESTATE_AUTO}"
+    printf 'debounce=%s\n' "${ESTATE_DEBOUNCE}"
+
+    for _n in alpha bravo charlie; do
+        printf '\n'
+        printf 'node_%s_vhid=%s\n' "${_n}" "$( estate_vhid "${_n}" )"
+        printf 'node_%s_vhid_ip=%s\n' "${_n}" "$( estate_vhid_ip "${_n}" )"
+        printf 'node_%s_carp_interface=%s\n' "${_n}" "$( estate_carp_if "${_n}" )"
+        _armed=$( estate_armed "${_n}" )
+        [ -n "${_armed}" ] && printf 'node_%s_auto_promote=%s\n' "${_n}" "${_armed}"
+    done
+
+    return 0
+}
+
 # node_seance <node> <args...>
 #
 # Run a seance verb inside a node, through the same wrapper a peer reaches over
@@ -129,6 +216,157 @@ node_charlie_heir2=bravo
 node_charlie_fence_driver=jail
 node_charlie_fence_target=charlie
 EOF
+
+    estate_carp_conf >> "${_out}"
+}
+
+# estate_carp_up
+#
+# Arrange CARP on every node exactly as an operator would, and then WAIT for
+# the election to settle. Call it after estate_up, with ESTATE_CARP=1.
+#
+# THE TEST APPLIES; SEANCE NEVER DOES. What is applied is what
+# `seance verify --render carp` printed, put into rc.conf so sysrc(8) reports
+# it and handed to ifconfig(8) the way /etc/network.subr hands an alias entry
+# to it -- the entry's value, with the action appended
+# (ifalias_af_common_handler). Nothing here is a second implementation of the
+# rendering: the rendering IS the input.
+estate_carp_up()
+{
+    local _n _list
+
+    _list=$( cluster_nodes ) || return 1
+
+    # carp(4) lives in a module on this guest, and the vnet jails cannot load
+    # it themselves: the host loads it once and every vnet gets the code.
+    kldload -n carp || { cluster_fail 1 "kldload -n carp on the guest host"; return 1; }
+
+    for _n in ${_list}; do
+        estate_carp_node "${_n}" || return 1
+    done
+
+    for _n in ${_list}; do
+        estate_carp_apply "${_n}" || return 1
+    done
+
+    return 0
+}
+
+# estate_carp_node <node>
+#
+# The two sysctls the model depends on, set inside the node's own vnet and
+# written where a reboot would find them.
+#
+# net.inet.carp.preempt is the one that is not the kernel's default, and a
+# jailed root can set it because the sysctl is CTLFLAG_VNET and this prison
+# owns its vnet (kern/kern_sysctl.c:2369-2372 grants PRIV_SYSCTL_WRITEJAIL for
+# exactly that case).
+estate_carp_node()
+{
+    local _n _root
+
+    _n=$1
+    _root=$( cluster_root "${_n}" ) || return 1
+
+    node_sh "${_n}" 'sysctl net.inet.carp.allow=1 net.inet.carp.preempt=1' \
+        > /dev/null || {
+        cluster_fail 1 "setting the carp sysctls inside ${_n}"
+        return 1
+    }
+
+    {
+        printf 'net.inet.carp.allow=1\n'
+        printf 'net.inet.carp.preempt=1\n'
+    } >> "${_root}/etc/sysctl.conf" || return 1
+
+    return 0
+}
+
+# estate_carp_apply <node>
+#
+# Render, then apply. The rendering is parsed for its assignments only -- the
+# comments above them are for a human -- and each alias value is handed to
+# ifconfig(8) with `alias` appended, which is the command netif would run.
+estate_carp_apply()
+{
+    local _n _root _if _render _line _var _val _rc
+
+    _n=$1
+    _root=$( cluster_root "${_n}" ) || return 1
+    _if=$( estate_carp_if "${_n}" ) || return 1
+
+    _render=$( t_tmpdir )/carp.${_n}
+    node_seance "${_n}" verify --render carp > "${_render}" || {
+        cluster_fail 1 "seance verify --render carp on ${_n}"
+        return 1
+    }
+
+    # rc.conf, so that `verify` has something to read back, and 0600 because
+    # the rendering has just put a shared secret in it -- which the rendering
+    # itself says in the line above the assignments.
+    grep -v '^#' "${_render}" | grep '^[a-z]' >> "${_root}/etc/rc.conf" || return 1
+    chmod 0600 "${_root}/etc/rc.conf" || return 1
+
+    # devd's rules. devd(8) is KEYWORD: nojail and cannot run in a vnet jail,
+    # so what shape A can prove about them is that the file seance renders is
+    # the file seance then recognises -- the firing itself is drill-node's.
+    mkdir -p "${_root}/usr/local/etc/devd" || return 1
+    node_seance "${_n}" verify --render devd \
+        > "${_root}/usr/local/etc/devd/seance.conf" || {
+        cluster_fail 1 "seance verify --render devd on ${_n}"
+        return 1
+    }
+
+    _rc=0
+    while IFS= read -r _line; do
+        case "${_line}" in
+            ifconfig_*_alias*=*) ;;
+            *) continue ;;
+        esac
+
+        _val=${_line#*=}
+        _val=${_val#\"}
+        _val=${_val%%\"*}
+
+        node_sh "${_n}" "ifconfig ${_if} ${_val} alias" > /dev/null || {
+            cluster_fail 1 "applying [${_val}] to ${_if} inside ${_n}"
+            _rc=1
+        }
+    done < "${_render}"
+
+    return "${_rc}"
+}
+
+# estate_carp_wait <node> <vhid> <state> [seconds]
+#
+# Wait until a node reports the state it should for a vhid. CARP elections take
+# advbase*3 plus the skew to resolve, so every assertion about a state has to
+# wait for one rather than read the interface the instant after it was told
+# something.
+estate_carp_wait()
+{
+    local _n _v _want _limit _i _got
+
+    _n=$1
+    _v=$2
+    _want=$3
+    _limit=${4:-30}
+
+    _i=0
+    while [ "${_i}" -lt "${_limit}" ]; do
+        _got=$( estate_carp_state "${_n}" "${_v}" )
+        [ "${_got}" = "${_want}" ] && return 0
+        _i=$(( _i + 1 ))
+        sleep 1
+    done
+
+    return 1
+}
+
+# estate_carp_state <node> <vhid>  -- through the adapter, as seance reads it.
+estate_carp_state()
+{
+    node_sh "$1" ". ${ESTATE_ADAPTER}; adapter_carp_state $2" 2>/dev/null
 }
 
 # estate_install_wrapper <node>

@@ -5,7 +5,13 @@
 #   * seance_ssh          -- run one command on a peer, over the mesh, with the
 #                            site's ssh settings taken from the configuration;
 #   * seance_run_timeout  -- bound any command in time, so that a replication
-#                            tick cannot hang until the next one overtakes it.
+#                            tick cannot hang until the next one overtakes it;
+#   * seance_run_timeout_detach
+#                         -- the same, for a command whose whole purpose is to
+#                            leave something running behind it. It is a
+#                            separate function because timeout(1) reaps the
+#                            command's descendants unless told not to, which
+#                            would make the bound apply to the detached work.
 #
 # It lives in its own file rather than in common.subr because common.subr is
 # the file that knows nothing about the outside world (logging, exit codes,
@@ -69,6 +75,50 @@ seance_run_timeout()
     # comes to report a failure whose real cause was the clock.
     [ "${_rc}" -eq "${TRANSPORT_RC_TIMEOUT}" ] &&
         seance_log warning "timed out after ${_secs}s and was killed: $1"
+
+    return "${_rc}"
+}
+
+# seance_run_timeout_detach <seconds> <command> [args...]
+#
+# Bound a command that is EXPECTED TO LEAVE SOMETHING RUNNING behind it, and
+# bound only the command.
+#
+# THE DEFECT THIS FUNCTION EXISTS FOR, measured in the guest rather than
+# reasoned about. timeout(1), IMPLEMENTATION NOTES: "If the --foreground option
+# is not specified, timeout runs as the reaper (see also procctl(2)) of the
+# command and its descendants, and will wait for all the descendants to
+# terminate." So `seance_run_timeout 10 daemon -f ... seance promote --auto`
+# does not return in a millisecond when daemon(8) detaches -- it waits ten
+# seconds for the PROMOTION, then kills it. Both halves are wrong: `promote-event`
+# blocks devd's whole event loop for the bound (devd waits for its actions), and
+# the promotion it just started is SIGTERMed part way through a mount ceremony.
+# Observed: `timeout -k 5 10 daemon -f /bin/sh -c "sleep 20"` exits 124, while
+# the same daemon(8) invocation on its own returns 0 immediately.
+#
+# --foreground is therefore not a workaround here, it is the correct semantics:
+# bound the launcher, never the launched. Every other caller in seance wants the
+# opposite -- a fence driver that spawns a child must have the whole subtree
+# killed at the deadline -- and keeps seance_run_timeout.
+seance_run_timeout_detach()
+{
+    local _secs _rc
+
+    _secs=${1:-}
+    [ $# -ge 2 ] || return 2
+
+    case "${_secs}" in
+        ''|*[!0123456789]*) return 2 ;;
+    esac
+    [ "${_secs}" -gt 0 ] || return 2
+
+    shift
+
+    timeout --foreground -k 5 "${_secs}" "$@"
+    _rc=$?
+
+    [ "${_rc}" -eq "${TRANSPORT_RC_TIMEOUT}" ] &&
+        seance_log warning "did not detach within ${_secs}s and was killed: $1"
 
     return "${_rc}"
 }

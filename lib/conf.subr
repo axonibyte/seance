@@ -41,8 +41,8 @@
 # from this source text rather than from a re-export, so that the guard is
 # asserting against the definition and not against a copy of it. The order of
 # CONF_FLEET_KEYS is also conf_dump's order.
-CONF_FLEET_KEYS="cadence retention_recent retention_hourly staleness_max skew_tolerance debounce fence_timeout ssh_user ssh_port ssh_extra_opts standby_root notify_cmd witness"
-CONF_NODE_KEYS="nodename mgmt heir heir2 fence_driver fence_target standby_root"
+CONF_FLEET_KEYS="cadence retention_recent retention_hourly staleness_max skew_tolerance debounce fence_timeout ssh_user ssh_port ssh_extra_opts standby_root notify_cmd witness carp_interface carp_pass auto"
+CONF_NODE_KEYS="nodename mgmt heir heir2 fence_driver fence_target standby_root vhid vhid_ip auto_promote carp_interface"
 CONF_GUEST_KEYS="cadence staleness_max heir heir2"
 
 # Fleet keys whose value is computed from other configuration when unset.
@@ -65,6 +65,7 @@ debounce=45
 fence_timeout=60
 ssh_user=root
 ssh_port=22
+auto=0
 "
 
 # Sanity ranges for conf_check: "<key> <min> <max>", inclusive.
@@ -82,7 +83,15 @@ skew_tolerance 0 3600
 debounce 0 3600
 fence_timeout 1 3600
 ssh_port 1 65535
+auto 0 1
 "
+
+# The CARP virtual host ID range. carp(4): "the administrator needs to
+# configure at a minimum a common virtual host ID (vhid)"; the wire field is
+# one octet and zero is not a host, so 1..255 -- the same bound
+# lib/adapter.subr's _adapter_vhid_ok enforces before a vhid reaches ifconfig.
+CONF_VHID_MIN=1
+CONF_VHID_MAX=255
 
 CONF_DATA=""
 CONF_FILE=""
@@ -92,6 +101,7 @@ CONF_NAME_ORDER=""
 CONF_PROBLEMS=""
 CONF_PROBLEM_COUNT=0
 CONF_SEEN_NODENAMES=""
+CONF_SEEN_VHIDS=""
 
 # A literal newline, carriage return and tab, built without depending on any
 # escape being understood inside a case pattern.
@@ -620,6 +630,66 @@ _conf_word_ok()
     return 0
 }
 
+# _conf_uint_le <value> <max>
+#
+# rc 0 if the value is a decimal integer from 0 to <max>. A LEADING ZERO IS
+# REFUSED rather than tolerated, and that is the point of the function existing
+# at all: inet_aton(3) reads "010" as octal 8, so an address octet written with
+# a leading zero means something other than what its author typed -- and
+# FreeBSD sh, asked to evaluate 08 inside $(( )), dies on the whole expression.
+# Refusing the shape removes both hazards instead of choosing between them.
+_conf_uint_le()
+{
+    case "${1:-}" in
+        ''|*[!0123456789]*) return 1 ;;
+        0) return 0 ;;
+        0*) return 1 ;;
+    esac
+
+    [ "$1" -le "$2" ]
+}
+
+# _conf_cidr_ok <value>
+#
+# rc 0 if the value is a dotted-quad IPv4 address with a prefix length --
+# <dotted-quad>/<prefix-length>. SHAPE ONLY: seance does not resolve it, does not route to
+# it and does not ask whether it belongs to the interface's subnet, because a
+# vhid address is a heartbeat token (design §6) and the only thing a
+# configuration check can honestly say about one is that it will parse where it
+# lands.
+_conf_cidr_ok()
+{
+    local _v _addr _plen _rest
+
+    _v=${1:-}
+
+    case "${_v}" in
+        *'/'*'/'*) return 1 ;;
+        *'/'*) ;;
+        *) return 1 ;;
+    esac
+
+    _addr=${_v%/*}
+    _plen=${_v#*/}
+
+    _conf_uint_le "${_plen}" 32 || return 1
+
+    case "${_addr}" in
+        *.*.*.*.*) return 1 ;;
+        *.*.*.*) ;;
+        *) return 1 ;;
+    esac
+
+    _conf_uint_le "${_addr%%.*}" 255 || return 1
+    _rest=${_addr#*.}
+    _conf_uint_le "${_rest%%.*}" 255 || return 1
+    _rest=${_rest#*.}
+    _conf_uint_le "${_rest%%.*}" 255 || return 1
+    _conf_uint_le "${_rest#*.}" 255 || return 1
+
+    return 0
+}
+
 # _conf_ge <label> <a-key> <a-value> <b-key> <b-value>
 #
 # Report a problem unless <a-value> >= <b-value>. Both must already be
@@ -722,6 +792,94 @@ _conf_check_node()
         _conf_word_ok "$( conf_get "node_${_n}_standby_root" "" )" ||
             _conf_problem "node ${_n}: standby_root must be a single non-empty word"
     fi
+
+    _conf_check_node_carp "${_n}"
+}
+
+# _conf_check_node_carp <nodekey>
+#
+# The CARP half of a node block: its vhid, the heartbeat address that vhid
+# carries, and which of its peers' deaths this node may act on by itself.
+#
+# The rule that matters most is the last one. `auto_promote` is the list of
+# nodes this node will promote WITHOUT A HUMAN when devd tells it a CARP vhid
+# went MASTER here, so every name in it is a node this node is allowed to fence
+# and inherit unattended. A name that is not in the succession map for this
+# node is an arrangement nobody agreed to: the ladder would stand down at rung
+# 5 anyway (pol_am_i_actor), but a configuration that asks for an automatic
+# promotion which can never happen is a configuration whose author believes
+# something untrue about their fleet.
+_conf_check_node_carp()
+{
+    local _n _v _w _h1 _h2
+
+    _n=$1
+
+    if conf_has "node_${_n}_carp_interface"; then
+        _conf_word_ok "$( conf_get "node_${_n}_carp_interface" "" )" ||
+            _conf_problem "node ${_n}: carp_interface must be a single non-empty word"
+    fi
+
+    if conf_has "node_${_n}_vhid"; then
+        # The interface is a per-node fact with a fleet default (D-67's shape,
+        # for D-59's reason): the configuration file is byte-identical across
+        # the mesh, so a fleet whose nodes do not all name their interface the
+        # same thing can only express that in each node's own block.
+        conf_has "node_${_n}_carp_interface" || conf_has carp_interface ||
+            _conf_problem "node ${_n}: carries a vhid and nothing says which interface" \
+                "CARP runs on -- set node_${_n}_carp_interface, or the fleet carp_interface"
+
+        _v=$( conf_get "node_${_n}_vhid" "" )
+
+        if ! _conf_uint_le "${_v}" "${CONF_VHID_MAX}" ||
+           [ "${_v}" -lt "${CONF_VHID_MIN}" ]; then
+            _conf_problem "node ${_n}: vhid \"${_v}\" is not a CARP vhid (${CONF_VHID_MIN}..${CONF_VHID_MAX})"
+        elif _conf_in_list "${_v}" "${CONF_SEEN_VHIDS}"; then
+            _conf_problem "node ${_n}: vhid ${_v} is claimed by more than one node;" \
+                "two nodes sharing a vhid are one virtual host, and a promotion could not tell them apart"
+        else
+            CONF_SEEN_VHIDS="${CONF_SEEN_VHIDS} ${_v}"
+        fi
+
+        conf_has "node_${_n}_vhid_ip" ||
+            _conf_problem "node ${_n}: vhid is set without a vhid_ip: a vhid with no address advertises nothing"
+    fi
+
+    if conf_has "node_${_n}_vhid_ip"; then
+        _v=$( conf_get "node_${_n}_vhid_ip" "" )
+
+        _conf_cidr_ok "${_v}" ||
+            _conf_problem "node ${_n}: vhid_ip \"${_v}\" is not <dotted-quad>/<prefix-length>"
+
+        conf_has "node_${_n}_vhid" ||
+            _conf_problem "node ${_n}: vhid_ip is set without a vhid"
+    fi
+
+    conf_has "node_${_n}_auto_promote" || return 0
+
+    for _w in $( conf_get "node_${_n}_auto_promote" "" ); do
+        if ! _conf_in_list "${_w}" "${CONF_NODE_ORDER}"; then
+            _conf_problem "node ${_n}: auto_promote names \"${_w}\", which is not a configured node"
+            continue
+        fi
+
+        if [ "${_w}" = "${_n}" ]; then
+            _conf_problem "node ${_n}: auto_promote names the node itself"
+            continue
+        fi
+
+        _h1=$( conf_get "node_${_w}_heir" "" )
+        _h2=$( conf_get "node_${_w}_heir2" "" )
+
+        if [ "${_h1}" != "${_n}" ] && [ "${_h2}" != "${_n}" ]; then
+            _conf_problem "node ${_n}: auto_promote names ${_w}, but ${_n} is neither" \
+                "node_${_w}_heir nor node_${_w}_heir2 -- it may not inherit ${_w} at all"
+        fi
+
+        conf_has "node_${_w}_vhid" ||
+            _conf_problem "node ${_n}: auto_promote names ${_w}, which has no node_${_w}_vhid:" \
+                "no CARP transition can ever fire for it"
+    done
 }
 
 # _conf_check_guest <guestkey>
@@ -760,6 +918,7 @@ conf_check()
     CONF_PROBLEMS=""
     CONF_PROBLEM_COUNT=0
     CONF_SEEN_NODENAMES=""
+    CONF_SEEN_VHIDS=""
 
     _count=$( conf_node_count )
 
@@ -777,6 +936,7 @@ conf_check()
     _conf_int_in_range debounce "debounce"
     _conf_int_in_range fence_timeout "fence_timeout"
     _conf_int_in_range ssh_port "ssh_port"
+    _conf_int_in_range auto "auto"
 
     _conf_ge "fleet" \
         staleness_max "$( conf_effective staleness_max )" \
@@ -800,6 +960,19 @@ conf_check()
     if conf_has standby_root &&
        ! _conf_word_ok "$( conf_get standby_root "" )"; then
         _conf_problem "standby_root must be a single non-empty word"
+    fi
+
+    if conf_has carp_interface &&
+       ! _conf_word_ok "$( conf_get carp_interface "" )"; then
+        _conf_problem "carp_interface must be a single non-empty word"
+    fi
+
+    # A CARP password with a space in it is not a password seance can render:
+    # ifconfig(8) takes 'pass <word>' and rc.conf(5) passes an alias entry's
+    # contents to ifconfig with no quoting of its own, so a second word would
+    # arrive as a second parameter.
+    if conf_has carp_pass && ! _conf_word_ok "$( conf_get carp_pass "" )"; then
+        _conf_problem "carp_pass must be a single non-empty word"
     fi
 
     # shellcheck disable=SC2086

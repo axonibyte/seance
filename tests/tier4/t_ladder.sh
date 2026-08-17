@@ -72,6 +72,9 @@ export SEANCE_ROOT
 # shellcheck source=../../lib/status.subr
 . "${T_ROOT}/lib/status.subr"
 # shellcheck source-path=SCRIPTDIR
+# shellcheck source=../../lib/carp.subr
+. "${T_ROOT}/lib/carp.subr"
+# shellcheck source-path=SCRIPTDIR
 # shellcheck source=../../lib/gate.subr
 . "${T_ROOT}/lib/gate.subr"
 # shellcheck source-path=SCRIPTDIR
@@ -178,8 +181,20 @@ printf '%s\n' "$*" >> "${WORLD_DIR}/logger.log"
 exit 0
 EOF
 
+# The debounce wait, injected. It records the number of seconds it was asked
+# for and returns at once, so the rung-1 path is taken in full at no cost --
+# the wait itself is the one thing in the ladder whose only observable effect
+# is time passing (D-51's reasoning, applied to a sleep instead of a timeout).
+SLEEPLOG=$( t_tmpdir )/slept
+# shellcheck disable=SC2016
+#   The single quotes are the point: "$1" is source text of the script being
+#   written, not an expansion for this shell.
+printf '#!/bin/sh\nprintf "%%s\\n" "$1" >> "%s"\nexit 0\n' "${SLEEPLOG}" \
+    > "${SHIM}/fakesleep"
+
 cp "${T_ROOT}/tests/drivers/fence_mock" "${SHIM}/fence_mock"
-chmod 0755 "${SHIM}/ssh" "${SHIM}/ping" "${SHIM}/logger" "${SHIM}/fence_mock"
+chmod 0755 "${SHIM}/ssh" "${SHIM}/ping" "${SHIM}/logger" "${SHIM}/fence_mock" \
+    "${SHIM}/fakesleep"
 
 PATH="${SHIM}:${PATH}"
 export PATH
@@ -358,7 +373,7 @@ world_build()
 {
     local _spec _kv _k _v
     local _nodes _reach _dead _fence _lineage _claim _peermute _kernel _guest _notify
-    local _sysdir _mirror _tree
+    local _sysdir _mirror _tree _auto _fleetauto _armed _carp _vhid
     local _conf _wd _n _lnow
 
     _spec=$1
@@ -376,6 +391,11 @@ world_build()
     _sysdir=present
     _mirror=ok
     _tree=coherent
+    _auto=0
+    _fleetauto=1
+    _armed=yes
+    _carp=MASTER
+    _vhid=yes
 
     [ "${_spec}" = "-" ] && _spec=""
 
@@ -396,6 +416,11 @@ world_build()
             sysdir)  _sysdir=${_v} ;;
             mirror)  _mirror=${_v} ;;
             tree)    _tree=${_v} ;;
+            auto)    _auto=${_v} ;;
+            fleetauto) _fleetauto=${_v} ;;
+            armed)   _armed=${_v} ;;
+            carp)    _carp=${_v} ;;
+            vhid)    _vhid=${_v} ;;
             *)
                 t_diag "world_build: unknown setting: ${_kv}"
                 return 2
@@ -484,6 +509,25 @@ pool0/bravo/standby/alpha/${REPL_SYS_GUEST}"
     esac
     SEANCE_MOCK_LINEAGE_NOW=${_lnow}
     export SEANCE_MOCK_LINEAGE_NODE SEANCE_MOCK_LINEAGE_NOW SEANCE_MOCK_LINEAGE_N
+
+    # --- the automatic path -----------------------------------------------
+    #
+    # The debounce wait is real on this path and is 45 s by default, so the
+    # sleep is injected -- the row still takes the wait, still re-reads CARP
+    # afterwards, and costs nothing. What is NOT faked is the re-check itself:
+    # the mock adapter answers adapter_carp_state, and what it answers is the
+    # difference between a death and a flapping link.
+    PROMOTE_AUTO=${_auto}
+    PROMOTE_DEBOUNCE_REQUIRED=0
+
+    if [ "${_auto}" = "1" ]; then
+        SEANCE_DEBOUNCE_SLEEP_CMD="${SHIM}/fakesleep"
+        export SEANCE_DEBOUNCE_SLEEP_CMD
+        printf 'adapter_carp_state 1\t%s\t%s\n' ok "${_carp}" \
+            >> "${SEANCE_MOCK_SCRIPT}"
+    else
+        unset SEANCE_DEBOUNCE_SLEEP_CMD
+    fi
     SEANCE_ZFS_LIST_CMD=mock_zfs_list
     export SEANCE_ZFS_LIST_CMD
 
@@ -556,9 +600,16 @@ pool0/bravo/standby/alpha/${REPL_SYS_GUEST}"
             *) printf 'notify_cmd=%s/notify\n' "${ROWDIR}" ;;
         esac
 
+        printf 'carp_interface=vtnet0\n'
+        printf 'auto=%s\n' "${_fleetauto}"
+
         printf 'node_alpha_nodename=alpha\n'
         printf 'node_alpha_mgmt=alpha-mgmt.example.net\n'
         printf 'node_alpha_heir=bravo\n'
+        if [ "${_vhid}" = "yes" ]; then
+            printf 'node_alpha_vhid=1\n'
+            printf 'node_alpha_vhid_ip=192.0.2.101/32\n'
+        fi
         [ "${_nodes}" -ge 3 ] && printf 'node_alpha_heir2=charlie\n'
         case "${_fence}" in
             none) ;;
@@ -575,6 +626,9 @@ pool0/bravo/standby/alpha/${REPL_SYS_GUEST}"
         printf 'node_bravo_nodename=bravo\n'
         printf 'node_bravo_mgmt=bravo-mgmt.example.net\n'
         printf 'node_bravo_heir=alpha\n'
+        printf 'node_bravo_vhid=2\n'
+        printf 'node_bravo_vhid_ip=192.0.2.102/32\n'
+        [ "${_armed}" = "yes" ] && printf 'node_bravo_auto_promote=alpha\n'
 
         _n=3
         while [ "${_n}" -le "${_nodes}" ]; do
@@ -700,7 +754,7 @@ fi
 # One assertion per row, plus the twenty-five named assertions below. A table
 # with no rows would have produced a green run of nothing, which is why the
 # count is derived from the table rather than written down.
-t_plan $(( NROWS + 44 ))
+t_plan $(( NROWS + 63 ))
 
 SAVED=$( t_tmpdir )
 
@@ -723,6 +777,7 @@ for row in ${ROWS}; do
     want_ev=$( printf '%s' "${want_ev}" | sed -e "s|%OP%|${OP}|" )
     [ "${want_ev}" = "-" ] && want_ev=""
     [ "${want_stop}" = "-" ] && want_stop=""
+    [ "${want_disp}" = "-" ] && want_disp=""
 
     if ! row_run "${id}" "${world}" "${force}"; then
         t_not_ok "${id}: the world could not be built"
@@ -889,6 +944,64 @@ t_unlike "$( cat "${SAVED}/sysdir-mirror-absent.mock" )" 'adapter_guest_start' \
     "and it is NOT started: a guest registered from a configuration seance guessed is worse than one that did not come back"
 
 # ---------------------------------------------------------------------------
+# The automatic path
+#
+# Two things are being pinned here that the table's four columns cannot say.
+# The first is that rung 1 became REAL: the wait is taken and the CARP state is
+# re-read afterwards, and a node that is no longer MASTER stops. The second is
+# that the automatic path cannot be forced -- not that it declines to, but that
+# the two flags are not expressible together at all.
+# ---------------------------------------------------------------------------
+
+t_like "$( cat "${SAVED}/auto-happy.out" )" '^rung 0 arming: pass' \
+    "the automatic path checks that it is armed before it does anything else"
+t_like "$( cat "${SAVED}/auto-happy.out" )" \
+    '^rung 1 debounce: pass — waited 45s and this node is still MASTER for vhid 1' \
+    "and rung 1 waits and then re-reads CARP, rather than reporting n/a"
+t_is "$( cat "${SLEEPLOG}" | LC_ALL=C sort -u )" "45" \
+    "every automatic row really took the wait, for the configured number of seconds"
+t_unlike "$( cat "${SAVED}/auto-happy.out" )" 'forced' \
+    "nothing on the automatic path is forced, because nothing on it can be"
+
+t_like "$( cat "${SAVED}/auto-transient.out" )" '^rung 1 debounce: abort — TRANSIENT MASTER' \
+    "a node that is BACKUP again after the wait stops at rung 1"
+t_unlike "$( cat "${SAVED}/auto-transient.mock" )" 'adapter_guest_register' \
+    "and registers nothing: the link flapped, the node did not die"
+t_unlike "$( cat "${SAVED}/auto-transient.mock" )" 'adapter_guest_start' \
+    "and starts nothing"
+t_is "$( ls "${SAVED}/auto-transient.fence" 2>/dev/null )" "" \
+    "and nothing was handed to the fence driver -- rung 1 is before rung 4"
+
+t_like "$( cat "${SAVED}/auto-fleet-off.out" )" \
+    '^rung 0 arming: abort — --auto, but the fleet key auto is 0' \
+    "auto=0 disarms the whole fleet whatever a node's own auto_promote says"
+t_is "$( ls "${SAVED}/auto-fleet-off.fence" 2>/dev/null )" "" \
+    "and a disarmed node fences nothing"
+t_like "$( cat "${SAVED}/auto-not-armed.out" )" \
+    '^rung 0 arming: abort — --auto, but node_bravo_auto_promote is ""' \
+    "and a node whose own list does not name the corpse is disarmed too"
+t_is "$( cat "${SAVED}/auto-fleet-off.zfs" )" "" \
+    "a run stopped at rung 0 touches no dataset at all"
+
+t_like "$( cat "${SAVED}/auto-force-refused.out" )" \
+    '^promote: FAIL — --force may not be combined with --auto' \
+    "--auto and --force together are a usage error, not a preference"
+t_is "$( ls "${SAVED}/auto-force-refused.fence" 2>/dev/null )" "" \
+    "and the refusal happens before anything is fenced"
+
+t_like "$( cat "${SAVED}/auto-no-vhid.out" )" \
+    'there is no vhid to re-check' \
+    "an armed node whose corpse has no vhid cannot re-check, so it stops"
+
+# The M3 gate: rungs 1-4 must ALL be green on the automatic path (design §7),
+# which is true here by construction rather than by inspection -- every one of
+# them stops the run, and none of them can be forced past.
+for row in auto-transient auto-probes auto-fence-unknown auto-quorum-n2; do
+    t_unlike "$( cat "${SAVED}/${row}.mock" )" 'adapter_guest_start' \
+        "${row}: a rung 1-4 that is not green starts nothing"
+done
+
+# ---------------------------------------------------------------------------
 # --force's own vocabulary
 # ---------------------------------------------------------------------------
 
@@ -926,10 +1039,10 @@ sleeplog=$( t_tmpdir )/slept
 # shellcheck disable=SC2016
 #   As above: "$1" is source text of the script being written.
 printf '#!/bin/sh\nprintf "%%s\\n" "$1" >> "%s"\nexit 0\n' "${sleeplog}" \
-    > "${SHIM}/fakesleep"
-chmod 0755 "${SHIM}/fakesleep"
+    > "${SHIM}/oncesleep"
+chmod 0755 "${SHIM}/oncesleep"
 
-SEANCE_DEBOUNCE_SLEEP_CMD="${SHIM}/fakesleep"
+SEANCE_DEBOUNCE_SLEEP_CMD="${SHIM}/oncesleep"
 export SEANCE_DEBOUNCE_SLEEP_CMD
 t_rc 0 "promote_debounce_wait takes the injected wait" \
     -- promote_debounce_wait 45

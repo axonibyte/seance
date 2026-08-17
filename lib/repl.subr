@@ -1424,7 +1424,8 @@ repl_tick()
     _home=$( seance_self_key ) ||
         seance_die 2 "repl: this node is not in the configuration; no node_*_nodename matches it"
 
-    _now=$( pol_now )
+    _now=$( pol_now ) ||
+        seance_die 1 "repl: this node cannot read its own clock"
     _ts=$( pol_epoch_to_ts "${_now}" ) ||
         seance_die 1 "repl: cannot render the current time as a timestamp"
 
