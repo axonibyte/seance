@@ -63,6 +63,9 @@ readonly SEANCE_ROOT
 # shellcheck source-path=SCRIPTDIR
 # shellcheck source=../lib/failback.subr
 . "${SEANCE_ROOT}/lib/failback.subr"
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=../lib/setup.subr
+. "${SEANCE_ROOT}/lib/setup.subr"
 
 # The adapter: everything that knows what a guest is on this host. One file,
 # selected by $SEANCE_ADAPTER so that the pseudo-cluster and the conformance
@@ -136,6 +139,12 @@ Verbs:
   config [--check] [--file <path>]
                      print the effective configuration; --check validates it
                      and prints one line per problem
+  setup [--non-interactive] [--set key=value]... [--out <file>]
+        [--from <file>] [--answers <file>] [--dump-answers <file>]
+        [--allow-invalid]
+                     an interactive (bsddialog) or headless editor for the
+                     config file. It only ever writes the target file; every
+                     screen has a --set equivalent
   version            print the seance version
   help, --help, -h   print this usage
 
@@ -460,6 +469,76 @@ seance_placement()
     placement_report "${_remote}"
 }
 
+# seance_setup [--non-interactive] [--set key=value]... [--out <file>]
+#              [--from <file>] [--answers <file>] [--dump-answers <file>]
+#              [--allow-invalid]
+#
+# lib/setup.subr's entry point. Needs no adapter and no existing configuration
+# -- this is how a first configuration comes to exist -- so it is the one
+# fleet-facing verb that does not call seance_load_conf.
+seance_setup()
+{
+    local _out _from _answers _dump _allow _noninter
+
+    _out=""
+    _from=""
+    _answers=""
+    _dump=""
+    _allow=0
+    _noninter=0
+    SETUP_SETS=""
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --non-interactive) _noninter=1 ;;
+            --set)
+                [ $# -ge 2 ] || seance_die 2 "setup: --set needs key=value"
+                SETUP_SETS="${SETUP_SETS}${SETUP_NL}$2"
+                shift
+                ;;
+            --set=*) SETUP_SETS="${SETUP_SETS}${SETUP_NL}${1#--set=}" ;;
+            --out)
+                [ $# -ge 2 ] || seance_die 2 "setup: --out needs a path"
+                _out=$2
+                shift
+                ;;
+            --out=*) _out=${1#--out=} ;;
+            --from)
+                [ $# -ge 2 ] || seance_die 2 "setup: --from needs a path"
+                _from=$2
+                shift
+                ;;
+            --from=*) _from=${1#--from=} ;;
+            --answers)
+                [ $# -ge 2 ] || seance_die 2 "setup: --answers needs a path"
+                _answers=$2
+                shift
+                ;;
+            --answers=*) _answers=${1#--answers=} ;;
+            --dump-answers)
+                [ $# -ge 2 ] || seance_die 2 "setup: --dump-answers needs a path"
+                _dump=$2
+                shift
+                ;;
+            --dump-answers=*) _dump=${1#--dump-answers=} ;;
+            --allow-invalid) _allow=1 ;;
+            *) seance_die 2 "setup: unknown argument: $1" ;;
+        esac
+        shift
+    done
+
+    SETUP_NONINTERACTIVE=${_noninter}
+    SETUP_OUT=${_out}
+    SETUP_FROM=${_from}
+    SETUP_ANSWERS_FILE=${_answers}
+    SETUP_DUMP_ANSWERS=${_dump}
+    SETUP_ALLOW_INVALID=${_allow}
+
+    seance_tmp_init
+
+    setup_run
+}
+
 # seance_version
 #
 # Print "seance <version>" and nothing else -- this verb is data, not a report,
@@ -619,6 +698,10 @@ case "${_verb}" in
         ;;
     config)
         seance_config "$@"
+        exit $?
+        ;;
+    setup)
+        seance_setup "$@"
         exit $?
         ;;
     version)

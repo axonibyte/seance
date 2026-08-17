@@ -15,3 +15,9 @@ Since M3 this tier also holds the tier-7 simulator's own units, which need no
 cluster: t_sim_gen.sh (the seeded PRNG and weighted chooser -- determinism,
 weights, and drawing only from what was offered) and t_sim_shrink.sh (prefix
 bisection and event-kind removal, driven by an injected fake rerun function).
+
+Since M5, t_setup_headless.sh: `seance setup`'s --set/--answers/--from path,
+which is also the only path this tier can exercise -- the interactive
+bsddialog wizard needs a real terminal, and t_setup_bsddialog_coverage.sh
+(tier 3) is what stands in for testing it, by asserting from source that every
+screen it could show has exactly this tier's answer-key equivalent.

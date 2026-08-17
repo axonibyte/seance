@@ -67,6 +67,7 @@ What is here:
 | `lib/failback.subr` | the ladder in reverse, plus the interim host's `failback-assist` half |
 | `lib/gate.subr` | placement records and the resurrection gate |
 | `lib/status.subr`, `lib/verify.subr` | the two reporting verbs |
+| `lib/setup.subr` | `setup`'s bsddialog wizard and its headless twin, and the one config-writing helper that isn't in `lib/conf.subr` |
 | `rc.d/seance_gate` | runs the gate before CBSD's autostart |
 | `etc/seance.conf.sample` | every key, documented, with its default |
 | `tools/lint.sh` | `sh -n`, `shellcheck`, tiers 1–4 |
@@ -75,6 +76,7 @@ What is here:
 | `tests/drivers/fence_mock` | a fence driver that produces every answer the contract names, including the three that are not answers |
 | `docs/cbsd-module-notes.md` | what M0 learned about CBSD, with citations |
 | `docs/repl-wire.md` | the exact send/receive command lines, and the evidence for each |
+| `docs/INSTALL.md` | install, upgrade, uninstall, and the cron/CARP/devd steps `verify` renders but never writes |
 | `docs/DRILLS.md` | the fleet drills each milestone is gated on |
 | `docs/RUNBOOK-failback.md` | what to do, in order, when a node comes back |
 
@@ -386,6 +388,58 @@ seance config --file /path/to/seance.conf --check
 Exit codes: `0` the configuration is valid, `1` it loaded and is invalid, `2`
 it could not be found or could not be parsed.
 
+### seance setup
+
+The configuration UX from design §14: **the file is the store, the TUI is an
+editor.** `setup` walks site defaults, then the fleet, then each node, then
+any per-guest overrides, then a review — and **only ever writes the target
+file.** It never touches the system, and it runs `config --check` on the
+result before writing, refusing an invalid configuration unless told
+otherwise.
+
+```sh
+seance setup                                     # the interactive walkthrough
+seance setup --out /path/to/seance.conf          # write somewhere other than
+                                                  #   the default target
+seance setup --from /path/to/seance.conf         # edit an existing file
+```
+
+**Every screen has a non-interactive equivalent** — the `inter=0` culture
+carried over from CBSD's own initenv (handoff §2, design §14):
+
+```sh
+seance setup --non-interactive --set cadence=600 --set node_alpha_mgmt=alpha-mgmt.example.net --out /tmp/seance.conf
+seance setup --non-interactive --answers answers.conf --out /tmp/seance.conf
+seance setup --dump-answers answers.conf         # interactive, but also
+                                                  #   records the answers
+seance setup --non-interactive --from /path/to/seance.conf --allow-invalid
+```
+
+`--set key=value` repeats and is applied last, after any seeding —
+the answer key IS the config key (`cadence`, `node_alpha_mgmt`,
+`guest_web01_heir`, ...), so an `--answers` file is nothing more than
+`seance.conf` grammar and there is no second vocabulary to keep in sync with
+the first. `--from <file>` and `--answers <file>` are the same mechanism under
+two names: `--from` points at a real deployed configuration to edit or
+replay, `--answers` at a file `--dump-answers` produced; given both,
+`--answers` is applied second and wins on any key both name.
+
+`--allow-invalid` writes even when `config --check` would refuse the result —
+the problems are still printed, and the verdict line says the file is invalid.
+Without it, `setup` writes nothing and exits `1`. Overwriting an existing
+target backs it up first (`<file>.bak-<timestamp>`) and prints the undo:
+
+```
+undo: mv "/tmp/seance.conf.bak-20260816T120000Z" "/tmp/seance.conf"
+setup: wrote /tmp/seance.conf (PASS)
+```
+
+Exit `0` when a configuration was written (valid, or invalid with
+`--allow-invalid`), `1` when it was refused, `2` on a usage error or a
+configuration that does not parse at all — the same three-way split `config`
+uses, because `setup` is the same question asked by an editor instead of a
+reader.
+
 ### seance version
 
 Print `seance <version>`, from the `VERSION` file beside the module. Exit `1`
@@ -461,7 +515,12 @@ promotion without a threshold, the boot gate removed, the quorum rule removed
 and the debounce removed all have to fail a workstation test before they are
 allowed to fail a cluster one.
 
-## Installing as a CBSD module
+## Installing, upgrading and uninstalling
+
+`docs/INSTALL.md` is the full procedure, step by step, with the CBSD source
+citations behind each one; this is the summary. Nothing here is automatic —
+every step is a command an operator types, and `seance verify` is how the last
+one gets checked.
 
 The repository root *is* the module directory, so a clone into place is a
 complete installation:
@@ -487,7 +546,27 @@ env NOINTER=1 ALWAYS_YES=1 /usr/local/cbsd/sudoexec/initenv
 ```
 
 `docs/cbsd-module-notes.md` has the citations, the observed output, and the
-other CBSD 15.0.9 defects worth knowing before relying on any of this.
+other CBSD 15.0.9 defects worth knowing before relying on any of this —
+including why `cbsd module mode=install` is not the supported route
+(`docs/INSTALL.md` §1 has the specific defect and what it would take upstream
+to fix).
+
+**Upgrade** is `git pull` in the module directory, followed by the same
+unattended `initenv` line above — the re-run is not optional, it is what
+reconciles the module's `ObsoleteFiles` list and re-links the verb if its path
+ever moved:
+
+```sh
+cd /usr/local/cbsd/modules/seance.d && git pull
+env NOINTER=1 ALWAYS_YES=1 /usr/local/cbsd/sudoexec/initenv
+```
+
+**Uninstall** removes the `seance.d` line from `~cbsd/etc/modules.conf` and
+re-runs the same `initenv` line; stage 8 removes the verb symlink and clears
+the inventory flag. It does **not** touch this node's configuration or state
+(`${workdir}/etc/seance.conf`, `${workdir}/var/db/seance`) — nor the two steps
+below, which were never automatic to begin with and so are never
+automatically undone.
 
 ### Two steps the clone does not do for you
 
@@ -518,6 +597,35 @@ Without it, every peer reads as silent — and a gate that hears silence from
 every peer withholds the whole estate, which is correct behaviour arriving for
 the wrong reason.
 
+### Scheduling: the cron line, and CARP/devd once a node carries a vhid
+
+`seance repl` is a cron target, not a daemon; `verify` renders the line this
+node expects and checks for it on every subsequent run, but installing it is
+the operator's:
+
+```sh
+seance verify --render cron > /usr/local/etc/cron.d/seance
+```
+
+Once a node's configuration gives it a `vhid` (CARP is opt-in, per node —
+`etc/seance.conf.sample` has the keys), render both halves: `verify --render
+carp` prints a self-explanatory `rc.conf(5)` fragment, applied line by line
+with `sysrc(8)` (it is not a single file to redirect into place — `verify`
+checks every `ifconfig_<if>_alias*` variable `sysrc -v -e -a` reports,
+whichever file it lives in); `verify --render devd` IS a complete rule file,
+redirected straight into place, for the rule that fires `promote-event`:
+
+```sh
+seance verify --render devd > /usr/local/etc/devd/seance.conf
+service devd restart
+```
+
+`seance verify` (no arguments) is the check that any of this actually took —
+CARP vhids against `ifconfig(8)`, the devd rule's presence, and whether
+`devd(8)` itself is running. Automatic promotion needs the fleet key `auto=1`
+*and* the node's own `auto_promote` list on top of all this; both are off by
+default.
+
 ## Exit codes
 
 `0` ok, `1` operation failed, `2` usage or contract error. stdout is data,
@@ -535,6 +643,7 @@ which is what makes `seance version` usable inside a shell substitution.
 | `HANDOFF.md` | the implementation brief |
 | `docs/cbsd-module-notes.md` | what M0 learned about CBSD 15.0.9, with citations |
 | `docs/repl-wire.md` | the exact `zfs send`/`recv` command lines, and the evidence for each |
+| `docs/INSTALL.md` | install, upgrade, uninstall, and the cron/CARP/devd steps `verify` renders but never writes |
 | `docs/DRILLS.md` | the fleet drills each milestone is gated on |
 | `docs/RUNBOOK-failback.md` | the failback runbook, and what each refusal means |
 

@@ -1,0 +1,3 @@
+cadence=10
+node_alpha_nodename=alpha.example.net
+node_alpha_mgmt=alpha-mgmt.example.net

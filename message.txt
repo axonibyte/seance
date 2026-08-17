@@ -55,3 +55,9 @@ symlink from step 4 and the rc unit from step 5 are removed by hand.
 Note: if this directory is a symlink rather than a real directory, every verb
 still works, but "cbsd module mode=list" will not show seance -- it enumerates
 with "find ... -type d".
+
+Upgrading is "git pull" in this directory followed by the same unattended
+initenv line above. Full install/upgrade/uninstall steps, the cron(8) line
+replication needs, and the CARP/devd files automatic promotion needs -- all
+rendered by "seance verify --render ..." and installed by the operator, never
+by seance itself -- are in docs/INSTALL.md.
