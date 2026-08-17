@@ -102,6 +102,7 @@ CONF_PROBLEMS=""
 CONF_PROBLEM_COUNT=0
 CONF_SEEN_NODENAMES=""
 CONF_SEEN_VHIDS=""
+CONF_SEEN_MGMT=""
 
 # A literal newline, carriage return and tab, built without depending on any
 # escape being understood inside a case pattern.
@@ -760,11 +761,24 @@ _conf_check_node()
         CONF_SEEN_NODENAMES="${CONF_SEEN_NODENAMES} ${_nodename}"
     fi
 
+    # THE ADDRESS IS THE NODE, for everything that counts nodes. The quorum
+    # rule is `1 + reachable_others > N/2` and "reachable" is counted by
+    # probing each configured node's mgmt address one key at a time
+    # (promote_reachable_peers), so two keys sharing an address make one living
+    # host answer twice: N rises by one and so does the count of the living,
+    # and a four-node fleet with a single surviving peer computes a majority it
+    # does not have. A copy-paste in a config file is not an acceptable way to
+    # reach a split brain, so it is a problem here rather than a surprise
+    # there. `verify` and `status` count the same way.
     _v=$( conf_get "node_${_n}_mgmt" "" )
     if [ -z "${_v}" ]; then
         _conf_problem "node ${_n}: node_${_n}_mgmt is required"
     elif ! _conf_word_ok "${_v}"; then
         _conf_problem "node ${_n}: mgmt must be a single non-empty word"
+    elif _conf_in_list "${_v}" "${CONF_SEEN_MGMT}"; then
+        _conf_problem "node ${_n}: mgmt \"${_v}\" is claimed by more than one node key, and quorum counts keys"
+    else
+        CONF_SEEN_MGMT="${CONF_SEEN_MGMT} ${_v}"
     fi
 
     _conf_check_heirs "node ${_n}" "${_n}" \
@@ -919,6 +933,7 @@ conf_check()
     CONF_PROBLEM_COUNT=0
     CONF_SEEN_NODENAMES=""
     CONF_SEEN_VHIDS=""
+    CONF_SEEN_MGMT=""
 
     _count=$( conf_node_count )
 

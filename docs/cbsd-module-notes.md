@@ -715,10 +715,19 @@ the jail comes up.
 
    So a per-guest query can be answered with **another guest's row**, and a
    node that has been through one unregister/register round trip lists one
-   guest twice for ever. seance's answer is in `_adapter_guest_row`: filter the
-   raw listing by name before parsing it, and let `_adapter_list_rows` drop the
-   `Unregister` rows it already drops. `tests/tier5/t_lifecycle_real.sh`
-   asserts both the doubled listing and that the adapter is not fooled by it.
+   guest twice for ever. seance's answer is in two halves. `_adapter_guest_row`
+   filters the raw listing by name before parsing it, and `_adapter_list_rows`
+   drops the `Unregister` rows it already drops — that is what keeps the
+   adapter from being fooled by somebody else's leftover. And
+   `adapter_guest_unregister` REMOVES the export it caused to be written, so
+   seance stops making them (decision D-101): before that, one
+   `seance failback` left the interim saying
+   `skipping <g>: CBSD's database does not know it` on stderr on every tick,
+   every `status` and every `gate`, for ever.
+   `tests/tier5/t_lifecycle_real.sh` asserts both halves: CBSD's behaviour raw
+   (the dump is written, the listing keeps the guest, the estate listing skips
+   it on stderr) and then the same round trip through the adapter, after which
+   there is no export, no row and nothing on stderr.
 
 9. **CBSD's mutating verbs talk on stdout, refusals included.** `cbsd jstart`
    on a jail in slave mode prints its refusal through `err()`

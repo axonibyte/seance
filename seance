@@ -1,5 +1,5 @@
 #!/usr/local/bin/cbsd
-#v0.1.0
+#v0.2.0
 # seance -- CBSD verb wrapper (decision D-2).
 #
 # This is the only file in the project that runs under cbsdsh. It does no
@@ -78,7 +78,8 @@ ${H3_COLOR}Options${N0_COLOR}:
              '--discard-origin-writes' says otherwise;
    failback-assist
            - INTERNAL: the interim host's half of a failback, invoked over
-             the mesh. 'stop', 'snapshot', 'unregister', 'release';
+             the mesh. 'stop', 'start', 'snapshot', 'unregister', 'release';
+             'start' is how a refused failback puts the guest back up;
    gate    - the resurrection gate. For every guest whose home is this
              node, ask each LIVING peer whether it already claims that
              guest; withhold any that is claimed, and the whole estate if
@@ -140,18 +141,21 @@ _MYSELF=$( ${REALPATH_CMD} "$0" )
 _MYDIR=${_MYSELF%/*}
 
 # CBSD facts, from /usr/local/cbsd/cbsd.conf: workdir (line 28-36),
-# jailsysdir (71), jaildatadir (65), dbdir (92), etcdir (73), CIX_DISTDIR (24),
-# myversion (21); nodename is read by CBSD from ${workdir}/nodename (52).
+# jailsysdir (71), jaildatadir (65), jailrcconfdir (67), dbdir (92), etcdir
+# (73), CIX_DISTDIR (24), myversion (21); nodename is read by CBSD from
+# ${workdir}/nodename (52).
 SEANCE_CBSD_WORKDIR="${workdir}"
 SEANCE_CBSD_NODENAME="${nodename}"
 SEANCE_CBSD_JAILSYSDIR="${jailsysdir}"
 SEANCE_CBSD_JAILDATADIR="${jaildatadir}"
+SEANCE_CBSD_JAILRCCONFDIR="${jailrcconfdir}"
 SEANCE_CBSD_DBDIR="${dbdir}"
 SEANCE_CBSD_ETCDIR="${etcdir}"
 SEANCE_CBSD_DISTDIR="${CIX_DISTDIR}"
 SEANCE_CBSD_VERSION="${myversion}"
 export SEANCE_CBSD_WORKDIR SEANCE_CBSD_NODENAME SEANCE_CBSD_JAILSYSDIR
-export SEANCE_CBSD_JAILDATADIR SEANCE_CBSD_DBDIR SEANCE_CBSD_ETCDIR
+export SEANCE_CBSD_JAILDATADIR SEANCE_CBSD_JAILRCCONFDIR
+export SEANCE_CBSD_DBDIR SEANCE_CBSD_ETCDIR
 export SEANCE_CBSD_DISTDIR SEANCE_CBSD_VERSION
 
 # 'cbsd seance mode=version' and 'cbsd seance version' must both work: CBSD has

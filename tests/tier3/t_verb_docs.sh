@@ -187,9 +187,9 @@ dead_invocations_in()
 # The documents scanned for liveness beyond README. A file added here and not
 # to the repository is caught by the "shows seance being invoked" assertion,
 # which is why that assertion is per-document rather than over the union.
-DOC_SET="docs/repl-wire.md docs/DRILLS.md"
+DOC_SET="docs/repl-wire.md docs/DRILLS.md docs/RUNBOOK-failback.md"
 
-t_plan 16
+t_plan 19
 
 verbs=$( dispatcher_verbs "${T_ROOT}/bin/seance" | tr '\n' ' ' )
 t_isnt "${verbs}" "" "the dispatcher's verbs can be read out of bin/seance"

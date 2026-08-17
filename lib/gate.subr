@@ -69,27 +69,69 @@ placement_file()
     printf '%s/placement\n' "${_d}"
 }
 
+# How long a placement update may wait for the file's lock before giving up.
+# Long enough that two promotions started in the same breath both land, short
+# enough that a wedged holder is a failure rather than a hang.
+GATE_PLACEMENT_LOCK_WAIT=10
+
 # placement_local  -- the records, one per line, "<guest><TAB><home>".
 #
 # An absent file is an empty placement, which is the normal state of a healthy
 # node and is rc 0 with no output.
+#
+# A FILE IT CANNOT READ IS NOT AN EMPTY PLACEMENT. This used to be
+# `awk 'NF >= 2'`, which means every line the format did not fit was dropped in
+# silence -- and the line most likely not to fit is a torn one, the guest name
+# written and the home not. A dropped record is a guest this node is hosting
+# away from home that this node no longer knows it is hosting: `status` says it
+# is at home, `gate --release` releases it because nothing claims it, and it
+# starts here while it runs there. That is the same class as D-88 and D-96 --
+# evidence that could not be read being taken for evidence of absence -- and it
+# is refused for the same reason. Every line must be exactly two fields, a
+# guest name seance would write (D-45) and a node key ([a-z0-9]+); anything
+# else fails the read, names the line, and leaves the caller to say so.
 placement_local()
 {
-    local _f
+    local _f _bad
 
     _f=$( placement_file ) || return 1
     [ -r "${_f}" ] || return 0
 
-    awk -F "${GATE_TAB}" 'NF >= 2 { print $1 "\t" $2 }' "${_f}"
+    # Character classes written out rather than ranged, as everywhere in
+    # seance: POSIX leaves bracket ranges outside the C locale unspecified.
+    _bad=$( awk -F "${GATE_TAB}" '
+        NF != 2 || $1 == "" || $2 == "" { print NR ": " $0; next }
+        $1 ~ /[^abcdefghijklmnopqrstuvwxyz0123456789._-]/ { print NR ": " $0; next }
+        $2 ~ /[^abcdefghijklmnopqrstuvwxyz0123456789]/ { print NR ": " $0; next }
+    ' "${_f}" )
+
+    if [ -n "${_bad}" ]; then
+        printf 'placement: %s cannot be read as placement records:\n' "${_f}" >&2
+        printf '%s\n' "${_bad}" | sed -e 's/^/  line /' >&2
+        printf 'placement: a record this node cannot read is not a guest it is not hosting\n' >&2
+        return 1
+    fi
+
+    awk -F "${GATE_TAB}" '{ print $1 "\t" $2 }' "${_f}"
 }
 
-# placement_home <guest>  -- the home this node records for a guest it hosts
-# away from home; rc 1 when it does not claim that guest at all.
+# placement_home <guest>
+#
+# The home this node records for a guest it hosts away from home.
+#   rc 0  it claims that guest, and the home is on stdout
+#   rc 1  it does not claim that guest
+#   rc 2  IT CANNOT TELL -- the placement file could not be read
+#
+# The third answer is the one that has to exist. A caller reading rc 1 for a
+# file it could not parse would be reading "no claim" out of "no idea", which
+# is the accident this whole file is written against.
 placement_home()
 {
-    local _h
+    local _out _h
 
-    _h=$( placement_local | awk -F "${GATE_TAB}" -v g="${1:?}" \
+    _out=$( placement_local ) || return 2
+
+    _h=$( printf '%s\n' "${_out}" | awk -F "${GATE_TAB}" -v g="${1:?}" \
         '$1 == g { print $2; exit }' )
 
     [ -n "${_h}" ] || return 1
@@ -97,39 +139,73 @@ placement_home()
     printf '%s\n' "${_h}"
 }
 
-# placement_set <guest> <home>  -- claim a guest, replacing any earlier claim.
-placement_set()
+# _placement_update <guest> <home-or-empty>
+#
+# Replace a guest's record, or -- with an empty home -- remove it, UNDER THE
+# FILE'S OWN LOCK.
+#
+# It is a read-modify-write, and two of them at once lose one of the two
+# claims: each reads the file, filters out its own guest, appends, and renames
+# over whatever the other one had just written. Two `seance promote` runs on
+# one node -- two dead nodes, or an operator and a script -- is all it takes,
+# and what is lost is a claim, which is the record that stops the gate
+# releasing a guest that is running here. Measured: twenty concurrent claims
+# left one record. (The temporary name is `$$`, which in FreeBSD /bin/sh is the
+# SHELL's pid and not the subshell's, so the twenty also collided on one
+# temporary file -- but distinct processes would still have lost the update,
+# and the lock is what fixes both.)
+#
+# lockf(1) rather than a lock file with a pid in it, for D-62's reason: it is
+# released when the process dies, and a stale lock nobody can prove is stale
+# either wedges the node for ever or gets stolen on a guess.
+#
+# shellcheck disable=SC2016
+#   The single quotes are the point: what follows is the SOURCE TEXT of the
+#   script lockf runs, not an expansion for this shell. Its arguments arrive
+#   positionally, after the argv[0] that names it.
+_placement_update()
 {
-    local _f _tmp
+    local _f _lock
 
     _f=$( placement_file ) || return 1
     mkdir -p "${_f%/*}" || return 1
-    [ -e "${_f}" ] || : > "${_f}"
+    _lock="${_f}.lock"
 
-    _tmp="${_f}.new.$$"
+    lockf -k -t "${GATE_PLACEMENT_LOCK_WAIT}" "${_lock}" /bin/sh -c '
+        _f=$1
+        _g=$2
+        _h=$3
+        _t="${_f}.new.$$"
 
-    awk -F "${GATE_TAB}" -v g="${1:?}" '$1 != g' "${_f}" > "${_tmp}" ||
-        { rm -f "${_tmp}"; return 1; }
-    printf '%s\t%s\n' "$1" "${2:?}" >> "${_tmp}" ||
-        { rm -f "${_tmp}"; return 1; }
+        [ -e "${_f}" ] || : > "${_f}"
 
-    mv "${_tmp}" "${_f}"
+        awk -F "\t" -v g="${_g}" "\$1 != g" "${_f}" > "${_t}" ||
+            { rm -f "${_t}"; exit 1; }
+
+        if [ -n "${_h}" ]; then
+            printf "%s\t%s\n" "${_g}" "${_h}" >> "${_t}" ||
+                { rm -f "${_t}"; exit 1; }
+        fi
+
+        mv "${_t}" "${_f}"
+    ' seance-placement-update "${_f}" "${1:?}" "${2:-}"
+}
+
+# placement_set <guest> <home>  -- claim a guest, replacing any earlier claim.
+placement_set()
+{
+    _placement_update "${1:?}" "${2:?}"
 }
 
 # placement_clear <guest>  -- stop claiming a guest. Absent is already cleared.
 placement_clear()
 {
-    local _f _tmp
+    local _f
 
     _f=$( placement_file ) || return 1
     [ -r "${_f}" ] || return 0
 
-    _tmp="${_f}.new.$$"
-
-    awk -F "${GATE_TAB}" -v g="${1:?}" '$1 != g' "${_f}" > "${_tmp}" ||
-        { rm -f "${_tmp}"; return 1; }
-
-    mv "${_tmp}" "${_f}"
+    _placement_update "${1:?}" ""
 }
 
 # placement_remote <peerkeys...>
@@ -373,11 +449,14 @@ gate_run()
             fi
 
             if [ -n "${_silent}" ]; then
-                printf 'gate: REFUSED %s -- living peer(s) %s could not report their placement,\n' \
-                    "${_guest}" "${_silent}"
-                printf '        so nothing here can say the guest is not running on one of them.\n'
+                # The verdict line last, with what it needs said above it: a
+                # verb ends in its verdict, and an indented sentence is not one
+                # (charter §8, D-55).
+                printf '        Nothing here can say the guest is not running on one of them.\n'
                 printf '        Fix seance on those nodes ("ssh <peer> %s") and try again.\n' \
                     "${GATE_REMOTE_CMD}"
+                printf 'gate: REFUSED %s -- living peer(s) %s could not report their placement\n' \
+                    "${_guest}" "${_silent}"
                 return 1
             fi
 

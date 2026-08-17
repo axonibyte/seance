@@ -130,7 +130,13 @@
 #
 #   node_<key>_nodename       this node's CBSD node name. Required. It is how
 #                             a running node recognises itself in this file.
-#   node_<key>_mgmt           the address peers reach it on. Required.
+#   node_<key>_mgmt           the address peers reach it on. Required, and it
+#                             must be that node's alone: everything that counts
+#                             nodes counts KEYS and probes their addresses one
+#                             at a time, so two keys sharing an address make
+#                             one living host answer twice and a quorum
+#                             arithmetic that is not the fleet's. `config
+#                             --check` refuses it.
 #   node_<key>_heir           the node that inherits its guests.
 #   node_<key>_heir2          the node that inherits them if the first heir is
 #                             itself unreachable.

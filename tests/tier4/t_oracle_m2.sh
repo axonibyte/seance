@@ -1,0 +1,383 @@
+#!/bin/sh
+# Tier 4 -- the tier-7 invariants, fed M2's own output.
+#
+# tests/tier4/t_sim_oracle_selftest.sh feeds the checker states written BY HAND:
+# it is the negative control, and it proves every invariant can fire. What it
+# cannot prove is that the file-format contract at the top of invariants.subr
+# describes the records seance actually writes. Until M3's world driver exists,
+# nothing has ever handed the checker a placement file or a succession log that
+# came out of a promotion.
+#
+# This file does. It runs rung 6 for two guests -- the real
+# promote_guest_promote, the real mount ceremony, the real registration, the
+# real promote_record and placement_set -- and then builds the observed state
+# from the files those wrote and from the snapshot names the real formatter
+# produced. The checker is then asked twice:
+#
+#   * against the state as it came out of the promotion: nothing may fire;
+#   * against copies with ONE thing wrong in each: the matching invariant must
+#     fire, and it must be the one that matches.
+#
+# The second half is not a repeat of the self-test. The self-test corrupts a
+# hand-built fixture; this corrupts a REAL one, which is the only way to find
+# out that a real record was passing an invariant by accident -- because the
+# checker could not read it at all, for instance, or because a field the
+# contract requires was never there to be wrong.
+#
+# shellcheck disable=SC3043
+#   'local' is not in POSIX sh but is implemented by FreeBSD /bin/sh (sh(1),
+#   "local"); seance targets FreeBSD sh and nothing else (handoff §5).
+set -u
+
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=../lib/harness.subr
+. "$( dirname "$( realpath "$0" )" )/../lib/harness.subr"
+
+SEANCE_ROOT=${T_ROOT}
+export SEANCE_ROOT
+
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=../../lib/common.subr
+. "${T_ROOT}/lib/common.subr"
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=../../lib/policy.subr
+. "${T_ROOT}/lib/policy.subr"
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=../../lib/conf.subr
+. "${T_ROOT}/lib/conf.subr"
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=../../lib/transport.subr
+. "${T_ROOT}/lib/transport.subr"
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=../../lib/notify.subr
+. "${T_ROOT}/lib/notify.subr"
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=../../lib/zfs.subr
+. "${T_ROOT}/lib/zfs.subr"
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=../../lib/lineage.subr
+. "${T_ROOT}/lib/lineage.subr"
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=../../lib/repl.subr
+. "${T_ROOT}/lib/repl.subr"
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=../../lib/status.subr
+. "${T_ROOT}/lib/status.subr"
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=../../lib/gate.subr
+. "${T_ROOT}/lib/gate.subr"
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=../../lib/promote.subr
+. "${T_ROOT}/lib/promote.subr"
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=../mock-adapter.subr
+. "${T_ROOT}/tests/mock-adapter.subr"
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=../cluster/sim/invariants.subr
+. "${T_ROOT}/tests/cluster/sim/invariants.subr"
+
+DIR=$( t_tmpdir )
+TAB=$( printf '\t.' )
+TAB=${TAB%.}
+
+SEANCE_TMP_REGISTRY="${DIR}/registry"
+: > "${SEANCE_TMP_REGISTRY}"
+export SEANCE_TMP_REGISTRY
+t_at_exit 'seance_tmp_cleanup'
+
+# --- the world the promotion happens in -------------------------------------
+
+CONF="${DIR}/seance.conf"
+cat > "${CONF}" <<'EOF'
+cadence=900
+standby_root=pool0/%n/standby
+node_alpha_nodename=alpha
+node_alpha_mgmt=alpha-mgmt.example.net
+node_alpha_heir=bravo
+node_alpha_heir2=charlie
+
+node_bravo_nodename=bravo
+node_bravo_mgmt=bravo-mgmt.example.net
+node_bravo_heir=charlie
+
+node_charlie_nodename=charlie
+node_charlie_mgmt=charlie-mgmt.example.net
+node_charlie_heir=bravo
+EOF
+conf_load "${CONF}" || { echo "the fixture configuration did not load" >&2; exit 2; }
+
+SEANCE_STATE_DIR="${DIR}/state"
+SEANCE_RUN_DIR="${DIR}/run"
+export SEANCE_STATE_DIR SEANCE_RUN_DIR
+mkdir -p "${SEANCE_STATE_DIR}" "${SEANCE_RUN_DIR}"
+
+SEANCE_MOCK_NODE=bravo
+SEANCE_MOCK_WORKDIR="${DIR}/workdir"
+SEANCE_MOCK_LOG="${DIR}/mock.log"
+SEANCE_MOCK_SCRIPT="${DIR}/mock.script"
+export SEANCE_MOCK_NODE SEANCE_MOCK_WORKDIR SEANCE_MOCK_LOG SEANCE_MOCK_SCRIPT
+# jails-system/<vm> is deliberately NOT created: on CBSD it is a SYMLINK into
+# the VM's own dataset (sudoexec/bcreate:599), which is what promote_relink
+# recreates, and a real directory there is a thing rung 6 correctly refuses to
+# replace.
+mkdir -p "${SEANCE_MOCK_WORKDIR}/jails-system/web01" \
+         "${SEANCE_MOCK_WORKDIR}/vm/db01" \
+         "${SEANCE_MOCK_WORKDIR}/jails-data"
+printf 'name=web01\n' > "${SEANCE_MOCK_WORKDIR}/jails-system/web01/rc.conf_web01"
+printf 'name=db01\n' > "${SEANCE_MOCK_WORKDIR}/vm/db01/rc.conf_db01"
+: > "${SEANCE_MOCK_SCRIPT}"
+
+# The lineage the replicas carry, generated by the REAL formatter at the REAL
+# default cadence, exactly as the tier-4 ladder does it: no fixture here writes
+# a snapshot name seance would not have written.
+NOW=$( date -u +%s )
+SEANCE_MOCK_LINEAGE_NODE=alpha
+SEANCE_MOCK_LINEAGE_NOW=$(( NOW - 60 ))
+SEANCE_MOCK_LINEAGE_N=3
+export SEANCE_MOCK_LINEAGE_NODE SEANCE_MOCK_LINEAGE_NOW SEANCE_MOCK_LINEAGE_N
+
+PROMOTE_DEAD=alpha
+PROMOTE_OPERATOR=tester
+PROMOTE_TMPDIR="${DIR}/promote"
+mkdir -p "${PROMOTE_TMPDIR}"
+PROMOTE_FORCE=""
+PROMOTE_EVIDENCE="fence:mock"
+
+W_MOUNTED=""
+
+# shellcheck disable=SC2329
+zfs_filesystems_r() { printf '%s\n' "$1"; }
+# shellcheck disable=SC2329
+zfs_volumes_r() { [ "${1##*/}" = "db01" ] && printf '%s/dsk1.vhd\n' "$1"; return 0; }
+# shellcheck disable=SC2329
+zfs_set() { return 0; }
+# shellcheck disable=SC2329
+zfs_inherit() { return 0; }
+# shellcheck disable=SC2329
+zfs_unmount() { W_MOUNTED=""; return 0; }
+# shellcheck disable=SC2329
+zfs_exists() { return 0; }
+# shellcheck disable=SC2329
+zfs_mounted() { case " ${W_MOUNTED} " in *" $1 "*) return 0 ;; esac; return 1; }
+# shellcheck disable=SC2329
+zfs_mount() { W_MOUNTED="${W_MOUNTED} $1"; return 0; }
+
+t_plan 17
+
+# ---------------------------------------------------------------------------
+# A real promotion of two guests
+# ---------------------------------------------------------------------------
+
+TS=$( pol_epoch_to_ts "${SEANCE_MOCK_LINEAGE_NOW}" )
+PROMOTED=0
+for g in web01 db01; do
+    if promote_guest_promote "${g}" "pool0/bravo/standby/alpha/${g}" "${TS}" \
+        bravo "${NOW}" pool0/bravo/standby > "${DIR}/promote.${g}" 2>&1
+    then
+        PROMOTED=$(( PROMOTED + 1 ))
+    else
+        t_diag "promoting ${g} failed:"
+        sed -e 's/^/# /' "${DIR}/promote.${g}"
+    fi
+done
+
+t_is "${PROMOTED}" "2" "two guests were promoted by the real rung 6"
+t_like "$( cat "${SEANCE_STATE_DIR}/succession.log" )" \
+    "^web01${TAB}alpha${TAB}bravo${TAB}[0-9]{8}T[0-9]{6}Z${TAB}fence:mock\$" \
+    "and the succession log it wrote is the file the checker is about to read"
+t_is "$( placement_local | LC_ALL=C sort | tr '\n' '|' )" \
+    "db01	alpha|web01	alpha|" \
+    "and so is the placement file"
+
+# ---------------------------------------------------------------------------
+# The observed state, built from what the promotion left behind
+#
+# Nothing below invents a record: every row comes from a file seance wrote, or
+# from the same listing seam the ladder reads its lineage through.
+# ---------------------------------------------------------------------------
+
+OBS="${DIR}/obs"
+MODEL="${DIR}/model"
+mkdir -p "${OBS}" "${MODEL}"
+
+
+: > "${OBS}/running"
+: > "${OBS}/placement"
+: > "${OBS}/snapshots"
+: > "${OBS}/records"
+: > "${OBS}/props"
+: > "${OBS}/datasets"
+: > "${OBS}/invocations"
+
+for g in web01 db01; do
+    # Running, as the platform on bravo answers it.
+    printf '%s\tbravo\t%s\n' "${g}" "$( adapter_guest_running "${g}" )" \
+        >> "${OBS}/running"
+
+    # Placement: bravo's own file, verbatim, turned into the checker's shape.
+    placement_local | awk -F "${TAB}" -v g="${g}" \
+        '$1 == g { print "bravo\t" $1 "\tactive" }' >> "${OBS}/placement"
+
+    # Snapshots, from the same listing seam the ladder reads.
+    for n in bravo charlie; do
+        mock_zfs_list "pool0/${n}/standby/alpha/${g}" |
+            awk -F '@' -v n="${n}" -v g="${g}" 'NF == 2 { print n "\t" g "\t" $2 }' \
+            >> "${OBS}/snapshots"
+    done
+
+    # Properties. bravo has the guest mounted in place -- it is the node
+    # running it -- and charlie still holds a hidden replica, which is what
+    # invariant 4a is about.
+    printf 'charlie\t%s\tcanmount\tnoauto\n' "${g}" >> "${OBS}/props"
+    printf 'charlie\t%s\tmountpoint\tnone\n' "${g}" >> "${OBS}/props"
+
+    for n in bravo charlie; do
+        printf '%s\tpool0/%s/standby/alpha/%s\n' "${n}" "${n}" "${g}" \
+            >> "${OBS}/datasets"
+    done
+done
+
+# The records, with the node that holds the log prepended -- the one
+# transformation the contract asks a driver to make.
+awk -v n=bravo 'NF > 0 { print n "\t" $0 }' "${SEANCE_STATE_DIR}/succession.log" \
+    >> "${OBS}/records"
+
+# The model: alpha is dead, both guests are alpha's, and the lineage the model
+# believes in is the instant the promotion actually chose.
+printf 'alpha\tdead\nbravo\talive\ncharlie\talive\n' > "${MODEL}/nodes"
+printf 'web01\talpha\ndb01\talpha\n' > "${MODEL}/guests"
+: > "${MODEL}/lineage"
+for g in web01 db01; do
+    for n in bravo charlie; do
+        printf '%s\t%s\t%s\n' "${g}" "${n}" "${TS}" >> "${MODEL}/lineage"
+    done
+done
+
+# ---------------------------------------------------------------------------
+# Nothing fires on the state a promotion leaves behind
+# ---------------------------------------------------------------------------
+
+check()
+{
+    INV_FIRED=0
+    inv_check_all "$1" "$2" "${3:-}" > "${DIR}/inv.out" 2> "${DIR}/inv.err"
+    printf '%s\n' "$?"
+}
+
+RC=$( check "${MODEL}" "${OBS}" )
+if [ "${RC}" = "0" ]; then
+    t_ok "no invariant fires on the state a real promotion left behind"
+else
+    t_not_ok "no invariant fires on the state a real promotion left behind"
+    grep -E 'FIRED' "${DIR}/inv.out" | sed -e 's/^/# /'
+    sed -e 's/^/# stderr: /' "${DIR}/inv.err"
+fi
+
+t_is "$( grep -c ' ok' "${DIR}/inv.out" )" "6" \
+    "and all six of them said so: 1, 2, 3, 4, 4a and 5"
+t_is "$( cat "${DIR}/inv.err" )" "" \
+    "with nothing on stderr: the state file contract was met by real output"
+
+# ---------------------------------------------------------------------------
+# One thing wrong in each copy, and the matching invariant fires
+# ---------------------------------------------------------------------------
+
+# corrupt <name>  -- a copy of the good state to break.
+corrupt()
+{
+    rm -rf "${DIR}/bad.$1"
+    cp -R "${OBS}" "${DIR}/bad.$1"
+    printf '%s\n' "${DIR}/bad.$1"
+}
+
+fires()
+{
+    local _n _rc _bad
+
+    _n=$1
+    _bad=$2
+
+    _rc=$( check "${3:-${MODEL}}" "${_bad}" "${4:-}" )
+
+    if [ "${_rc}" = "1" ] && grep -q "^invariant ${_n} FIRED" "${DIR}/inv.out"; then
+        t_ok "$5"
+    else
+        t_not_ok "$5"
+        t_diag "rc=${_rc}"
+        sed -e 's/^/# /' "${DIR}/inv.out"
+    fi
+}
+
+# 1 -- the same guest running on two nodes, which is the reason for all of this
+B=$( corrupt running )
+printf 'web01\tcharlie\t1\n' >> "${B}/running"
+fires 1 "${B}" "" "" \
+    "a real state with web01 running on two nodes fires invariant 1"
+
+# 1 -- and claimed active by two, which is the record form of the same thing
+B=$( corrupt claim )
+printf 'charlie\tweb01\tactive\n' >> "${B}/placement"
+fires 1 "${B}" "" "" \
+    "and a second ACTIVE claim on the same guest fires it too"
+
+# 2 -- the promotion's evidence, removed from the record seance wrote
+B=$( corrupt evidence )
+awk -F "${TAB}" 'BEGIN { OFS = "\t" } $2 == "web01" { $6 = "" } { print }' \
+    "${OBS}/records" > "${B}/records"
+fires 2 "${B}" "" "" \
+    "a real succession record with its evidence emptied fires invariant 2"
+
+# 2 -- and a record that does not parse at all
+B=$( corrupt fields )
+printf 'bravo\tweb01\talpha\tbravo\n' >> "${B}/records"
+fires 2 "${B}" "" "" \
+    "and a four-field line in a real log fires it: 'logs parse' is an invariant"
+
+# 2 -- a guest placed away from home with no record of how it got there
+B=$( corrupt norecord )
+: > "${B}/records"
+fires 2 "${B}" "" "" \
+    "a guest hosted away from home with an EMPTY log fires invariant 2"
+
+# 3 -- lineage that went backwards between two states
+B=$( corrupt regress )
+awk -F "${TAB}" 'BEGIN { OFS = "\t" } { print }' "${OBS}/snapshots" |
+    sed -e 's/@//' > /dev/null
+: > "${B}/snapshots"
+fires 3 "${B}" "" "${OBS}" \
+    "a node that has LOST every snapshot it had fires invariant 3"
+
+# 4 -- a dataset that was there and is not
+B=$( corrupt destroyed )
+grep -v 'pool0/charlie/standby/alpha/web01' "${OBS}/datasets" > "${B}/datasets"
+fires 4 "${B}" "" "${OBS}" \
+    "a data-bearing dataset that disappeared between two states fires invariant 4"
+
+# 4a -- a replica that can mount itself
+B=$( corrupt shadow )
+sed -e 's/^charlie	web01	canmount	noauto$/charlie	web01	canmount	on/' \
+    "${OBS}/props" > "${B}/props"
+fires 4a "${B}" "" "" \
+    "a replica left with canmount=on fires invariant 4a"
+
+B=$( corrupt shadowmp )
+sed -e 's#^charlie	web01	mountpoint	none$#charlie	web01	mountpoint	/seance/web01#' \
+    "${OBS}/props" > "${B}/props"
+fires 4a "${B}" "" "" \
+    "and so does one with a real mountpoint under it"
+
+# 5 -- an invocation capture that is not there
+B=$( corrupt invocation )
+printf '%s/no-such-capture\n' "${DIR}" > "${B}/invocations"
+fires 5 "${B}" "" "" \
+    "an invocation the oracle cannot read fires invariant 5"
+
+# The contract's own teeth: a mandatory file that is missing must fire rather
+# than read as "nothing wrong".
+B=$( corrupt missing )
+rm -f "${B}/placement"
+RC=$( check "${MODEL}" "${B}" )
+t_is "${RC}" "1" \
+    "and a mandatory state file that is simply absent fires rather than passing"
+
+t_done

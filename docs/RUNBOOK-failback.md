@@ -52,6 +52,24 @@ seance gate --check          # what it would withhold now; changes nothing
 seance status                # every displaced guest should read held yes
 ```
 
+A guest a peer claims reads like this, and the hold prints its undo above it:
+
+```
+gate: HELD <guest> -- <peer> claims it
+```
+
+and when the peers answer and none of them claims it, `--release` says so:
+
+```
+gate: released <guest> (<n> peer(s) answered, none claims it)
+```
+
+while a peer that still claims it refuses, by name:
+
+```
+gate: REFUSED <guest> -- <peer> still claims it
+```
+
 **If a guest is running here and a peer also claims it, you have a split
 brain.** Stop the local copy immediately — do not wait to finish reading this
 page — and then work out how it started. That is the failure mode the whole
@@ -102,12 +120,32 @@ What it does, in order, printing the undo beside each step:
 8. prunes the interim's lineage from this node's datasets;
 9. says which heirs the next replication tick will send to.
 
+The last line is the verdict, and it is the one to read:
+
+```
+failback: <guest> is home on <node> and running; the next repl tick sends @seance-<node>-* to <heir>
+```
+
+The interim's own half prints its verdicts too, and step 5's is the one that
+says the interim has let go of the guest completely:
+
+```
+failback-assist: unregistered <guest> and returned its datasets to mountpoint=none
+```
+
 ### If it refuses with a byte count
 
 ```
-failback: REFUSED -- 1441792 byte(s) have been written here to the copy of web01
-        since the base the reverse stream would roll back to.
+        <n> byte(s) have been written here to the copy of <guest> since the base
+        the reverse stream would roll back to. Receiving would destroy them.
+        If they are the debris of the crash and not data, run:
+            seance failback <guest> --discard-origin-writes
+        <guest> is still RUNNING on <interim>; nothing has been stopped.
+failback: REFUSED -- <n> byte(s) have been written here to the copy of <guest>
 ```
+
+The verdict is the LAST line, always: every seance verb ends in one, so the
+line to read after a scrollback has gone past is the bottom one.
 
 This is the design working, not failing. The reverse stream lands with
 `zfs recv -F`, which rolls this node's dataset back to the base before rolling
@@ -172,16 +210,26 @@ seance placement --remote      # confirm nobody claims it
 seance gate --release <guest>
 ```
 
-`--release` refuses while any peer still claims the guest, **and while any
-living peer could not report its placement at all**. The second refusal names
-the peer: it is up, its seance could not answer, and nothing here can tell a
-node with no claim from a node that never got to state one. Fix seance there —
-`ssh <peer> seance placement` is the test — and try again. The same silence
-freezes `promote` and `failback` for the same reason.
+`--release` refuses in three situations, and all three are the gate doing its
+job rather than something to work around:
 
-`--release` refuses while any peer still claims the guest, and refuses while no
-peer answers at all. Both refusals are the gate doing its job; neither is
-something to work around.
+- **a peer still claims the guest**:
+
+```
+gate: REFUSED <guest> -- <peer> still claims it
+```
+
+- **not one peer answered** — there is nothing to confirm anything with;
+- **a living peer could not report its placement at all** — it is up, its
+  seance could not answer, and nothing here can tell a node with no claim from
+  a node that never got to state one. The refusal names the peer:
+
+```
+gate: REFUSED <guest> -- living peer(s) <peer> could not report their placement
+```
+
+Fix seance there — `ssh <peer> seance placement` is the test — and try again.
+The same silence freezes `promote` and `failback` for the same reason.
 
 ## Step 5 — prove the fleet is back
 

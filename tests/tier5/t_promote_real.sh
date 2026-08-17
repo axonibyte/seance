@@ -95,7 +95,7 @@ EOF
 
 SEANCE="${T_ROOT}/bin/seance"
 
-t_plan 31
+t_plan 35
 
 # ---------------------------------------------------------------------------
 # One tick
@@ -315,6 +315,43 @@ t_stdout_is "jail" "and the guest is a jail on this node again" \
 t_rc 0 "and it STARTS" -- adapter_guest_start "${J}"
 t_stdout_is "1" "and it is running" -- adapter_guest_running "${J}"
 t_rc 0 "and stops again" -- adapter_guest_stop "${J}"
+
+# ---------------------------------------------------------------------------
+# And the way home: `seance failback-assist <g> unregister`, the verb itself
+#
+# Step 4 of a failback, run on the interim over the mesh, and the printed undo
+# of promote's registration (D-72). It is run here through the dispatcher and
+# not through the adapter, because the whole path is the claim: the verb loads
+# the configuration, initialises the adapter, unregisters, and unmounts.
+#
+# What it must NOT leave behind is the export junregister writes as it goes
+# (sudoexec/junregister:139). Before this fix, one failback made this node say
+# "skipping <g>: CBSD's database does not know it" on stderr on every tick,
+# every status and every gate, for ever -- because jls keeps listing a guest
+# out of that file alone (jailctl/jls:281-296).
+# ---------------------------------------------------------------------------
+
+DUMP="${WD}/jails-rcconf/rc.conf_${J}"
+assist=$( t_tmpdir )
+sh "${SEANCE}" failback-assist "${J}" unregister \
+    > "${assist}/out" 2> "${assist}/err" < /dev/null
+assist_rc=$?
+
+t_is "${assist_rc}" "0" "seance failback-assist ${J} unregister succeeds"
+t_like "$( cat "${assist}/out" )" '^  undo: ' \
+    "and prints its undo, as every mutating step does"
+
+if [ -e "${DUMP}" ]; then
+    t_not_ok "and leaves no export behind in \${jailrcconfdir}"
+    t_diag "still there: ${DUMP}"
+else
+    t_ok "and leaves no export behind in \${jailrcconfdir}"
+fi
+
+after=$( t_tmpdir )
+adapter_guest_list > "${after}/out" 2> "${after}/err"
+t_unlike "$( cat "${after}/err" )" "${J}" \
+    "so the estate listing is silent about it on every later tick"
 
 rm -rf "${SYSDIR}.aside"
 zfs destroy -r "${POOL}/standby" 2>/dev/null

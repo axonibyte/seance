@@ -25,3 +25,5 @@ quorum-rule-removed.patch	4	-	tests/tier4/t_ladder.sh
 quorum-rule-removed.patch	6	quorum	tests/tier6/t_quorum.sh
 debounce-removed.patch	4	-	tests/tier4/t_ladder.sh
 debounce-removed.patch	6	flap	tests/tier6/t_flap.sh
+placement-unreadable-accepted.patch	4	-	tests/tier4/t_records.sh
+mount-not-verified.patch	4	-	tests/tier4/t_empty0_m2.sh

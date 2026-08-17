@@ -285,15 +285,28 @@ zfs_inherit()
     printf 'inherit %s %s\n' "$1" "$2" >> "${W_ZFSLOG}"
 }
 
+# W_MOUNTS is the mount table this fixture keeps, because promote now ASKS
+# whether the mount happened rather than believing `zfs mount`'s exit status
+# (the empty-output-with-success class, applied to a mount --
+# tests/tier4/t_empty0_m2.sh is the file about it). A fixture whose zfs_mounted
+# always said "no" would fail every ceremony; one that always said "yes" would
+# make the new check unfalsifiable. It says what this fixture's own zfs_mount
+# did.
+W_MOUNTS=""
+
 # shellcheck disable=SC2329
 zfs_mount()
 {
     printf 'mount %s\n' "$1" >> "${W_ZFSLOG}"
+    W_MOUNTS="${W_MOUNTS} $1"
 }
 
 # shellcheck disable=SC2329
 zfs_mounted()
 {
+    case " ${W_MOUNTS} " in
+        *" $1 "*) return 0 ;;
+    esac
     return 1
 }
 
@@ -373,7 +386,7 @@ world_build()
 {
     local _spec _kv _k _v
     local _nodes _reach _dead _fence _lineage _claim _peermute _kernel _guest _notify
-    local _sysdir _mirror _tree _auto _fleetauto _armed _carp _vhid
+    local _sysdir _mirror _tree _auto _fleetauto _armed _carp _vhid _succ
     local _conf _wd _n _lnow
 
     _spec=$1
@@ -396,6 +409,7 @@ world_build()
     _armed=yes
     _carp=MASTER
     _vhid=yes
+    _succ=default
 
     [ "${_spec}" = "-" ] && _spec=""
 
@@ -421,6 +435,7 @@ world_build()
             armed)   _armed=${_v} ;;
             carp)    _carp=${_v} ;;
             vhid)    _vhid=${_v} ;;
+            succ)    _succ=${_v} ;;
             *)
                 t_diag "world_build: unknown setting: ${_kv}"
                 return 2
@@ -454,6 +469,7 @@ world_build()
 
     W_ZFSLOG="${ROWDIR}/zfs.log"
     : > "${W_ZFSLOG}"
+    W_MOUNTS=""
 
     FENCE_MOCK_LOG="${ROWDIR}/fence.log"
     FENCE_MOCK_MODE=off
@@ -605,14 +621,42 @@ pool0/bravo/standby/alpha/${REPL_SYS_GUEST}"
 
         printf 'node_alpha_nodename=alpha\n'
         printf 'node_alpha_mgmt=alpha-mgmt.example.net\n'
-        printf 'node_alpha_heir=bravo\n'
         if [ "${_vhid}" = "yes" ]; then
             printf 'node_alpha_vhid=1\n'
             printf 'node_alpha_vhid_ip=192.0.2.101/32\n'
         fi
-        [ "${_nodes}" -ge 3 ] && printf 'node_alpha_heir2=charlie\n'
+
+        # Whose guests alpha's are, when alpha is gone. The default is the
+        # fleet every other row assumes -- this node first. The others are
+        # configurations that pass `config --check` and put this node
+        # somewhere else in the queue (battery a).
+        case "${_succ}" in
+            default)
+                printf 'node_alpha_heir=bravo\n'
+                [ "${_nodes}" -ge 3 ] && printf 'node_alpha_heir2=charlie\n'
+                ;;
+            h2self)
+                # The first heir is somewhere else and this node is second.
+                printf 'node_alpha_heir=charlie\n'
+                printf 'node_alpha_heir2=bravo\n'
+                ;;
+            none)
+                # alpha has no succession at all: legal, checks clean, and
+                # means nothing here may inherit anything of alpha's.
+                ;;
+            *)
+                t_diag "world_build: unknown succ: ${_succ}"
+                return 2
+                ;;
+        esac
         case "${_fence}" in
             none) ;;
+            targetless)
+                # A driver named with nothing to name to it. conf_check
+                # requires a driver for every target and not the reverse, so
+                # this is a configuration that passes --check.
+                printf 'node_alpha_fence_driver=mock\n'
+                ;;
             missing)
                 printf 'node_alpha_fence_driver=nosuchdriver\n'
                 printf 'node_alpha_fence_target=alpha\n'
@@ -647,7 +691,7 @@ pool0/bravo/standby/alpha/${REPL_SYS_GUEST}"
     } > "${_conf}"
 
     case "${_fence}" in
-        none|missing|off) ;;
+        none|missing|targetless|off) ;;
         *) FENCE_MOCK_MODE=${_fence} ;;
     esac
 

@@ -122,6 +122,20 @@ case " ${WORLD_SSH_ALIVE:-} " in
     *) echo "ssh: connect to host ${addr}: Connection refused" >&2; exit 255 ;;
 esac
 
+# The interim goes away in the middle. WORLD_SSH_DEAF_AFTER names the assist
+# step it answers LAST: that call succeeds, and everything after it -- the
+# snapshot listing, the reverse send, the unregister -- is a connection
+# refused, which is what an interim losing its uplink looks like from here.
+if [ -n "${WORLD_SSH_DEAF_AFTER:-}" ]; then
+    if [ -f "${WORLD_DIR}/deaf" ]; then
+        echo "ssh: connect to host ${addr}: Connection refused" >&2
+        exit 255
+    fi
+    case "${cmd}" in
+        *"failback-assist "*" ${WORLD_SSH_DEAF_AFTER}") : > "${WORLD_DIR}/deaf" ;;
+    esac
+fi
+
 case "${cmd}" in
     "exit 0")
         exit 0
@@ -136,7 +150,12 @@ case "${cmd}" in
         exit 0
         ;;
     *"failback-assist "*" snapshot")
-        printf 'assist\tsnapshot\t%s\t%s\n' "${WORLD_IDS}" "${WORLD_FINAL}"
+        # WORLD_SNAP_MUTE: the interim says it snapshotted and does not say
+        # WHAT -- a success with no record, which is the crashed-verifier class
+        # applied to the one answer the reverse stream is built from.
+        if [ -z "${WORLD_SNAP_MUTE:-}" ]; then
+            printf 'assist\tsnapshot\t%s\t%s\n' "${WORLD_IDS}" "${WORLD_FINAL}"
+        fi
         echo "failback-assist: snapshotted"
         exit 0
         ;;
@@ -319,7 +338,9 @@ world()
     export WORLD_IDS WORLD_FINAL
 
     WORLD_SSH_ALIVE="bravo-mgmt.example.net"
-    export WORLD_SSH_ALIVE
+    WORLD_SSH_DEAF_AFTER=""
+    WORLD_SNAP_MUTE=""
+    export WORLD_SSH_ALIVE WORLD_SSH_DEAF_AFTER WORLD_SNAP_MUTE
 
     SEANCE_STATE_DIR="${WORLD_DIR}/state"
     export SEANCE_STATE_DIR
@@ -361,7 +382,7 @@ failback()
     FB_RC=$?
 }
 
-t_plan 35
+t_plan 54
 
 # ---------------------------------------------------------------------------
 # THE REFUSAL
@@ -518,6 +539,93 @@ t_like "$( cat "${WEB_OUT}" )" 'neither held nor stopped here' \
     "and says which of the two preconditions it failed"
 t_unlike "$( cat "${WORLD_DIR}/ssh.log" 2>/dev/null )" 'failback-assist web01' \
     "and it never touched the interim"
+
+# ---------------------------------------------------------------------------
+# THE INTERIM GOES AWAY IN THE MIDDLE
+#
+# The dangerous window is between "the guest is stopped there" and "the data is
+# here": the guest is down, the origin has not received anything, and whatever
+# the operator does next they have to be told what state they are in. A
+# failback that dies here must leave the origin untouched and must name the one
+# command that puts the guest back up on the interim.
+# ---------------------------------------------------------------------------
+
+world 0 bravo
+WORLD_SSH_DEAF_AFTER=snapshot
+export WORLD_SSH_DEAF_AFTER
+failback 0
+
+t_is "${FB_RC}" "1" "an interim that goes away after the final snapshot fails the failback"
+t_like "$( tail -1 "${FB_OUT}" )" '^failback: FAIL'     "and the last line is a verdict, not the last thing that happened to work"
+t_like "$( cat "${FB_OUT}" )" 'seance failback-assist arc01 start'     "and the way back is a command an operator can type, not a description of one"
+
+t_unlike "$( cat "${WORLD_DIR}/zfs.log" 2>/dev/null || echo none )" 'recv'     "nothing was received: the origin's live dataset is untouched"
+t_unlike "$( cat "${WORLD_DIR}/mounts.log" 2>/dev/null || echo none )" '^unmount '     "and nothing was unmounted for a receive that never came"
+t_unlike "$( cat "${SEANCE_MOCK_LOG}" )" 'adapter_guest_release'     "the guest is NOT released here: half a failback is not a failback"
+t_unlike "$( cat "${SEANCE_MOCK_LOG}" )" 'adapter_guest_start'     "and it is NOT started here, which is the sentence that would have meant two writers"
+t_is "$( cat "${SEANCE_STATE_DIR}/succession.log" 2>/dev/null || printf '' )" ""     "and no succession record is written for a failback that did not happen"
+t_is "$( grep -o 'failback-assist arc01 [a-z]*' "${WORLD_DIR}/ssh.log" | tr '\n' ' ' )"     "failback-assist arc01 stop failback-assist arc01 snapshot "     "the interim was asked to stop and to snapshot, and was never asked to unregister"
+
+# The same cut one step earlier: the guest is stopped and the snapshot never
+# happens. The verdict has to name the step, because "it failed" and "it failed
+# after stopping your guest" are different instructions to a human at 03:00.
+world 0 bravo
+WORLD_SSH_DEAF_AFTER=stop
+export WORLD_SSH_DEAF_AFTER
+failback 0
+
+t_is "${FB_RC}" "1" "an interim that goes away after the stop fails the failback too"
+t_like "$( cat "${FB_OUT}" )" 'could not take the final snapshot of arc01'     "and names the step that did not happen"
+t_like "$( cat "${FB_OUT}" )" 'seance failback-assist arc01 start'     "and still prints the way back, because the guest is down either way"
+
+# ---------------------------------------------------------------------------
+# THE INTERIM SAYS IT SNAPSHOTTED AND DOES NOT SAY WHAT
+#
+# Success with no record. Everything after step 2 is built on the name the
+# interim returns -- the reverse stream is `zfs send -I @base <root>@<final>`
+# -- so a caller that read the silence as "fine" would send from a name it had
+# guessed. The crashed-verifier class (TESTING.md §5) at the one seam a
+# failback cannot do without.
+# ---------------------------------------------------------------------------
+
+world 0 bravo
+WORLD_SNAP_MUTE=1
+export WORLD_SNAP_MUTE
+failback 0
+
+t_is "${FB_RC}" "1" \
+    "an interim that reports a snapshot without saying which one fails the failback"
+t_like "$( cat "${FB_OUT}" )" 'did not say what: empty output with a success status is a contract violation' \
+    "and says so in those words, rather than proceeding on a name nobody returned"
+t_unlike "$( cat "${WORLD_DIR}/zfs.log" 2>/dev/null || echo none )" 'recv' \
+    "and nothing was received"
+
+# ---------------------------------------------------------------------------
+# TWICE
+#
+# A failback is typed by a human, and a human who is not sure it worked types
+# it again. The second one must refuse -- the interim has stopped claiming the
+# guest, which is exactly the state that means "already home" -- and it must
+# not touch the guest that is now running here.
+# ---------------------------------------------------------------------------
+
+world 0 bravo
+failback 1
+FIRST_RC=${FB_RC}
+FIRST_DIR=${WORLD_DIR}
+t_is "${FIRST_RC}" "0" "the first failback completes"
+
+# The interim released its claim as step 6 of that run, so it no longer answers
+# `seance placement` with one.
+rm -f "${FIRST_DIR}/claims.bravo-mgmt.example.net"
+: > "${SEANCE_MOCK_LOG}"
+SECOND_OUT="${FIRST_DIR}/second.out"
+failback_run arc01 1 > "${SECOND_OUT}" 2>&1
+SECOND_RC=$?
+
+t_is "${SECOND_RC}" "1" "the second failback of the same guest refuses"
+t_like "$( cat "${SECOND_OUT}" )" 'no living peer claims arc01'     "and says the guest is claimed by nobody, which is what home looks like"
+t_unlike "$( cat "${SEANCE_MOCK_LOG}" )" 'adapter_guest_stop'     "and it does not stop the guest it just brought home"
 
 # A guest this node does not have at all is not a failback, it is a promotion.
 world 0 bravo

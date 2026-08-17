@@ -39,7 +39,7 @@ directive()
     sed -n -e "s/^# *$2: *//p" "$1" | head -1
 }
 
-t_plan 11
+t_plan 16
 
 t_rc 0 "rc.d/seance_gate exists and is executable" -- test -x "${UNIT}"
 
@@ -79,5 +79,95 @@ sed -e 's/^rcvar=seance_gate_enable$/rcvar=seance_enable/' "${UNIT}" \
     > "${scratch}/renamed"
 t_unlike "$( cat "${scratch}/renamed" )" '^rcvar=seance_gate_enable$' \
     "and so is a unit whose rcvar has been renamed out from under rc.conf"
+
+# ---------------------------------------------------------------------------
+# rcorder(8) itself, on a synthetic rc.d directory
+#
+# Everything above reads the header and believes it. This runs the program
+# rc(8) runs -- rcorder(8), the thing that actually decides the order -- and
+# asks where seance_gate lands.
+#
+# A SYNTHETIC directory, not /etc/rc.d and /usr/local/etc/rc.d: the workstation
+# and the guest have different services installed, the answer would depend on
+# whichever ones they are, and printing an operator's real service list into a
+# public repository's test log is not something a test needs to do. What is
+# built here is the smallest world in which the question means anything -- the
+# real unit, a cbsdd stub carrying the daemon's REAL header (read from the
+# installed 15.0.9 tree, quoted at the top of this file), and one stub per name
+# either of them requires.
+# ---------------------------------------------------------------------------
+
+RCDIR=$( t_tmpdir )/rc.d
+mkdir -p "${RCDIR}"
+
+cp "${UNIT}" "${RCDIR}/seance_gate"
+
+stub()
+{
+    local _n
+
+    _n=$1
+    shift
+
+    {
+        printf '#!/bin/sh\n#\n'
+        printf '# PROVIDE: %s\n' "${_n}"
+        [ $# -gt 0 ] && printf '# REQUIRE: %s\n' "$*"
+        printf '#\nexit 0\n'
+    } > "${RCDIR}/${_n}"
+    chmod 0755 "${RCDIR}/${_n}"
+}
+
+# The platform's daemon, with its own header verbatim.
+stub cbsdd LOGIN FILESYSTEMS cleanvar sshd
+# Everything either unit names, so that rcorder has a complete graph.
+stub FILESYSTEMS
+stub NETWORKING FILESYSTEMS
+stub LOGIN NETWORKING
+stub cleanvar FILESYSTEMS
+stub sshd NETWORKING
+
+ORDER=$( rcorder "${RCDIR}"/* 2>/dev/null | sed -e "s|^${RCDIR}/||" | tr '\n' ' ' )
+
+t_like "${ORDER}" 'seance_gate.*cbsdd' \
+    "rcorder(8) really does put seance_gate ahead of the platform's daemon"
+t_like "${ORDER}" 'FILESYSTEMS.*seance_gate' \
+    "and behind FILESYSTEMS, so the state directory it reads is mounted"
+t_like "${ORDER}" 'NETWORKING.*seance_gate' \
+    "and behind NETWORKING, so 'no peer answered' means the peers and not the boot order"
+
+# --- and the mutation, in the world where it is observable ------------------
+#
+# Taking the BEFORE line out of the unit above does NOT move it in the world
+# above: seance_gate requires two names and the daemon requires four, so
+# rcorder emits it first anyway. That is the point rather than a nuisance --
+# without the BEFORE line the ordering is not wrong, it is UNDECIDED, and it
+# comes out right for a reason that has nothing to do with seance. Which is
+# exactly the kind of ordering that changes the day somebody adds a REQUIRE to
+# either unit.
+#
+# So the mutation is shown in the smallest world where the edge is the only
+# thing deciding: a daemon stub with no requirements of its own, which rcorder
+# would otherwise emit first. Its header is deliberately NOT the platform's
+# here, and that is stated rather than left to be noticed.
+MINDIR=$( t_tmpdir )/rc.d.min
+mkdir -p "${MINDIR}"
+RCDIR_SAVED=${RCDIR}
+RCDIR=${MINDIR}
+stub cbsdd
+stub FILESYSTEMS
+stub NETWORKING
+RCDIR=${RCDIR_SAVED}
+
+cp "${UNIT}" "${MINDIR}/seance_gate"
+ORDER=$( rcorder "${MINDIR}"/* 2>/dev/null | sed -e "s|^${MINDIR}/||" | tr '\n' ' ' )
+t_like "${ORDER}" 'seance_gate.*cbsdd' \
+    "with the BEFORE line, seance_gate is ordered ahead of a daemon that requires nothing"
+
+grep -v '^# BEFORE:' "${UNIT}" > "${MINDIR}/seance_gate"
+chmod 0755 "${MINDIR}/seance_gate"
+ORDER=$( rcorder "${MINDIR}"/* 2>/dev/null | sed -e "s|^${MINDIR}/||" | tr '\n' ' ' )
+t_unlike "${ORDER}" 'seance_gate.*cbsdd' \
+    "and without it rcorder puts it AFTER the daemon: a gate that gates nothing"
 
 t_done

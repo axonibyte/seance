@@ -165,6 +165,35 @@ promote_undo()
     printf '  undo: %s\n' "$*"
 }
 
+# promote_one_line  -- stdin, rendered as ONE line fit to put in a rung line.
+#
+# What a fence driver prints is advisory: its EXIT STATUS is the verdict
+# (D-44 item 2), and the text is interpolated into the rung line so that an
+# operator can see what the endpoint said. A driver that answers with two
+# hundred lines of chatter -- a web server's error page, a BMC's banner, a
+# stack trace -- would otherwise print two hundred lines of rung, into a
+# scrollback somebody is reading at 03:00 and into a log the tier-7 oracle
+# parses a verdict out of.
+#
+# The first line is kept because that is where a driver puts its answer; the
+# rest are COUNTED rather than dropped, so nothing disappears silently, and a
+# single very long line is cut at 200 characters with the cut marked. Empty
+# input stays empty: that is the contract violation the fence rung tests for,
+# and it must not be turned into a sentence here.
+promote_one_line()
+{
+    awk '
+        NR == 1 { _first = $0 }
+        END {
+            if (NR == 0) { exit }
+            _s = _first
+            if (length(_s) > 200) { _s = substr(_s, 1, 200) "[cut]" }
+            if (NR > 1) { _s = _s " (+" NR - 1 " more line(s) from the driver)" }
+            print _s
+        }
+    '
+}
+
 # promote_note <message...>  -- a per-guest line that is not a rung verdict.
 promote_note()
 {
@@ -840,7 +869,7 @@ promote_rung_fence()
         > "${_outf}" 2> "${_errf}" < /dev/null
     _rc=$?
 
-    _out=$( cat "${_outf}" )
+    _out=$( promote_one_line < "${_outf}" )
 
     [ -s "${_errf}" ] && sed -e 's/^/  fence: /' "${_errf}" >&2
 
@@ -1521,6 +1550,19 @@ promote_mount_ceremony()
 
         if ! zfs_mount "${_ds}"; then
             seance_log err "promote ${_guest}: cannot mount ${_ds} at ${_target}"
+            _rc=1
+            continue
+        fi
+
+        # AND IT IS ASKED AGAIN. `zfs mount` exiting 0 is not the same fact as
+        # the dataset being mounted, and the difference is the whole of this
+        # ceremony: what happens next is a registration and a start, so a
+        # dataset that is not there means a guest booted over an empty
+        # directory with its data sitting unmounted beside it. The
+        # empty-output-with-success class (TESTING.md §5), applied to a mount.
+        if ! zfs_mounted "${_ds}"; then
+            seance_log err "promote ${_guest}: zfs mount ${_ds} exited 0 and ${_ds} is" \
+                "still not mounted at ${_target}. Nothing has been registered or started."
             _rc=1
             continue
         fi

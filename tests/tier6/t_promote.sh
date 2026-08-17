@@ -52,7 +52,7 @@ if [ "$( id -u )" -ne 0 ]; then
     exit 2
 fi
 
-t_plan 49
+t_plan 59
 
 TAB=$( printf '\t.' )
 TAB=${TAB%.}
@@ -99,6 +99,106 @@ node_sh alpha 'mkdir -p /var/db/seance/sys/web01 &&
 
 t_rc 0 "a second tick, carrying the seeded configuration mirror" \
     -- estate_replicate
+
+# oracle_capture <dir> <live-node>...
+#
+# One observed state, in the format of invariants.subr's header. Every
+# mandatory file is created even when it is empty: a missing file is a contract
+# error there, deliberately, and this must not be the thing that hides one.
+oracle_capture()
+{
+    local _d _n _g _st _ds
+
+    _d=$1
+    shift
+
+    mkdir -p "${_d}" || return 1
+    : > "${_d}/running"
+    : > "${_d}/placement"
+    : > "${_d}/snapshots"
+    : > "${_d}/records"
+    : > "${_d}/props"
+    : > "${_d}/datasets"
+    : > "${_d}/invocations"
+
+    for _n in "$@"; do
+        _st=$( node_seance "${_n}" status --tsv 2>/dev/null ) || _st=""
+
+        printf '%s\n' "${_st}" |
+            awk -F "${TAB}" -v n="${_n}" \
+                '$1 == "guest" { print $2 "\t" n "\t" ($5 == "yes" ? 1 : 0) }' \
+            >> "${_d}/running"
+
+        printf '%s\n' "${_st}" |
+            awk -F "${TAB}" -v n="${_n}" \
+                '$1 == "guest" && $6 == "yes" { print n "\t" $2 "\theld" }' \
+            >> "${_d}/placement"
+
+        node_seance "${_n}" placement 2>/dev/null |
+            awk -F "${TAB}" -v n="${_n}" \
+                '$1 == "placement" { print n "\t" $2 "\tactive" }' \
+            >> "${_d}/placement"
+
+        cluster_exec "${_n}" cat /var/db/seance/succession.log < /dev/null 2>/dev/null |
+            awk -v n="${_n}" 'NF > 0 { print n "\t" $0 }' >> "${_d}/records"
+    done
+
+    # From the host: every dataset of the estate, and which node holds it.
+    zfs list -H -o name -r "${BASE_DS}" 2>/dev/null |
+        awk -F '/' -v b="${BASE_DS}" -v n=0 '
+            { n = split(b, p, "/"); if (NF > n) print $(n + 1) "\t" $0 }' \
+        >> "${_d}/datasets"
+
+    # And per (node, guest): the snapshots of that node's copy, and -- for the
+    # REPLICAS only -- the two properties invariant 4a reads.
+    #
+    # ONLY THE REPLICAS, and the reason is a gap in the invariant rather than a
+    # convenience here. Invariant 4a exempts the node the guest is placed on
+    # and calls every other copy a replica that must be unmountable. After a
+    # promotion the guest's HOME still holds the original, mounted where the
+    # platform put it -- alpha's own <base>/alpha/web01 reads
+    # mountpoint=/seance/web01 -- so a capture that offered it would fire 4a on
+    # every correct post-promotion state. The original is not a shadow mount;
+    # what stops the home starting it again is the boot gate (D-21), which is
+    # invariant 1's business and not 4a's. Written down in decisions.md for M3,
+    # whose world driver has to answer the same question.
+    for _n in alpha bravo charlie; do
+        for _g in web01 db01; do
+            if [ "${_n}" = alpha ]; then
+                _ds="${BASE_DS}/alpha/${_g}"
+            else
+                _ds=$( estate_replica_root "${_n}" alpha "${_g}" )
+            fi
+
+            zfs list -H -o name "${_ds}" > /dev/null 2>&1 || continue
+
+            zfs list -H -o name -t snapshot -r "${_ds}" 2>/dev/null |
+                awk -F '@' -v n="${_n}" -v g="${_g}" -v d="${_ds}" \
+                    'NF == 2 && $1 == d { print n "\t" g "\t" $2 }' \
+                >> "${_d}/snapshots"
+
+            [ "${_n}" = alpha ] && continue
+
+            printf '%s\t%s\tcanmount\t%s\n' "${_n}" "${_g}" \
+                "$( zfs get -H -o value canmount "${_ds}" 2>/dev/null )" \
+                >> "${_d}/props"
+            printf '%s\t%s\tmountpoint\t%s\n' "${_n}" "${_g}" \
+                "$( zfs get -H -o value mountpoint "${_ds}" 2>/dev/null )" \
+                >> "${_d}/props"
+        done
+    done
+
+    return 0
+}
+
+ORACLE_DIR=$( t_tmpdir )/oracle
+mkdir -p "${ORACLE_DIR}"
+
+# The tier-7 checker's "before" observation, taken while every node is alive --
+# it has to happen here, because after the next section alpha is a corpse and
+# its own placement and log can no longer be asked for.
+oracle_capture "${ORACLE_DIR}/pre" alpha bravo charlie ||
+    t_diag "capturing the state before the death failed"
 
 WEB_ON_BRAVO=$( estate_replica_root bravo alpha web01 )
 WEB_ON_CHARLIE=$( estate_replica_root charlie alpha web01 )
@@ -268,6 +368,108 @@ t_stdout_is "mirrored-rcconf" \
 
 t_is "$( nz bravo get -H -o value mountpoint "${SYS_ON_BRAVO}" )" "none" \
     "and putting it back leaves it mounted nowhere, as it was"
+
+
+# ---------------------------------------------------------------------------
+# The tier-7 checker's state-file contract, met by a real cluster
+#
+# tests/tier4/t_oracle_m2.sh feeds the invariants the records a real rung 6
+# writes, with the pool and the peers stood in for. This does the same thing
+# with none of it stood in for: the placement files, succession logs, snapshot
+# names, ZFS properties and dataset lists below are read off three real nodes
+# and the guest host's own pool, and handed to tests/cluster/sim/invariants.subr
+# in the format its header specifies.
+#
+# TWO states, before and after the death, so that invariants 3 and 4 -- the
+# transition ones -- have two real observations to compare rather than a model
+# nobody wrote. THE DATASETS ARE READ FROM THE HOST, which is the contract's own
+# instruction and the reason it gives: a node being dead is not a reason for its
+# datasets to stop existing, and an observer that could not see a stopped node's
+# datasets would turn invariant 4 into a check that fires on every kill.
+# ---------------------------------------------------------------------------
+
+oracle_capture "${ORACLE_DIR}/cur" bravo charlie ||
+    t_diag "capturing the state after the promotion failed"
+
+mkdir -p "${ORACLE_DIR}/model"
+printf 'alpha\tdead\nbravo\talive\ncharlie\talive\n' > "${ORACLE_DIR}/model/nodes"
+printf 'web01\talpha\ndb01\talpha\n' > "${ORACLE_DIR}/model/guests"
+: > "${ORACLE_DIR}/model/lineage"
+
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=../cluster/sim/invariants.subr
+. "${T_ROOT}/tests/cluster/sim/invariants.subr"
+
+oracle_check()
+{
+    INV_FIRED=0
+    inv_check_all "${ORACLE_DIR}/model" "$1" "${2:-}" \
+        > "${ORACLE_DIR}/inv.out" 2> "${ORACLE_DIR}/inv.err"
+    printf '%s\n' "$?"
+}
+
+MISSING=""
+for f in running placement snapshots records props datasets invocations; do
+    [ -f "${ORACLE_DIR}/cur/${f}" ] || MISSING="${MISSING} ${f}"
+done
+t_is "${MISSING}" "" "the capture wrote every file the state contract makes mandatory"
+
+t_rc 0 "and the placement it captured is bravo's own, with a claim in it" \
+    -- grep -q "^bravo	web01	active$" "${ORACLE_DIR}/cur/placement"
+t_rc 0 "and the records it captured are bravo's succession log" \
+    -- grep -q "^bravo	web01	alpha	bravo	" "${ORACLE_DIR}/cur/records"
+t_rc 0 "and it saw the DEAD node's datasets, from the host" \
+    -- grep -q "^alpha	${BASE_DS}/alpha/web01$" "${ORACLE_DIR}/cur/datasets"
+
+RC=$( oracle_check "${ORACLE_DIR}/cur" "${ORACLE_DIR}/pre" )
+if [ "${RC}" = "0" ]; then
+    t_ok "no invariant fires on a real cluster's real promotion"
+else
+    t_not_ok "no invariant fires on a real cluster's real promotion"
+    grep -E 'FIRED' "${ORACLE_DIR}/inv.out" | sed -e 's/^/# /'
+    sed -e 's/^/# stderr: /' "${ORACLE_DIR}/inv.err"
+fi
+t_is "$( cat "${ORACLE_DIR}/inv.err" )" "" \
+    "and the checker had nothing to say about the shape of what it was given"
+
+# And the negative controls, on copies of the REAL state -- which is the half a
+# hand-built fixture cannot do: an invariant that a real record was passing by
+# accident shows up here and nowhere else.
+oracle_break()
+{
+    rm -rf "${ORACLE_DIR}/bad"
+    cp -R "${ORACLE_DIR}/cur" "${ORACLE_DIR}/bad"
+}
+
+oracle_fires()
+{
+    local _rc
+
+    _rc=$( oracle_check "${ORACLE_DIR}/bad" "${ORACLE_DIR}/pre" )
+    if [ "${_rc}" = "1" ] && grep -q "^invariant $1 FIRED" "${ORACLE_DIR}/inv.out"; then
+        t_ok "$2"
+    else
+        t_not_ok "$2"
+        sed -e 's/^/# /' "${ORACLE_DIR}/inv.out"
+    fi
+}
+
+oracle_break
+printf 'charlie\tweb01\tactive\n' >> "${ORACLE_DIR}/bad/placement"
+oracle_fires 1 "a second node claiming web01 active fires invariant 1 on the real state"
+
+oracle_break
+: > "${ORACLE_DIR}/bad/records"
+oracle_fires 2 "the same state with the succession log emptied fires invariant 2"
+
+oracle_break
+grep -v "^alpha	" "${ORACLE_DIR}/cur/datasets" > "${ORACLE_DIR}/bad/datasets"
+oracle_fires 4 "and the dead node's datasets going missing fires invariant 4"
+
+oracle_break
+sed -e "s/^charlie	web01	canmount	noauto$/charlie	web01	canmount	on/" \
+    "${ORACLE_DIR}/cur/props" > "${ORACLE_DIR}/bad/props"
+oracle_fires 4a "a replica left able to mount itself fires invariant 4a"
 
 # ---------------------------------------------------------------------------
 # The direction reverses, with nothing configured to make it

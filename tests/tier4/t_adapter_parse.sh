@@ -43,7 +43,7 @@ rows()
     RRC=$?
 }
 
-t_plan 47
+t_plan 52
 
 # --- a listing of the shape CBSD prints --------------------------------------
 rows 'web01  jail   1  On
@@ -250,6 +250,9 @@ ADAPTER_READY=1
 ADAPTER_WORKDIR=/wd
 ADAPTER_JAILDATADIR=/wd/jails-data
 ADAPTER_JAILSYSDIR=/wd/jails-system
+# A real one, because the unregister rows below act on it.
+ADAPTER_JAILRCCONFDIR="${DIR}/jails-rcconf"
+mkdir -p "${ADAPTER_JAILRCCONFDIR}"
 
 # The fixture zfs answers the same way the real one does.
 t_is "$( zfs list -H -o name /wd/jails-data/web01-data )" "pool0/web01" \
@@ -324,6 +327,37 @@ t_stdout_is "" "adapter_guest_register prints nothing on stdout" \
 t_stdout_is "" "a refused start prints nothing on stdout either" \
     -- adapter_guest_start arc01
 t_rc 1 "and it is a refusal" -- adapter_guest_start arc01
+
+# --- unregistering does not leave a phantom guest behind ----------------------
+#
+# `cbsd junregister` dumps the row it is deleting into
+# ${jailrcconfdir}/rc.conf_<name> on its way out (sudoexec/junregister:128-146)
+# and nothing ever removes it, because `cbsd jregister` MOVES the file it reads
+# into ${jailsysdir}/<name>/ (sudoexec/jregister:215) and promote registers
+# from the replica's copy, never from that one. jls then prints a row for it
+# out of its unregistered area, outside every predicate (jailctl/jls:281-296) --
+# so one failback made this node say "skipping <g>: CBSD's database does not
+# know it" on every tick, every status and every gate, for ever. Observed on
+# the real node (tier 5, docs/cbsd-module-notes.md §8.8); the OLD02 row in the
+# jls fixture above is the same litter, left by an earlier round trip.
+: > "${ADAPTER_JAILRCCONFDIR}/rc.conf_web01"
+: > "${ADAPTER_JAILRCCONFDIR}/rc.conf_db01"
+t_stdout_is "" "adapter_guest_unregister still prints nothing on stdout" \
+    -- adapter_guest_unregister web01
+t_is "$( ls "${ADAPTER_JAILRCCONFDIR}" )" "rc.conf_db01" \
+    "the export junregister wrote is gone when the unregister returns, and only that guest's"
+
+t_rc 0 "an unregister with nothing left behind is still a success" \
+    -- adapter_guest_unregister web01
+
+# A removal that cannot happen is a failed unregister, not a quiet one: the
+# node is left listing a guest it does not have, and the caller has to hear it.
+mkdir -p "${ADAPTER_JAILRCCONFDIR}/rc.conf_arc01/inuse"
+t_rc 1 "an export that cannot be removed fails the unregister" \
+    -- adapter_guest_unregister arc01
+adapter_guest_unregister arc01 2> "${DIR}/unreg.err" > /dev/null
+t_like "$( cat "${DIR}/unreg.err" )" 'could not be removed' \
+    "and says so, naming the path, on stderr"
 
 # --- the paths the platform expects ------------------------------------------
 t_is "$( adapter_guest_mountpoint web01 jail )" "/wd/jails-data/web01-data" \

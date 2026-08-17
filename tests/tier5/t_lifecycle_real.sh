@@ -61,7 +61,7 @@ RCFILE="${SYSDIR}/rc.conf_${J}"
 POOL=$( zfs list -H -o name "${WD}/jails-data" )
 DATAPATH="${WD}/jails-data/${J}-data"
 
-t_plan 48
+t_plan 54
 
 # ---------------------------------------------------------------------------
 # Start, and what CBSD says about a guest that exists
@@ -142,29 +142,50 @@ t_rc 0 "and stops again" -- adapter_guest_stop "${J}"
 before_row=$( adapter_guest_list | awk -F '\t' -v j="${J}" '$1 == j' )
 before_rc=$( sha256 -q "${RCFILE}" )
 
-t_rc 0 "adapter_guest_unregister removes it from CBSD's database" \
-    -- adapter_guest_unregister "${J}"
+DUMP="${WD}/jails-rcconf/rc.conf_${J}"
 
-t_rc 1 "an unregistered guest is not a guest this node has" \
-    -- adapter_guest_type "${J}"
-t_rc 1 "and jstatus does not know it either" \
-    -- adapter_guest_running "${J}"
+# rows_for <guest>  -- how many rows CBSD's own listing prints for one guest.
+# Asked with the jname= predicate AND filtered here, because the point of
+# several assertions below is that the predicate does not reach every area of
+# the listing (jailctl/jls:281-296).
+rows_for()
+{
+    shapeb_cbsd jls header=0 display=jname,status jname="$1" |
+        awk -v j="$1" '$1 == j' | wc -l | tr -d ' '
+}
 
-t_is "$( adapter_guest_list | awk -F '\t' -v j="${J}" '$1 == j' )" "" \
-    "and it is not in the estate listing"
+# --- first, what CBSD does when nobody tidies up -----------------------------
+#
+# Run raw, so that the platform's behaviour is measured before seance's answer
+# to it. junregister --help: "rcfile= <path>, alternative path to source config
+# file, by default: ${workdir}/jails-rcconf/rc.conf_<env>", and
+# sudoexec/junregister:139 writes it with `jmkrcconf jname=<n> > ${JAILRCCONF}`
+# on its way out.
 
-t_is "$( sha256 -q "${RCFILE}" )" "${before_rc}" \
-    "junregister leaves \${jailsysdir}/<n>/rc.conf_<n> byte-identical"
+t_rc 0 "cbsd junregister, run raw, removes the guest from the database" \
+    -- shapeb_cbsd junregister jname="${J}"
 
-# WHERE CBSD PUTS ITS OWN DUMP, which is not where seance reads from.
-# junregister --help: "rcfile= <path>, alternative path to source config file,
-# by default: ${workdir}/jails-rcconf/rc.conf_<env>". Observed: that file is
-# created by the unregister and is NOT removed by the register that follows.
-if [ -f "${WD}/jails-rcconf/rc.conf_${J}" ]; then
+if [ -f "${DUMP}" ]; then
     t_ok "junregister dumped its own copy to \${workdir}/jails-rcconf/rc.conf_<n>"
 else
     t_not_ok "junregister dumped its own copy to \${workdir}/jails-rcconf/rc.conf_<n>"
 fi
+
+# THE PHANTOM, and it outlives the guest. jls walks ${jailrcconfdir} as an
+# "Unregister" area of its own (jailctl/jls:281-296), so the dump alone is
+# enough to keep the name in every listing.
+t_is "$( rows_for "${J}" )" "1" \
+    "and CBSD goes on listing the guest out of that dump alone"
+
+lst=$( t_tmpdir )
+adapter_guest_list > "${lst}/out" 2> "${lst}/err"
+t_like "$( cat "${lst}/err" )" "skipping ${J}" \
+    "so the estate listing has to skip it -- on stderr, on every single call"
+t_is "$( awk -F '\t' -v j="${J}" '$1 == j' "${lst}/out" )" "" \
+    "and the phantom is correctly kept OUT of the estate itself"
+
+t_is "$( sha256 -q "${RCFILE}" )" "${before_rc}" \
+    "junregister leaves \${jailsysdir}/<n>/rc.conf_<n> byte-identical"
 
 t_rc 1 "adapter_guest_register refuses an rcfile it cannot read" \
     -- adapter_guest_register "${J}" /nonexistent/rc.conf
@@ -174,24 +195,51 @@ t_rc 0 "adapter_guest_register brings it back from the sysdir's rcfile" \
 t_is "$( adapter_guest_list | awk -F '\t' -v j="${J}" '$1 == j' )" "${before_row}" \
     "and the guest is listed again with exactly the fields it had"
 
-# THE PHANTOM. jregister does not remove the dump junregister made, and jls
-# lists ${jailrcconfdir} as an "Unregister" area of its own (jailctl/jls:281-296)
-# -- so CBSD now prints TWO rows for one guest, and its jname= predicate does
-# not reach the second one. The adapter has to be right about this or an estate
+# jregister MOVES the file it was given into ${jailsysdir}/<n>/
+# (sudoexec/jregister:215) and never looks at the dump, so CBSD now prints TWO
+# rows for one guest. The adapter has to be right about this or an estate
 # listing gains a guest that does not exist.
-t_is "$( shapeb_cbsd jls header=0 display=jname,status jname="${J}" | wc -l |
-    tr -d ' ' )" "2" \
+t_is "$( rows_for "${J}" )" "2" \
     "CBSD lists the guest twice after the round trip: registered and Unregister"
 t_stdout_is "jail" "the adapter still answers about the registered one" \
     -- adapter_guest_type "${J}"
 t_rc 1 "and a question about another name is not answered with this row" \
     -- adapter_guest_type nosuchguest
 
-rm -f "${WD}/jails-rcconf/rc.conf_${J}"
-t_is "$( shapeb_cbsd jls header=0 display=jname,status jname="${J}" | wc -l |
-    tr -d ' ' )" "1" \
-    "removing the dump removes the phantom row"
+# --- and now the same round trip through seance ------------------------------
+#
+# This is what `seance failback-assist <g> unregister` runs on the interim at
+# step 4 of a failback, and what promote prints as the undo of its own
+# registration (D-72). One failback used to leave the dump above behind for
+# ever; the adapter removes it in the same breath now, and nothing that
+# predated the call is touched -- the file it removes is the one this call
+# caused to be written.
 
+t_rc 0 "adapter_guest_unregister removes it from CBSD's database" \
+    -- adapter_guest_unregister "${J}"
+
+t_rc 1 "an unregistered guest is not a guest this node has" \
+    -- adapter_guest_type "${J}"
+t_rc 1 "and jstatus does not know it either" \
+    -- adapter_guest_running "${J}"
+
+if [ -e "${DUMP}" ]; then
+    t_not_ok "and the export junregister wrote is gone with it"
+    t_diag "still there: ${DUMP}"
+else
+    t_ok "and the export junregister wrote is gone with it"
+fi
+
+t_is "$( rows_for "${J}" )" "0" \
+    "so CBSD lists no row for the guest at all: no phantom to outlive it"
+
+lst2=$( t_tmpdir )
+adapter_guest_list > "${lst2}/out" 2> "${lst2}/err"
+t_unlike "$( cat "${lst2}/err" )" "${J}" \
+    "and the estate listing has nothing left to say about it, tick after tick"
+
+t_rc 0 "the jail registers again from the sysdir's rcfile" \
+    -- adapter_guest_register "${J}" "${RCFILE}"
 t_rc 0 "a re-registered jail starts" -- adapter_guest_start "${J}"
 t_stdout_is "1" "and runs" -- adapter_guest_running "${J}"
 t_rc 0 "and stops" -- adapter_guest_stop "${J}"
