@@ -92,6 +92,14 @@ ${H3_COLOR}Options${N0_COLOR}:
              ssh user on every node;
    config  - print the effective configuration and its verdict;
              'config --check' validates and lists every problem;
+   setup   - an interactive (bsddialog) or headless editor for the config
+             file. It only ever writes the target file -- never the system
+             -- and runs 'config --check' on the result before writing;
+             '--non-interactive' with '--set key=value' (repeatable) or
+             '--answers <file>' is every screen's non-interactive twin;
+             '--from <file>' seeds the walkthrough from an existing file;
+             '--dump-answers <file>' records what was answered so it can be
+             replayed with '--answers';
    version - print the seance version;
    help    - print dispatcher usage;
 
@@ -125,6 +133,9 @@ ${H3_COLOR}Examples${N0_COLOR}:
  # cbsd seance config
  # cbsd seance config --check
  # cbsd seance config --file /path/to/seance.conf
+ # cbsd seance setup
+ # cbsd seance setup --non-interactive --set cadence=600 --out /tmp/seance.conf
+ # cbsd seance setup --non-interactive --from /path/to/seance.conf --allow-invalid
  # cbsd seance help
 
 "

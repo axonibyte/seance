@@ -10,4 +10,10 @@ The two guards exist from M0 because handoff §0.4 puts the tenant guard among
 the first tests written, and because a guard added after the code it guards is
 a guard written to the code's shape.
 
+Since M5, t_setup_bsddialog_coverage.sh: the same source-as-data idiom, aimed
+at `lib/setup.subr` -- every `bsddialog` call site is tagged with the answer
+key it sets, so a screen the wizard can show but `--set`/`--answers` cannot
+reach is caught here rather than discovered the first time someone tries to
+script `seance setup`.
+
 Files named t_*.sh are tests; anything else here is ignored.

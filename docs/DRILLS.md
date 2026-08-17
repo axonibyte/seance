@@ -16,10 +16,13 @@ checkable claim rather than a recollection.
 | drill-guest | M2 | **documented below; fleet execution pending** |
 | drill-failback | M2 | **the second half of drill-guest; runnable alone** |
 | drill-node | M3 | **documented below; fleet execution pending** |
-| drill-fence | M4 | not yet written (M4) |
+| drill-fence | M4 | **documented below; the driver it fences with (`drivers/fence_ipmi`) ships at M4 — fleet execution pending both** |
 
-The M4 drill is deliberately absent: a drill for a verb that does not exist is
-a procedure nobody can follow, and scope fences are hard (charter §7).
+Config keys `node_<key>_fence_driver` and `node_<key>_fence_target` are
+already parsed, shape-checked and exercised against the mock/jail drivers from
+M2 onward (`tests/tier4/t_fence_contract.sh`) — what M4 adds is the one real
+driver these config keys are for, `drivers/fence_ipmi`, and the credentials it
+reads from `docs/fence-drivers.md`'s file, never from `seance.conf` itself.
 
 ---
 
@@ -464,7 +467,10 @@ relationship with it and not the estate.
 - A fence driver is configured for the victim and `drill-fence` has passed, or
   the operator accepts that rung 4 will stop at notify and the drill will
   measure detection only. **Say which before starting**; a drill whose scope
-  was decided afterwards measures whatever happened.
+  was decided afterwards measures whatever happened. If a driver IS armed,
+  `docs/fence-drivers.md` is what names its credentials file and what its
+  `off`/`status` actions are contracted to do — read it before this drill,
+  not during it.
 - Somebody is at the machine, or at the PDU, or at the BMC. The power goes off
   by hand.
 - A stopwatch. This drill's output is a number.
@@ -629,3 +635,160 @@ about the debounce and not about seance.
 - **T0→T6 misses five minutes** — read the timing table for which interval
   swallowed it. A slow fence and a slow guest boot are different findings and
   only one of them is seance's.
+
+---
+
+## drill-fence (gates M4)
+
+**What it proves.** That the real fence driver — `drivers/fence_ipmi` against
+a real iDRAC/BMC, credentials and endpoint named in `docs/fence-drivers.md` —
+powers a target off and VERIFIES it off inside `fence_timeout`
+(`etc/seance.conf.sample`, default 60s), and that `seance promote`'s rung 4
+(`promote_rung_fence` in `lib/promote.subr`) reads that result correctly.
+Rung 4 is the rung the whole ladder's split-brain guarantee rests on
+(design §7): "command accepted" is not "off", and this is the drill that
+proves the driver knows the difference before it is ever asked to know it
+about a node that might answer back.
+
+**What it must not do.** This drill fences a node that is **powered on and
+idle**, not a dead one — proving the fence path is this drill's whole job,
+proving a real failover is `drill-node`'s. No guest here is administratively
+at risk the way `drill-guest`'s is, but the target node itself goes dark for
+real: schedule the window like a real outage, because for `fence_timeout`
+seconds and however long it takes to power it back on, it is one.
+
+**Preconditions.**
+
+- `docs/fence-drivers.md` has been read for the driver under test — where its
+  credentials live (never in `seance.conf` itself: `node_<key>_fence_driver`
+  and `node_<key>_fence_target` name the driver and an entry, and the entry's
+  host, user and passfile live in the driver's own lookup file), and what
+  `off` and `status` are contracted to do (handoff §2.4): `off` exits 0 only
+  on VERIFIED off, bounded by `fence_timeout`; `status` distinguishes off
+  (exit 0), on (exit 1) and cannot-determine (exit 2).
+- `seance config --check` passes with the target's `fence_driver` and
+  `fence_target` set — shape-checked already by `_conf_check_node`
+  (`lib/conf.subr`) before this drill ever touches the network.
+- The driver executable is where `promote_fence_exe` (`lib/promote.subr`)
+  looks: `drivers/fence_<driver>` in the module directory, or on `PATH`.
+- The target is reachable, powered on, and doing nothing that matters for the
+  drill's duration.
+- A second way to power the target back on that does **not** depend on the
+  fence driver working — console access, a PDU, a second admin. A drill that
+  can only recover through the thing it is testing is not a drill.
+
+### Steps
+
+1. **Read status first, by hand, before seance touches anything.**
+
+   ```sh
+   drivers/fence_ipmi status <target>
+   ```
+
+   Exit 1 (ON) is the expected precondition. Exit 0 (already off) means
+   somebody got there first and this drill would measure the wrong thing —
+   stop and find out who. Exit 2 (cannot determine) means fix that before
+   anything else: a driver that cannot determine status now will not suddenly
+   manage it during a real death.
+
+2. **Fence it, timed.**
+
+   ```sh
+   time drivers/fence_ipmi off <target>
+   ```
+
+   Record the wall-clock time and the exit code. `off` exits 0 **only** on
+   verified off; record what it printed either way. Compare the elapsed time
+   against the configured `fence_timeout` — a driver that verifies but takes
+   longer than the timeout is a driver `promote`'s own rung 4 will read as
+   CANNOT DETERMINE on a real run, which is a finding worth having now rather
+   than mid-outage.
+
+3. **Confirm from a second source.** Whatever `status` you would trust that
+   is not the driver itself — console, PDU, physically being in the room —
+   and the driver's own `status` again:
+
+   ```sh
+   drivers/fence_ipmi status <target>
+   ```
+
+   Both must agree: OFF. A disagreement here outranks everything else in this
+   drill — see "what a failure means" below.
+
+4. **Drive it through the ladder, not just the driver.** On a survivor, with
+   the target still off, decide BEFORE running this whether the target's
+   guests are ones this drill is prepared to move — the ladder does not pause
+   for confirmation once started:
+
+   ```sh
+   seance promote <target> --guest <guest>
+   ```
+
+   Rung 3 (probes) should report no answer from the target; rung 4 (fence)
+   should PASS, naming the driver, and the promotion should proceed on the
+   real path `promote_rung_fence` takes — not the mock's. Read every rung
+   line, the way `drill-guest` does.
+
+5. **Power the target back on**, by the recovery path from the preconditions,
+   never by asking the fence driver to reverse itself. No driver in this
+   contract has an `on` action, and that is deliberate (handoff §2.4): a fence
+   driver that could also power a node ON would be a second way to create the
+   exact split brain fencing exists to prevent.
+
+6. **Verify the fleet again.**
+
+   ```sh
+   seance verify
+   seance status
+   ```
+
+   Both must exit 0 once the target is back and gated
+   (`docs/RUNBOOK-failback.md`), and once whatever `promote` moved in step 4
+   has been failed back.
+
+### Timing
+
+| Step | What is being timed | Target | Record |
+| --- | --- | --- | --- |
+| 1 | `status` before touching anything | < 10 s | elapsed |
+| 2 | `off`, start to verified | < the configured `fence_timeout` | elapsed, and `fence_timeout` itself |
+| 3 | the second-source confirmation | operator's call | elapsed |
+| 4 | `seance promote` through rung 4 | < 90 s | elapsed, and which rung it reached |
+| 6 | `verify` + `status` once the target is back | < 60 s | elapsed |
+
+A step that overruns its target is the number the next drill is compared
+against, except step 2: an `off` that verifies past `fence_timeout` is not a
+slow drill, it is a driver that will read as CANNOT DETERMINE on a real
+promotion, and the finding is the timeout or the network path, not the drill.
+
+### Evidence a passing drill leaves
+
+- the driver's own `status` output, before and after, alongside the
+  second-source confirmation that agrees with it;
+- `off`'s wall-clock time against the configured `fence_timeout`;
+- the `seance promote` rung lines through rung 4, whole and unedited;
+- `verify` and `status` output from before the drill and after recovery, both
+  exit 0;
+- the `seance version` of the node the drill was run from, so a later drill
+  compares against the code this one ran.
+
+### What a failure means
+
+- **`off` exits 0 but the second source disagrees** — the driver is lying
+  about verification, which is worse than a driver that times out: rung 4
+  would PASS a promotion the fence never actually delivered. Stop using this
+  driver until this is understood; nothing else in this file matters until it
+  is, and no other row in this table outranks it.
+- **`off` never returns inside `fence_timeout`** — a real `promote` run
+  against this node reads this as CANNOT DETERMINE and stops at notify, not
+  FAIL; that is correct fail-safe behaviour, but a fleet that expects
+  automatic fencing here has an arrangement that does not match reality. Fix
+  the timeout or the network path before arming `auto` anywhere that depends
+  on it.
+- **Rung 3 (probes) reports the target answering** while the driver says
+  OFF — believe the probe, not the driver, and investigate before running
+  this drill again.
+- **Rung 4 reports REFUSED or STILL ON** — the ladder did exactly what it
+  should. This is not a drill failure; it is the drill working, and the
+  question becomes why the driver's own `off` disagreed with `promote`'s own
+  check moments later.

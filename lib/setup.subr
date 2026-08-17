@@ -1,0 +1,1121 @@
+# seance -- `setup`: an interactive editor for the config file, and its
+# headless twin.
+#
+# Sourced, never executed. Design §14: "the file is the store, the TUI is an
+# editor." This file NEVER touches the system -- no adapter, no cbsd, no zfs.
+# It gathers answers (from bsddialog, from --set, from an existing file) into
+# one buffer, then always writes through the SAME renderer, so the interactive
+# path and `--non-interactive` cannot drift from each other -- there is only
+# one place that turns answers into a config file.
+#
+#   seance setup [--non-interactive] [--set key=value]... [--out <file>]
+#                [--from <file>] [--answers <file>] [--dump-answers <file>]
+#                [--allow-invalid]
+#
+# --from <file> and --answers <file> both SEED the buffer from an existing
+# key=value file (conf_load does the reading, so a bad file is refused exactly
+# as `seance config` would refuse it). They are the same primitive under two
+# names because the INTENT differs and the mechanism does not: --from points
+# at a real deployed configuration to edit or replay; --answers points at a
+# file `--dump-answers` produced. Given both, --answers is applied second and
+# so wins on any key both name.
+#
+# `--set key=value` may repeat and is applied LAST, after any seeding and
+# after the wizard (if one ran) -- an explicit flag on the command line always
+# has the last word, which is what makes `--non-interactive --set k=v ...`
+# usable as a scripted override on top of `--from` without needing the wizard
+# at all.
+#
+# Interactive screens ask ONE datum at a time (never bsddialog --form) on
+# purpose: `--form`'s field separator in its printed output is documented as
+# "default white space" (bsddialog(1)), and several of this project's own
+# values legitimately CONTAIN a space (`ssh_extra_opts`, `notify_cmd`). One
+# inputbox per field never has to parse its own output apart.
+#
+# WHAT SETUP DOES, IN ORDER: it only ever writes the file (default
+# ${SEANCE_CONF} or ${SEANCE_CBSD_WORKDIR}/etc/seance.conf, per D-3, or --out).
+# It runs `conf_check` on the result and refuses to write a configuration that
+# fails it, unless --allow-invalid says otherwise. If the target already
+# exists it is backed up first, and the backup path is the undo -- every
+# destructive path prints its undo (charter §8).
+#
+# THE ANSWER-KEY VOCABULARY IS THE CONFIG-KEY VOCABULARY. Every question this
+# file can ask writes into exactly the key `seance.conf` would carry for it
+# (`cadence`, `node_<n>_mgmt`, `guest_<g>_heir`, ...), so an --answers file is
+# valid seance.conf grammar and nothing here invents a second vocabulary to
+# keep in sync with the first. Two exceptions, both structural rather than
+# configuration: the inputbox that decides WHICH node or guest key a following
+# block of questions is about does not itself set a config key -- see
+# setup_ask_node_select / setup_ask_guest_select.
+#
+# TAGGING, for tests/tier3/t_setup_bsddialog_coverage.sh (source-as-data, like
+# every other tier-3 guard: it greps this file as text, on purpose, so that a
+# clever call site is exactly what it cannot be reasoned around). EVERY
+# `bsddialog --stdout` invocation is immediately preceded -- the line right
+# above it, nothing between -- by ONE of:
+#
+#   # setup-answer: <key> [<key> ...]
+#       This call site's answer becomes exactly this config key (bare for a
+#       fleet key, `node:<field>` for a per-node field, `guest:<field>` for a
+#       per-guest field), or one of the structural names `node-select`,
+#       `guest-select`, `names`.
+#   # setup-nodata: <why>
+#       This call site stores nothing -- an orientation screen, a "continue?"
+#       confirmation, a read-only preview. The guard still requires the tag;
+#       an untagged call site is what it exists to catch, not merely an
+#       untagged DATA call site.
+#
+# NOT SMOKE-TESTED. bsddialog needs a real terminal; there is no `script(1)`
+# harness for it here (handoff's own words: "No"). What tier 1 exercises is
+# the headless path, which is the SAME renderer the wizard feeds -- see
+# setup_write and setup_render_canonical.
+#
+# shellcheck shell=sh
+# shellcheck disable=SC3043
+#   'local' is not in POSIX sh but is implemented by FreeBSD /bin/sh (sh(1),
+#   "local"); seance targets FreeBSD sh and nothing else (handoff §5).
+
+# The answer buffer: same shape and same idiom as lib/conf.subr's CONF_DATA
+# (newline-prefixed "key=value" records), deliberately NOT reusing CONF_DATA
+# itself -- conf.subr stays a pure parser with no mutation API (handoff: "if
+# the TUI needs a config helper, add it to lib/setup.subr only").
+SETUP_NL='
+'
+SETUP_DATA=""
+
+# The command-line surface, set by bin/seance's seance_setup() before it calls
+# setup_run. Defaulted here too, defensively, under 'set -u'.
+SETUP_SETS=""
+SETUP_NONINTERACTIVE=0
+SETUP_OUT=""
+SETUP_FROM=""
+SETUP_ANSWERS_FILE=""
+SETUP_DUMP_ANSWERS=""
+SETUP_ALLOW_INVALID=0
+
+# ---------------------------------------------------------------------------
+# The answer buffer
+# ---------------------------------------------------------------------------
+
+# setup_has <key>
+setup_has()
+{
+    case "${SETUP_DATA}" in
+        *"${SETUP_NL}$1="*) return 0 ;;
+    esac
+
+    return 1
+}
+
+# setup_get <key> [default]
+setup_get()
+{
+    local _rest
+
+    case "${SETUP_DATA}" in
+        *"${SETUP_NL}$1="*)
+            _rest=${SETUP_DATA#*"${SETUP_NL}$1="}
+            printf '%s\n' "${_rest%%"${SETUP_NL}"*}"
+            return 0
+            ;;
+    esac
+
+    if [ $# -ge 2 ]; then
+        printf '%s\n' "$2"
+        return 0
+    fi
+
+    return 1
+}
+
+# setup_unset <key>  -- remove the key if present. Always rc 0.
+setup_unset()
+{
+    local _needle _pre _post
+
+    _needle="${SETUP_NL}$1="
+
+    case "${SETUP_DATA}" in
+        *"${_needle}"*) ;;
+        *) return 0 ;;
+    esac
+
+    _pre=${SETUP_DATA%%"${_needle}"*}
+    _post=${SETUP_DATA#*"${_needle}"}
+
+    case "${_post}" in
+        *"${SETUP_NL}"*)
+            _post=${_post#*"${SETUP_NL}"}
+            _post="${SETUP_NL}${_post}"
+            ;;
+        *) _post="" ;;
+    esac
+
+    SETUP_DATA="${_pre}${_post}"
+}
+
+# setup_set <key> <value>  -- overwrite-or-append; last write wins.
+setup_set()
+{
+    setup_unset "$1"
+    SETUP_DATA="${SETUP_DATA}${SETUP_NL}$1=$2"
+}
+
+# setup_dump_raw  -- every record, one "key=value" per line, insertion order.
+# Insertion order is not incidental: setup_seed_from_file and the wizard both
+# insert fleet keys and each node/guest's fields in the SAME order
+# conf_load/conf_dump would report them, so this text is already close to
+# canonical before setup_render_canonical imposes it exactly (see there).
+setup_dump_raw()
+{
+    local _rest _line
+
+    [ -n "${SETUP_DATA}" ] || return 0
+
+    _rest=${SETUP_DATA#"${SETUP_NL}"}
+
+    while :; do
+        case "${_rest}" in
+            *"${SETUP_NL}"*)
+                _line=${_rest%%"${SETUP_NL}"*}
+                _rest=${_rest#*"${SETUP_NL}"}
+                ;;
+            *)
+                _line=${_rest}
+                _rest=""
+                ;;
+        esac
+
+        printf '%s\n' "${_line}"
+        [ -n "${_rest}" ] || break
+    done
+
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# Seeding: --from and --answers
+# ---------------------------------------------------------------------------
+
+# setup_seed_from_file <path>
+#
+# Load <path> as a configuration file (conf_load, exactly what `seance config`
+# would do to it -- a seed file that config would refuse is refused here too)
+# and copy every key it actually SET, and only those, into the answer buffer.
+# Never a default, a derivation or a runtime value: setup only ever repeats
+# back what a human or a previous run actually wrote.
+setup_seed_from_file()
+{
+    local _file _k _n _g
+
+    _file=$1
+
+    conf_load "${_file}" ||
+        seance_die 2 "setup: ${_file} does not parse as a configuration file" \
+            "(run 'seance config --file ${_file}' for the parse error)"
+
+    for _k in ${CONF_FLEET_KEYS}; do
+        conf_has "${_k}" && setup_set "${_k}" "$( conf_get "${_k}" "" )"
+    done
+
+    # shellcheck disable=SC2086
+    #   Deliberate word splitting: node keys are [a-z0-9]+ by conf_classify.
+    set -- ${CONF_NODE_ORDER}
+    for _n in "$@"; do
+        for _k in ${CONF_NODE_KEYS}; do
+            conf_has "node_${_n}_${_k}" &&
+                setup_set "node_${_n}_${_k}" "$( conf_get "node_${_n}_${_k}" "" )"
+        done
+    done
+
+    # shellcheck disable=SC2086
+    #   Deliberate word splitting: guest keys are [a-z0-9]+ by conf_classify.
+    set -- ${CONF_GUEST_ORDER}
+    for _g in "$@"; do
+        for _k in ${CONF_GUEST_KEYS}; do
+            conf_has "guest_${_g}_${_k}" &&
+                setup_set "guest_${_g}_${_k}" "$( conf_get "guest_${_g}_${_k}" "" )"
+        done
+    done
+
+    # shellcheck disable=SC2086
+    #   Deliberate word splitting: display-name keys are [a-z0-9]+.
+    set -- ${CONF_NAME_ORDER}
+    for _n in "$@"; do
+        setup_set "names_${_n}" "$( conf_get "names_${_n}" "" )"
+    done
+
+    return 0
+}
+
+# setup_apply_sets
+#
+# Fold every --set key=value into the buffer, last one written wins (which
+# also means the CLI, not the file grammar, decides what a repeated --set of
+# the same key means -- conf_load refuses a duplicate key; --set does not,
+# because it is an override interface and refusing a correction would defeat
+# the point of one).
+setup_apply_sets()
+{
+    local _rest _rec _k _v
+
+    [ -n "${SETUP_SETS}" ] || return 0
+
+    _rest=${SETUP_SETS#"${SETUP_NL}"}
+
+    while :; do
+        case "${_rest}" in
+            *"${SETUP_NL}"*)
+                _rec=${_rest%%"${SETUP_NL}"*}
+                _rest=${_rest#*"${SETUP_NL}"}
+                ;;
+            *)
+                _rec=${_rest}
+                _rest=""
+                ;;
+        esac
+
+        case "${_rec}" in
+            *=*) ;;
+            *) seance_die 2 "setup: --set \"${_rec}\" is not key=value" ;;
+        esac
+
+        _k=${_rec%%=*}
+        _v=${_rec#*=}
+
+        case "${_k}" in
+            ''|*[!abcdefghijklmnopqrstuvwxyz0123456789_]*)
+                seance_die 2 "setup: --set \"${_k}\": keys are [a-z0-9_]+"
+                ;;
+        esac
+
+        setup_set "${_k}" "${_v}"
+
+        [ -n "${_rest}" ] || break
+    done
+
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# Rendering: the ONE function that turns answers into a config file
+# ---------------------------------------------------------------------------
+
+# setup_render_canonical
+#
+# Print exactly the keys that are SET -- never a default, a derivation or a
+# runtime value -- in the same order conf_dump reports them: CONF_FLEET_KEYS
+# order for the fleet section, then display names, then each node in
+# CONF_NODE_ORDER with its fields in CONF_NODE_KEYS order, then each guest the
+# same way. Must be called with CONF_DATA already loaded (conf_load) from
+# setup_dump_raw's own output -- see setup_write.
+#
+# This is the config helper the handoff brief allows: it lives here and not in
+# lib/conf.subr, which stays a pure parser with no writer.
+setup_render_canonical()
+{
+    local _k _n _g
+
+    for _k in ${CONF_FLEET_KEYS}; do
+        conf_has "${_k}" && printf '%s=%s\n' "${_k}" "$( conf_get "${_k}" "" )"
+    done
+
+    # shellcheck disable=SC2086
+    #   Deliberate word splitting: display-name keys are [a-z0-9]+.
+    set -- ${CONF_NAME_ORDER}
+    for _n in "$@"; do
+        printf 'names_%s=%s\n' "${_n}" "$( conf_get "names_${_n}" "" )"
+    done
+
+    # shellcheck disable=SC2086
+    #   Deliberate word splitting: node keys are [a-z0-9]+ by conf_classify.
+    set -- ${CONF_NODE_ORDER}
+    for _n in "$@"; do
+        for _k in ${CONF_NODE_KEYS}; do
+            conf_has "node_${_n}_${_k}" &&
+                printf 'node_%s_%s=%s\n' "${_n}" "${_k}" \
+                    "$( conf_get "node_${_n}_${_k}" "" )"
+        done
+    done
+
+    # shellcheck disable=SC2086
+    #   Deliberate word splitting: guest keys are [a-z0-9]+ by conf_classify.
+    set -- ${CONF_GUEST_ORDER}
+    for _g in "$@"; do
+        for _k in ${CONF_GUEST_KEYS}; do
+            conf_has "guest_${_g}_${_k}" &&
+                printf 'guest_%s_%s=%s\n' "${_g}" "${_k}" \
+                    "$( conf_get "guest_${_g}_${_k}" "" )"
+        done
+    done
+
+    return 0
+}
+
+# setup_write [<target>]
+#
+# Validate the buffer and write it. <target> defaults to seance_conf_path
+# (bin/seance): $SEANCE_CONF, else $SEANCE_CBSD_WORKDIR/etc/seance.conf.
+#
+#   rc 0  written -- valid, or invalid and --allow-invalid said to anyway
+#   rc 1  refused: conf_check failed and --allow-invalid was not given
+#   rc 2  the buffer itself does not parse (a contract error in setup unless
+#         it was caused by a hand-edited --answers or --from file, which
+#         setup_seed_from_file would already have refused on its own)
+setup_write()
+{
+    local _target _seed _problems _rc _ts _bak
+
+    _target=${1:-}
+    if [ -z "${_target}" ]; then
+        _target=$( seance_conf_path ) ||
+            seance_die 2 "setup: no target: pass --out, set SEANCE_CONF, or run under CBSD"
+    fi
+
+    _seed=$( seance_tmpdir )/answers.conf
+    setup_dump_raw > "${_seed}"
+
+    conf_load "${_seed}" ||
+        seance_die 2 "setup: the collected answers do not parse as a configuration" \
+            "(this is a contract error in setup itself unless it was caused by" \
+            "a hand-edited --answers or --from file)"
+
+    _problems=$( conf_check )
+    _rc=$?
+
+    if [ "${_rc}" -ne 0 ]; then
+        printf '%s\n' "${_problems}"
+        printf 'setup: refusing to write an invalid configuration to %s\n' "${_target}"
+
+        if [ "${SETUP_ALLOW_INVALID}" -ne 1 ]; then
+            printf 'setup: pass --allow-invalid to write it anyway\n'
+            return 1
+        fi
+
+        printf 'setup: --allow-invalid: writing it anyway\n'
+    fi
+
+    _ts=$( pol_epoch_to_ts "$( pol_now )" ) || _ts=unknown
+
+    if [ -e "${_target}" ]; then
+        _bak="${_target}.bak-${_ts}"
+        cp "${_target}" "${_bak}" ||
+            seance_die 1 "setup: cannot back up ${_target} to ${_bak}"
+        printf 'undo: mv "%s" "%s"\n' "${_bak}" "${_target}"
+    else
+        printf 'undo: rm "%s"\n' "${_target}"
+    fi
+
+    setup_render_canonical > "${_target}.new" ||
+        seance_die 1 "setup: cannot render ${_target}.new"
+    mv "${_target}.new" "${_target}" ||
+        seance_die 1 "setup: cannot install ${_target}"
+
+    if [ "${_rc}" -eq 0 ]; then
+        printf 'setup: wrote %s (PASS)\n' "${_target}"
+    else
+        printf 'setup: wrote %s (FAIL: invalid; written because --allow-invalid)\n' "${_target}"
+    fi
+
+    return 0
+}
+
+# setup_run  -- the whole verb, headless or interactive, reading the SETUP_*
+# globals bin/seance's seance_setup() set.
+setup_run()
+{
+    SETUP_DATA=""
+
+    [ -n "${SETUP_FROM}" ]         && setup_seed_from_file "${SETUP_FROM}"
+    [ -n "${SETUP_ANSWERS_FILE}" ] && setup_seed_from_file "${SETUP_ANSWERS_FILE}"
+
+    if [ "${SETUP_NONINTERACTIVE}" -ne 1 ]; then
+        setup_require_tty ||
+            seance_die 2 "setup: an interactive terminal is required;" \
+                "pass --non-interactive with --set and/or --answers to run headless"
+        seance_require_cmd bsddialog
+        setup_wizard || seance_die 1 "setup: cancelled; nothing was written"
+    fi
+
+    setup_apply_sets
+
+    [ -n "${SETUP_DUMP_ANSWERS}" ] && setup_dump_raw > "${SETUP_DUMP_ANSWERS}"
+
+    setup_write "${SETUP_OUT}"
+}
+
+# ---------------------------------------------------------------------------
+# The wizard
+# ---------------------------------------------------------------------------
+
+# setup_require_tty  -- rc 0 if stdin and stderr look like a real terminal.
+# bsddialog draws on the controlling terminal regardless of where --stdout
+# sends its data, so this is what a script that forgot --non-interactive would
+# otherwise hang inside.
+setup_require_tty()
+{
+    [ -t 0 ] && [ -t 2 ]
+}
+
+# setup_wizard  -- site, then fleet defaults, then nodes, then guests, then
+# review. Each screen's non-zero return (Cancel, No, ESC) aborts the whole
+# walkthrough; setup_run turns that into "cancelled; nothing was written".
+setup_wizard()
+{
+    setup_screen_welcome     || return $?
+    setup_screen_fleet_core  || return $?
+    setup_screen_fleet_ssh   || return $?
+    setup_screen_fleet_extra || return $?
+    setup_screen_fleet_carp  || return $?
+    setup_screen_nodes       || return $?
+    setup_screen_guests      || return $?
+    setup_screen_review       || return $?
+    return 0
+}
+
+setup_screen_welcome()
+{
+    # setup-nodata: an orientation screen; nothing here is stored, and
+    # declining it aborts before anything else is asked.
+    bsddialog --stdout --title "seance setup" --yesno \
+        "This walks through a seance configuration: fleet defaults, then each node, then any per-guest overrides, then a review before anything is written.\n\nEvery screen here has a --set equivalent (seance setup --help); this wizard only ever writes the target file. Continue?" \
+        0 0
+}
+
+# --- fleet: core cadence/retention/staleness/timing -------------------------
+
+setup_ask_cadence()
+{
+    local _v
+    # setup-answer: cadence
+    _v=$( bsddialog --stdout --title "Fleet defaults" --inputbox \
+        "cadence: how often 'seance repl' ticks, in seconds. Default $( conf_default cadence ) ; floor 60." \
+        0 0 "$( setup_get cadence "" )" ) || return $?
+    if [ -n "${_v}" ]; then
+        setup_set cadence "${_v}"
+    else
+        setup_unset cadence
+    fi
+}
+
+setup_ask_retention_recent()
+{
+    local _v
+    # setup-answer: retention_recent
+    _v=$( bsddialog --stdout --title "Fleet defaults" --inputbox \
+        "retention_recent: keep every snapshot younger than this, in seconds. Default $( conf_default retention_recent )." \
+        0 0 "$( setup_get retention_recent "" )" ) || return $?
+    if [ -n "${_v}" ]; then
+        setup_set retention_recent "${_v}"
+    else
+        setup_unset retention_recent
+    fi
+}
+
+setup_ask_retention_hourly()
+{
+    local _v
+    # setup-answer: retention_hourly
+    _v=$( bsddialog --stdout --title "Fleet defaults" --inputbox \
+        "retention_hourly: keep the newest snapshot of each UTC hour up to this age, in seconds; older is pruned. Default $( conf_default retention_hourly )." \
+        0 0 "$( setup_get retention_hourly "" )" ) || return $?
+    if [ -n "${_v}" ]; then
+        setup_set retention_hourly "${_v}"
+    else
+        setup_unset retention_hourly
+    fi
+}
+
+setup_ask_staleness_max()
+{
+    local _v
+    # setup-answer: staleness_max
+    _v=$( bsddialog --stdout --title "Fleet defaults" --inputbox \
+        "staleness_max: how old a replica may be before promotion demands --force, in seconds. Leave blank for 3x this guest's cadence." \
+        0 0 "$( setup_get staleness_max "" )" ) || return $?
+    if [ -n "${_v}" ]; then
+        setup_set staleness_max "${_v}"
+    else
+        setup_unset staleness_max
+    fi
+}
+
+setup_ask_skew_tolerance()
+{
+    local _v
+    # setup-answer: skew_tolerance
+    _v=$( bsddialog --stdout --title "Fleet defaults" --inputbox \
+        "skew_tolerance: how far a timestamp may sit in the future before it reads as clock skew rather than freshness, in seconds. Default $( conf_default skew_tolerance )." \
+        0 0 "$( setup_get skew_tolerance "" )" ) || return $?
+    if [ -n "${_v}" ]; then
+        setup_set skew_tolerance "${_v}"
+    else
+        setup_unset skew_tolerance
+    fi
+}
+
+setup_ask_debounce()
+{
+    local _v
+    # setup-answer: debounce
+    _v=$( bsddialog --stdout --title "Fleet defaults" --inputbox \
+        "debounce: how long an automatic promotion waits before re-checking the CARP transition that woke it, in seconds. Default $( conf_default debounce )." \
+        0 0 "$( setup_get debounce "" )" ) || return $?
+    if [ -n "${_v}" ]; then
+        setup_set debounce "${_v}"
+    else
+        setup_unset debounce
+    fi
+}
+
+setup_ask_fence_timeout()
+{
+    local _v
+    # setup-answer: fence_timeout
+    _v=$( bsddialog --stdout --title "Fleet defaults" --inputbox \
+        "fence_timeout: how long a fence driver has to prove a node is off, in seconds. Default $( conf_default fence_timeout )." \
+        0 0 "$( setup_get fence_timeout "" )" ) || return $?
+    if [ -n "${_v}" ]; then
+        setup_set fence_timeout "${_v}"
+    else
+        setup_unset fence_timeout
+    fi
+}
+
+setup_screen_fleet_core()
+{
+    setup_ask_cadence          || return $?
+    setup_ask_retention_recent || return $?
+    setup_ask_retention_hourly || return $?
+    setup_ask_staleness_max    || return $?
+    setup_ask_skew_tolerance   || return $?
+    setup_ask_debounce         || return $?
+    setup_ask_fence_timeout    || return $?
+    return 0
+}
+
+# --- fleet: ssh ---------------------------------------------------------
+
+setup_ask_ssh_user()
+{
+    local _v
+    # setup-answer: ssh_user
+    _v=$( bsddialog --stdout --title "Fleet defaults: ssh" --inputbox \
+        "ssh_user: the account seance uses node-to-node. Default $( conf_default ssh_user )." \
+        0 0 "$( setup_get ssh_user "" )" ) || return $?
+    if [ -n "${_v}" ]; then
+        setup_set ssh_user "${_v}"
+    else
+        setup_unset ssh_user
+    fi
+}
+
+setup_ask_ssh_port()
+{
+    local _v
+    # setup-answer: ssh_port
+    _v=$( bsddialog --stdout --title "Fleet defaults: ssh" --inputbox \
+        "ssh_port: the port ssh listens on, node-to-node. Default $( conf_default ssh_port ) (seance's default is 22 because that is ssh's port; a site that moved it says so here)." \
+        0 0 "$( setup_get ssh_port "" )" ) || return $?
+    if [ -n "${_v}" ]; then
+        setup_set ssh_port "${_v}"
+    else
+        setup_unset ssh_port
+    fi
+}
+
+setup_ask_ssh_extra_opts()
+{
+    local _v
+    # setup-answer: ssh_extra_opts
+    _v=$( bsddialog --stdout --title "Fleet defaults: ssh" --inputbox \
+        "ssh_extra_opts: extra options passed to every ssh and zfs send/recv transport, verbatim and unquoted (a jump host, a shorter ConnectTimeout). Leave blank for none." \
+        0 0 "$( setup_get ssh_extra_opts "" )" ) || return $?
+    if [ -n "${_v}" ]; then
+        setup_set ssh_extra_opts "${_v}"
+    else
+        setup_unset ssh_extra_opts
+    fi
+}
+
+setup_screen_fleet_ssh()
+{
+    setup_ask_ssh_user       || return $?
+    setup_ask_ssh_port       || return $?
+    setup_ask_ssh_extra_opts || return $?
+    return 0
+}
+
+# --- fleet: optional extras --------------------------------------------
+
+setup_ask_standby_root()
+{
+    local _v
+    # setup-answer: standby_root
+    _v=$( bsddialog --stdout --title "Fleet defaults: optional" --inputbox \
+        "standby_root: where replicas land, <pool>/<path>. Leave blank to let seance derive it from this node's own guest-data pool at run time -- which is why no pool name has to be written down here." \
+        0 0 "$( setup_get standby_root "" )" ) || return $?
+    if [ -n "${_v}" ]; then
+        setup_set standby_root "${_v}"
+    else
+        setup_unset standby_root
+    fi
+}
+
+setup_ask_notify_cmd()
+{
+    local _v
+    # setup-answer: notify_cmd
+    _v=$( bsddialog --stdout --title "Fleet defaults: optional" --inputbox \
+        "notify_cmd: a command run for every notification (subject as \$1, body on stdin). Leave blank for syslog only, which is the whole notification feature at this level." \
+        0 0 "$( setup_get notify_cmd "" )" ) || return $?
+    if [ -n "${_v}" ]; then
+        setup_set notify_cmd "${_v}"
+    else
+        setup_unset notify_cmd
+    fi
+}
+
+setup_ask_witness()
+{
+    local _v
+    # setup-answer: witness
+    _v=$( bsddialog --stdout --title "Fleet defaults: optional" --inputbox \
+        "witness: a tiebreaker host name for an even-N fleet. Documented, NOT implemented at v1 -- an even-N site still degrades to notify plus --force. Leave blank unless you know why you are filling this in." \
+        0 0 "$( setup_get witness "" )" ) || return $?
+    if [ -n "${_v}" ]; then
+        setup_set witness "${_v}"
+    else
+        setup_unset witness
+    fi
+}
+
+setup_screen_fleet_extra()
+{
+    setup_ask_standby_root || return $?
+    setup_ask_notify_cmd   || return $?
+    setup_ask_witness      || return $?
+    return 0
+}
+
+# --- fleet: CARP ---------------------------------------------------------
+
+setup_ask_carp_interface()
+{
+    local _v
+    # setup-answer: carp_interface
+    _v=$( bsddialog --stdout --title "Fleet defaults: CARP" --inputbox \
+        "carp_interface: the interface the CARP vhids run on. No default -- leave blank until at least one node carries a vhid." \
+        0 0 "$( setup_get carp_interface "" )" ) || return $?
+    if [ -n "${_v}" ]; then
+        setup_set carp_interface "${_v}"
+    else
+        setup_unset carp_interface
+    fi
+}
+
+setup_ask_carp_pass()
+{
+    local _v
+    # setup-answer: carp_pass
+    _v=$( bsddialog --stdout --title "Fleet defaults: CARP" --passwordbox \
+        "carp_pass: the CARP shared secret (carp(4) 'pass'), one word. Rendered into rc.conf, so the target file should end up mode 0600 -- 'seance verify' says so when it is not. Leave blank to re-use what is already configured; typing here replaces it." \
+        0 0 "" ) || return $?
+    if [ -n "${_v}" ]; then
+        setup_set carp_pass "${_v}"
+    fi
+
+    return 0
+}
+
+setup_ask_auto()
+{
+    local _rc
+    # setup-answer: auto
+    bsddialog --stdout --title "Fleet defaults: CARP" --yesno \
+        "Arm fleet-wide automatic promotion (the 'auto' key)? Each node ALSO needs its own auto_promote list; this is only the fleet-wide switch, and either one alone leaves the fleet notify-only." \
+        0 0
+    _rc=$?
+    case "${_rc}" in
+        0) setup_set auto 1 ;;
+        1) setup_set auto 0 ;;
+        *) return "${_rc}" ;;
+    esac
+    return 0
+}
+
+setup_screen_fleet_carp()
+{
+    setup_ask_carp_interface || return $?
+    setup_ask_carp_pass      || return $?
+    setup_ask_auto           || return $?
+    return 0
+}
+
+# --- nodes ----------------------------------------------------------------
+
+# setup_ask_node_select  -- prints a node key on stdout, or nothing to stop.
+# This does NOT set a config key -- it decides which node_<key>_* block the
+# following questions belong to, which is why the tier-3 guard's vocabulary
+# has a structural name for it instead of a fleet/node/guest key.
+setup_ask_node_select()
+{
+    local _v
+    # setup-answer: node-select
+    _v=$( bsddialog --stdout --title "Nodes" --inputbox \
+        "Node key (lowercase letters and digits only, e.g. alpha) -- this is what appears in snapshot names. Leave blank to stop adding nodes." \
+        0 0 "" ) || return $?
+    printf '%s\n' "${_v}"
+}
+
+setup_ask_node_nodename()
+{
+    local _n _v
+    _n=$1
+    # setup-answer: node:nodename
+    _v=$( bsddialog --stdout --title "Node ${_n}" --inputbox \
+        "node_${_n}_nodename: this node's CBSD node name (\${workdir}/nodename on that node). Required." \
+        0 0 "$( setup_get "node_${_n}_nodename" "" )" ) || return $?
+    if [ -n "${_v}" ]; then
+        setup_set "node_${_n}_nodename" "${_v}"
+    else
+        setup_unset "node_${_n}_nodename"
+    fi
+}
+
+setup_ask_node_mgmt()
+{
+    local _n _v
+    _n=$1
+    # setup-answer: node:mgmt
+    _v=$( bsddialog --stdout --title "Node ${_n}" --inputbox \
+        "node_${_n}_mgmt: the address peers reach ${_n} on. Required, and must belong to ${_n} alone -- quorum counts keys, and two keys sharing an address make one living host answer twice." \
+        0 0 "$( setup_get "node_${_n}_mgmt" "" )" ) || return $?
+    if [ -n "${_v}" ]; then
+        setup_set "node_${_n}_mgmt" "${_v}"
+    else
+        setup_unset "node_${_n}_mgmt"
+    fi
+}
+
+setup_ask_node_heir()
+{
+    local _n _v
+    _n=$1
+    # setup-answer: node:heir
+    _v=$( bsddialog --stdout --title "Node ${_n}" --inputbox \
+        "node_${_n}_heir: the node key that inherits ${_n}'s guests." \
+        0 0 "$( setup_get "node_${_n}_heir" "" )" ) || return $?
+    if [ -n "${_v}" ]; then
+        setup_set "node_${_n}_heir" "${_v}"
+    else
+        setup_unset "node_${_n}_heir"
+    fi
+}
+
+setup_ask_node_heir2()
+{
+    local _n _v
+    _n=$1
+    # setup-answer: node:heir2
+    _v=$( bsddialog --stdout --title "Node ${_n}" --inputbox \
+        "node_${_n}_heir2: the node key that inherits ${_n}'s guests if the first heir is itself unreachable." \
+        0 0 "$( setup_get "node_${_n}_heir2" "" )" ) || return $?
+    if [ -n "${_v}" ]; then
+        setup_set "node_${_n}_heir2" "${_v}"
+    else
+        setup_unset "node_${_n}_heir2"
+    fi
+}
+
+setup_ask_node_fence_driver()
+{
+    local _n _v
+    _n=$1
+    # setup-answer: node:fence_driver
+    _v=$( bsddialog --stdout --title "Node ${_n}: fencing (optional)" --inputbox \
+        "node_${_n}_fence_driver: the fence driver to use against ${_n} (e.g. ipmi). Leave blank until this node ships one; a missing driver means promotion stops at notify rather than fencing." \
+        0 0 "$( setup_get "node_${_n}_fence_driver" "" )" ) || return $?
+    if [ -n "${_v}" ]; then
+        setup_set "node_${_n}_fence_driver" "${_v}"
+    else
+        setup_unset "node_${_n}_fence_driver"
+    fi
+}
+
+setup_ask_node_fence_target()
+{
+    local _n _v
+    _n=$1
+    # setup-answer: node:fence_target
+    _v=$( bsddialog --stdout --title "Node ${_n}: fencing (optional)" --inputbox \
+        "node_${_n}_fence_target: the name of an entry the driver looks up (not an address) -- see docs/fence-drivers.md for what a driver expects here." \
+        0 0 "$( setup_get "node_${_n}_fence_target" "" )" ) || return $?
+    if [ -n "${_v}" ]; then
+        setup_set "node_${_n}_fence_target" "${_v}"
+    else
+        setup_unset "node_${_n}_fence_target"
+    fi
+}
+
+setup_ask_node_vhid()
+{
+    local _n _v
+    _n=$1
+    # setup-answer: node:vhid
+    _v=$( bsddialog --stdout --title "Node ${_n}: CARP (optional)" --inputbox \
+        "node_${_n}_vhid: the CARP virtual host ID standing for ${_n}'s identity, 1-255, unique across the fleet. Leave blank until CARP is arranged for ${_n}." \
+        0 0 "$( setup_get "node_${_n}_vhid" "" )" ) || return $?
+    if [ -n "${_v}" ]; then
+        setup_set "node_${_n}_vhid" "${_v}"
+    else
+        setup_unset "node_${_n}_vhid"
+    fi
+}
+
+setup_ask_node_vhid_ip()
+{
+    local _n _v
+    _n=$1
+    # setup-answer: node:vhid_ip
+    _v=$( bsddialog --stdout --title "Node ${_n}: CARP (optional)" --inputbox \
+        "node_${_n}_vhid_ip: the address that vhid carries, <dotted-quad>/<prefix-length> -- a heartbeat token, not a service address. Leave blank if vhid above is blank too." \
+        0 0 "$( setup_get "node_${_n}_vhid_ip" "" )" ) || return $?
+    if [ -n "${_v}" ]; then
+        setup_set "node_${_n}_vhid_ip" "${_v}"
+    else
+        setup_unset "node_${_n}_vhid_ip"
+    fi
+}
+
+setup_ask_node_auto_promote()
+{
+    local _n _v
+    _n=$1
+    # setup-answer: node:auto_promote
+    _v=$( bsddialog --stdout --title "Node ${_n}: CARP (optional)" --inputbox \
+        "node_${_n}_auto_promote: dead-node keys ${_n} may promote WITHOUT a human, space separated. Each must be a node whose heir or heir2 ${_n} is. Leave blank for notify-only." \
+        0 0 "$( setup_get "node_${_n}_auto_promote" "" )" ) || return $?
+    if [ -n "${_v}" ]; then
+        setup_set "node_${_n}_auto_promote" "${_v}"
+    else
+        setup_unset "node_${_n}_auto_promote"
+    fi
+}
+
+setup_ask_node_carp_interface()
+{
+    local _n _v
+    _n=$1
+    # setup-answer: node:carp_interface
+    _v=$( bsddialog --stdout --title "Node ${_n}: CARP (optional)" --inputbox \
+        "node_${_n}_carp_interface: overrides the fleet carp_interface for ${_n} alone. Leave blank unless ${_n} names its interface differently from the rest of the fleet." \
+        0 0 "$( setup_get "node_${_n}_carp_interface" "" )" ) || return $?
+    if [ -n "${_v}" ]; then
+        setup_set "node_${_n}_carp_interface" "${_v}"
+    else
+        setup_unset "node_${_n}_carp_interface"
+    fi
+}
+
+setup_ask_node_standby_root()
+{
+    local _n _v
+    _n=$1
+    # setup-answer: node:standby_root
+    _v=$( bsddialog --stdout --title "Node ${_n}: optional" --inputbox \
+        "node_${_n}_standby_root: overrides the fleet standby_root for replicas landing ON ${_n}. Leave blank to use the fleet setting." \
+        0 0 "$( setup_get "node_${_n}_standby_root" "" )" ) || return $?
+    if [ -n "${_v}" ]; then
+        setup_set "node_${_n}_standby_root" "${_v}"
+    else
+        setup_unset "node_${_n}_standby_root"
+    fi
+}
+
+# setup_ask_names <key>
+#
+# The display-name mapping (names_<key>), shared by nodes and guests: a node
+# or guest whose real name is not [a-z0-9]+ needs one, because the config key
+# itself must be dash-free.
+setup_ask_names()
+{
+    local _n _v
+    _n=$1
+    # setup-answer: names
+    _v=$( bsddialog --stdout --title "${_n}: display name (optional)" --inputbox \
+        "names_${_n}: display name for '${_n}', if its real name is not [a-z0-9]+. Leave blank if '${_n}' is already the real name." \
+        0 0 "$( setup_get "names_${_n}" "" )" ) || return $?
+    if [ -n "${_v}" ]; then
+        setup_set "names_${_n}" "${_v}"
+    else
+        setup_unset "names_${_n}"
+    fi
+}
+
+setup_screen_nodes()
+{
+    local _n _more
+
+    while :; do
+        _n=$( setup_ask_node_select ) || return $?
+        [ -n "${_n}" ] || break
+
+        setup_ask_node_nodename "${_n}"        || return $?
+        setup_ask_node_mgmt "${_n}"            || return $?
+        setup_ask_node_heir "${_n}"            || return $?
+        setup_ask_node_heir2 "${_n}"           || return $?
+        setup_ask_node_fence_driver "${_n}"    || return $?
+        setup_ask_node_fence_target "${_n}"    || return $?
+        setup_ask_node_vhid "${_n}"            || return $?
+        setup_ask_node_vhid_ip "${_n}"         || return $?
+        setup_ask_node_auto_promote "${_n}"    || return $?
+        setup_ask_node_carp_interface "${_n}"  || return $?
+        setup_ask_node_standby_root "${_n}"    || return $?
+        setup_ask_names "${_n}"                || return $?
+
+        # setup-nodata: flow control only -- loop back for another node, or
+        # move on to per-guest overrides.
+        bsddialog --stdout --title "Nodes" --yesno "Add another node?" 0 0
+        _more=$?
+        [ "${_more}" -eq 0 ] || break
+    done
+
+    return 0
+}
+
+# --- per-guest overrides ---------------------------------------------------
+
+# setup_ask_guest_select  -- same shape as setup_ask_node_select, for guests.
+setup_ask_guest_select()
+{
+    local _v
+    # setup-answer: guest-select
+    _v=$( bsddialog --stdout --title "Per-guest overrides" --inputbox \
+        "Guest key (lowercase letters and digits only, e.g. web01) whose defaults you want to override. Leave blank to stop." \
+        0 0 "" ) || return $?
+    printf '%s\n' "${_v}"
+}
+
+setup_ask_guest_cadence()
+{
+    local _g _v
+    _g=$1
+    # setup-answer: guest:cadence
+    _v=$( bsddialog --stdout --title "Guest ${_g}" --inputbox \
+        "guest_${_g}_cadence: overrides the fleet cadence for ${_g} alone, in seconds. Leave blank to inherit the fleet value." \
+        0 0 "$( setup_get "guest_${_g}_cadence" "" )" ) || return $?
+    if [ -n "${_v}" ]; then
+        setup_set "guest_${_g}_cadence" "${_v}"
+    else
+        setup_unset "guest_${_g}_cadence"
+    fi
+}
+
+setup_ask_guest_staleness_max()
+{
+    local _g _v
+    _g=$1
+    # setup-answer: guest:staleness_max
+    _v=$( bsddialog --stdout --title "Guest ${_g}" --inputbox \
+        "guest_${_g}_staleness_max: overrides staleness_max for ${_g} alone, in seconds. Leave blank to inherit (which for a guest means 3x ITS OWN cadence)." \
+        0 0 "$( setup_get "guest_${_g}_staleness_max" "" )" ) || return $?
+    if [ -n "${_v}" ]; then
+        setup_set "guest_${_g}_staleness_max" "${_v}"
+    else
+        setup_unset "guest_${_g}_staleness_max"
+    fi
+}
+
+setup_ask_guest_heir()
+{
+    local _g _v
+    _g=$1
+    # setup-answer: guest:heir
+    _v=$( bsddialog --stdout --title "Guest ${_g}" --inputbox \
+        "guest_${_g}_heir: replaces ${_g}'s succession ENTIRELY with this node key. Leave blank to inherit the home node's own heir." \
+        0 0 "$( setup_get "guest_${_g}_heir" "" )" ) || return $?
+    if [ -n "${_v}" ]; then
+        setup_set "guest_${_g}_heir" "${_v}"
+    else
+        setup_unset "guest_${_g}_heir"
+    fi
+}
+
+setup_ask_guest_heir2()
+{
+    local _g _v
+    _g=$1
+    # setup-answer: guest:heir2
+    _v=$( bsddialog --stdout --title "Guest ${_g}" --inputbox \
+        "guest_${_g}_heir2: ${_g}'s second heir. Only meaningful once guest_${_g}_heir above is set -- a second heir without a first is refused by 'seance config --check'." \
+        0 0 "$( setup_get "guest_${_g}_heir2" "" )" ) || return $?
+    if [ -n "${_v}" ]; then
+        setup_set "guest_${_g}_heir2" "${_v}"
+    else
+        setup_unset "guest_${_g}_heir2"
+    fi
+}
+
+setup_screen_guests()
+{
+    local _g _more
+
+    while :; do
+        _g=$( setup_ask_guest_select ) || return $?
+        [ -n "${_g}" ] || break
+
+        setup_ask_guest_cadence "${_g}"       || return $?
+        setup_ask_guest_staleness_max "${_g}" || return $?
+        setup_ask_guest_heir "${_g}"          || return $?
+        setup_ask_guest_heir2 "${_g}"         || return $?
+        setup_ask_names "${_g}"               || return $?
+
+        # setup-nodata: flow control only -- loop back for another guest, or
+        # move on to the review screen.
+        bsddialog --stdout --title "Per-guest overrides" \
+            --yesno "Add another guest override?" 0 0
+        _more=$?
+        [ "${_more}" -eq 0 ] || break
+    done
+
+    return 0
+}
+
+# --- review -----------------------------------------------------------
+
+# setup_screen_review  -- show conf_dump of what has been collected so far,
+# then the one confirmation that actually gates the write. Its own return
+# status is setup_wizard's, and therefore setup_run's: a No or Cancel here
+# aborts setup_run before setup_write is ever called.
+setup_screen_review()
+{
+    local _dir _seed _txt
+
+    _dir=$( seance_tmpdir )
+    _seed="${_dir}/answers.conf"
+    _txt="${_dir}/review.txt"
+
+    setup_dump_raw > "${_seed}"
+
+    if conf_load "${_seed}"; then
+        conf_dump > "${_txt}"
+        printf '\n' >> "${_txt}"
+        if conf_check >> "${_txt}"; then
+            :
+        fi
+    else
+        printf 'The collected answers do not parse. This is a defect in setup\n' \
+            > "${_txt}"
+        printf 'itself, unless it was caused by a hand-edited --answers file.\n' \
+            >> "${_txt}"
+    fi
+
+    # setup-nodata: a read-only preview of conf_dump plus conf_check's problem
+    # list, if any -- nothing here is stored, and closing it changes nothing.
+    bsddialog --stdout --title "Review" --textbox "${_txt}" 0 0
+
+    # setup-nodata: the confirmation that gates the write. This dialog's exit
+    # status is what setup_screen_review, setup_wizard and setup_run return.
+    bsddialog --stdout --title "Review" --yesno "Write this configuration?" 0 0
+}
