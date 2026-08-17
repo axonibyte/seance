@@ -39,3 +39,9 @@ ram_gb = 16
 [profiles.hunt]
 ttl = "6h"
 env = { SEANCE_HUNT = "1" }
+
+# The even-N profile. TESTING.md §2 makes the even-N freeze a boundary the
+# suite has to exercise, and tier 7's default fleet is three nodes; this is the
+# same battery against four, where a clean half-split is expressible.
+[profiles.evenn]
+env = { SEANCE_SIM_N = "4", SEANCE_TIERS = "7" }

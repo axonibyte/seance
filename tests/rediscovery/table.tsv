@@ -27,3 +27,9 @@ debounce-removed.patch	4	-	tests/tier4/t_ladder.sh
 debounce-removed.patch	6	flap	tests/tier6/t_flap.sh
 placement-unreadable-accepted.patch	4	-	tests/tier4/t_records.sh
 mount-not-verified.patch	4	-	tests/tier4/t_empty0_m2.sh
+verifier-masks-crash.patch	4	-	tests/tier4/t_ladder_lineage.sh
+verifier-masks-crash.patch	4	-	tests/tier4/t_ladder.sh
+promotion-without-fencing.patch	6	quorum	tests/tier6/t_quorum.sh
+promotion-without-fencing.patch	7	sim	tests/tier7/t_sim.sh
+quorum-rule-removed.patch	7	sim	tests/tier7/t_sim.sh
+boot-gate-removed.patch	7	sim	tests/tier7/t_sim.sh

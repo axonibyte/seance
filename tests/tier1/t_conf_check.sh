@@ -68,7 +68,7 @@ rule()
     t_like "${_out}" "${_want}" "${_name}"
 }
 
-t_plan 126
+t_plan 135
 
 # --- the positive control --------------------------------------------------
 
@@ -547,6 +547,91 @@ t_like "${out}" 'auto_promote names "delta", which is not a configured node' \
     "the bad word of a two-word auto_promote is named"
 t_unlike "${out}" 'auto_promote names "bravo"' \
     "and the good word beside it is not"
+
+# ---------------------------------------------------------------------------
+# The one WARNING conf_check has (D-130)
+#
+# A per-guest heir override is legal, a fleet with auto=1 is legal, and the
+# combination is legal -- and it means a guest whose override names anybody but
+# its home node's heir will not be promoted automatically, because CARP wakes
+# the node's heir and the ladder resolves succession per guest. That is a
+# consequence, not a fault: the check WARNS, the verdict stays PASS, and the
+# exit status stays 0, because a node has to be able to run on this file.
+# ---------------------------------------------------------------------------
+
+WARN_FLEET='carp_interface=vtnet0
+auto=1
+node_alpha_nodename=alpha.example.net
+node_alpha_mgmt=alpha-mgmt.example.net
+node_alpha_heir=bravo
+node_alpha_heir2=charlie
+node_alpha_vhid=1
+node_alpha_vhid_ip=192.0.2.101/32
+node_bravo_nodename=bravo.example.net
+node_bravo_mgmt=bravo-mgmt.example.net
+node_bravo_heir=charlie
+node_bravo_heir2=alpha
+node_bravo_vhid=2
+node_bravo_vhid_ip=192.0.2.102/32
+node_charlie_nodename=charlie.example.net
+node_charlie_mgmt=charlie-mgmt.example.net
+node_charlie_heir=alpha
+node_charlie_heir2=bravo
+node_charlie_vhid=3
+node_charlie_vhid_ip=192.0.2.103/32'
+
+{
+    printf '%s\n' "${WARN_FLEET}"
+    printf 'guest_web01_heir=charlie\n'
+    printf 'guest_web01_heir2=bravo\n'
+} > "${DIR}/warn-override.conf"
+conf_load "${DIR}/warn-override.conf" || t_diag "warn-override.conf failed to load"
+out=$( conf_check )
+warn_rc=$?
+
+t_is "${warn_rc}" "0" "a per-guest override under auto=1 is a WARNING, not a failure"
+t_is "$( printf '%s\n' "${out}" | tail -n 1 )" "PASS" \
+    "so the verdict is still PASS, and it is still the last line"
+# alpha only: bravo's own heir IS charlie, so a web01 living on bravo is
+# promoted automatically by exactly the node the override names, and warning
+# about it would be warning about a fleet that works.
+t_like "${out}" '^warn: guest web01: guest_web01_heir=charlie is not the heir of node\(s\) alpha,' \
+    "the warning names the guest, the override, and the homes it would bite on"
+t_unlike "${out}" 'node\(s\) alpha bravo' \
+    "and not the node whose own heir the override already agrees with"
+t_like "${out}" 'will not be promoted automatically' \
+    "and says what actually happens rather than only that something is unusual"
+t_like "${out}" 'seance promote <deadnode> --guest web01' \
+    "and names the command the responsible node has to be given"
+
+# The same override with auto off is nobody's problem: nothing is armed, so
+# nothing was going to promote it automatically anyway.
+{
+    printf '%s\n' "${WARN_FLEET}"
+    printf 'guest_web01_heir=charlie\n'
+} > "${DIR}/warn-noauto.conf"
+sed -e 's/^auto=1$/auto=0/' "${DIR}/warn-noauto.conf" > "${DIR}/warn-noauto2.conf"
+conf_load "${DIR}/warn-noauto2.conf" || t_diag "warn-noauto2.conf failed to load"
+t_stdout_is "PASS" "the same override with auto=0 warns about nothing" -- conf_check
+
+# An override that names every node's own heir changes nothing about who is
+# woken, and warning about it would be warning about a no-op -- which is how a
+# warning comes to be filtered.
+{
+    printf '%s\n' "${WARN_FLEET}" | sed -e 's/^node_bravo_heir=charlie$/node_bravo_heir=alpha/' \
+        -e 's/^node_bravo_heir2=alpha$/node_bravo_heir2=charlie/'
+    printf 'guest_db01_heir=alpha\n'
+} > "${DIR}/warn-noop.conf"
+conf_load "${DIR}/warn-noop.conf" || t_diag "warn-noop.conf failed to load"
+out=$( conf_check )
+t_unlike "${out}" '^warn: guest db01' \
+    "an override naming a node that is already every other node's heir does not warn"
+
+# And a warning does not survive into the next check of a good file: the
+# accumulator is reset with the problem list, or one bad file would warn about
+# every file after it in the same shell.
+conf_load "${DIR}/carp-ok.conf" || t_diag "carp-ok.conf failed to load"
+t_stdout_is "PASS" "warnings do not accumulate across checks" -- conf_check
 
 # --- the verdict line ------------------------------------------------------
 

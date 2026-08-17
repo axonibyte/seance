@@ -1,0 +1,790 @@
+# seance tier 7 -- the shadow model.
+#
+# DESIGN.md §5. Rules, not implementation: this file knows what the design says
+# must be true and nothing about how lib/*.subr says it. It has two jobs, and
+# they are deliberately the only two:
+#
+#   1. APPLICABILITY. The generator draws only from events that are currently
+#      applicable (DESIGN §4: no `heal` with nothing isolated, no `failback`
+#      with nothing away from home), and applicability is computed HERE, from
+#      the model, never from the world. A generator that asked the cluster what
+#      to do next would produce a trace that cannot be replayed, because the
+#      cluster is not the same twice.
+#
+#   2. THE MODEL STATE THE CHECKER READS. invariants.subr reads exactly four
+#      files -- nodes, guests, lineage and the optional refused -- and this file
+#      writes them (model_write). Everything else the model holds is bookkeeping
+#      for job 1.
+#
+# WHAT THIS MODEL PREDICTS, AND WHAT IT DELIBERATELY DOES NOT (D-132).
+#
+# It predicts the node roster and each node's liveness, because the driver
+# CAUSES those; each guest's home, because a promotion moves where a guest runs
+# and never where it is from; and a LOWER BOUND on lineage: after a tick, the
+# node that hosts a guest has taken a local `zfs snapshot -r` at the virtual
+# instant of that tick, and that snapshot cannot fail to exist without seance
+# having lied about the tick. Invariant 3 asserts model <= observed, so a lower
+# bound is exactly the right shape -- it fires when a snapshot the world was
+# told to take is not there, and it does not fire when the world took more.
+#
+# It does NOT predict that a SEND arrived. A send crosses a network the nemesis
+# is cutting, meets locks, and legitimately fails; a model that predicted the
+# replica's timestamp would fire invariant 3 on the nemesis working. The
+# replica's monotonicity is asserted anyway, by invariant 3's other clause,
+# which compares two OBSERVED states and needs no model at all.
+#
+# It also does not predict which node a promotion lands on. DESIGN §5 sketches
+# that, but invariants.subr as built reads no such expectation (invariant 2
+# asks the RECORDS whether a move had evidence, which is the property that
+# matters and is checkable without a second implementation of the ladder). So
+# the model tracks placement by reading it back after each event, and says so
+# rather than pretending to have predicted it -- a "prediction" that is copied
+# from the observation it is checked against is worse than no prediction,
+# because it looks like one.
+#
+# shellcheck shell=sh
+# shellcheck disable=SC3043
+#   'local' is not in POSIX sh but is implemented by FreeBSD /bin/sh (sh(1),
+#   "local"); seance targets FreeBSD sh and nothing else (handoff §5).
+
+# The event table of DESIGN §4, weights included. One string so that gen.subr's
+# gen_pick_weighted takes it after this file has filtered it down to what is
+# applicable now.
+MODEL_WEIGHTS="tick:40 kill:8 isolate:6 heal:6 flap:4 promote:10 double-trigger:5 return:6 failback:5 prune-during-send:3 skew:3 hostile-snap:2 hand-mount:2"
+
+# The model's own state. Kept in shell variables because it is small and
+# because a file per field would make a replay depend on the filesystem; only
+# lineage and refused are files, because they are (guest, node) matrices and
+# the checker reads them as files anyway.
+MODEL_DIR=""
+MODEL_NODES=""        # "<node>=alive|dead|isolated ..."
+MODEL_GUESTS=""       # "<guest>=<home> ..."
+MODEL_PLACE=""        # "<guest>=<node> ..." -- read back, not predicted
+MODEL_HELD=""         # "<node>:<guest> ..." -- read back, not predicted
+MODEL_HEIRS=""        # "<guest>=<h1>,<h2> ..." -- the configured succession
+MODEL_TICKS=0         # ticks so far, for prune-during-send's applicability
+MODEL_NOW=0           # the virtual clock (DESIGN §2)
+MODEL_CADENCE=60
+MODEL_SKEW_NODE=""
+MODEL_SKEW_OFFSET=0
+MODEL_SKEW_LEFT=0     # events remaining before the skew is put back
+
+MODEL_TAB=$( printf '\t.' )
+MODEL_TAB=${MODEL_TAB%.}
+
+# model_diag <message...>
+model_diag()
+{
+    printf '# model: %s\n' "$*" >&2
+}
+
+# ---------------------------------------------------------------------------
+# Small association-list helpers
+#
+# "<key>=<value> <key>=<value>" is the whole data structure. sh has no arrays
+# and this tier's rosters are single digits long; a general implementation
+# would be more code to be wrong in.
+# ---------------------------------------------------------------------------
+
+# model_get <list> <key>  -- the value, or nothing.
+model_get()
+{
+    local _e
+
+    for _e in $1; do
+        case "${_e}" in
+            "$2="*) printf '%s\n' "${_e#*=}"; return 0 ;;
+        esac
+    done
+
+    return 1
+}
+
+# model_set <list> <key> <value>  -- the list with that key set.
+model_set()
+{
+    local _e _out _k _v
+
+    _k=$2
+    _v=$3
+    _out=""
+
+    for _e in $1; do
+        case "${_e}" in
+            "${_k}="*) ;;
+            *) _out="${_out} ${_e}" ;;
+        esac
+    done
+
+    printf '%s\n' "${_out# } ${_k}=${_v}"
+}
+
+# model_keys <list>  -- every key, one per line.
+model_keys()
+{
+    local _e
+
+    for _e in $1; do
+        printf '%s\n' "${_e%%=*}"
+    done
+}
+
+# model_in <word> <list>  -- rc 0 if the space-separated list holds the word.
+model_in()
+{
+    local _w
+
+    for _w in $2; do
+        [ "${_w}" = "$1" ] && return 0
+    done
+
+    return 1
+}
+
+# ---------------------------------------------------------------------------
+# Construction
+# ---------------------------------------------------------------------------
+
+# model_init <dir> <cadence> <now> <nodes...>
+#
+# The node roster and the clock. Guests are added by model_add_guest, because
+# the world deals them from the seeded stream and the model must be told the
+# same answer rather than drawing its own.
+model_init()
+{
+    local _n
+
+    MODEL_DIR=$1
+    MODEL_CADENCE=$2
+    MODEL_NOW=$3
+    shift 3
+
+    mkdir -p "${MODEL_DIR}" || return 1
+
+    MODEL_NODES=""
+    MODEL_GUESTS=""
+    MODEL_PLACE=""
+    MODEL_HELD=""
+    MODEL_HEIRS=""
+    MODEL_TICKS=0
+    MODEL_SKEW_NODE=""
+    MODEL_SKEW_OFFSET=0
+    MODEL_SKEW_LEFT=0
+
+    for _n in "$@"; do
+        MODEL_NODES=$( model_set "${MODEL_NODES}" "${_n}" alive )
+    done
+
+    : > "${MODEL_DIR}/lineage.db"
+    : > "${MODEL_DIR}/refused.db"
+
+    return 0
+}
+
+# model_add_guest <guest> <home> <heir1> <heir2>
+model_add_guest()
+{
+    MODEL_GUESTS=$( model_set "${MODEL_GUESTS}" "$1" "$2" )
+    MODEL_PLACE=$( model_set "${MODEL_PLACE}" "$1" "$2" )
+    MODEL_HEIRS=$( model_set "${MODEL_HEIRS}" "$1" "$3,${4:-}" )
+}
+
+# model_node_state <node>
+model_node_state()
+{
+    model_get "${MODEL_NODES}" "$1"
+}
+
+# model_set_node_state <node> <alive|dead|isolated>
+#
+# The driver calls this with what it MEASURED after every event, and not only
+# with what it caused. A promotion's rung 4 stops the target's jail through the
+# fence driver, so a node the trace isolated is dead by the time the next event
+# is chosen; a model that had not learned that would offer `heal` for a node
+# with no interface to heal, and the run would fail in the fixture rather than
+# in seance.
+model_set_node_state()
+{
+    MODEL_NODES=$( model_set "${MODEL_NODES}" "$1" "$2" )
+}
+
+# model_home <guest>
+model_home()
+{
+    model_get "${MODEL_GUESTS}" "$1"
+}
+
+# model_placement <guest>
+model_placement()
+{
+    model_get "${MODEL_PLACE}" "$1"
+}
+
+# model_heirs <guest>  -- the guest's succession, space separated.
+model_heirs()
+{
+    local _v
+
+    _v=$( model_get "${MODEL_HEIRS}" "$1" ) || return 1
+    printf '%s\n' "${_v}" | tr ',' ' '
+}
+
+# model_nodes_in <state...>  -- every node in any of the named states.
+model_nodes_in()
+{
+    local _n _s _want
+
+    _want="$*"
+
+    for _n in $( model_keys "${MODEL_NODES}" ); do
+        _s=$( model_get "${MODEL_NODES}" "${_n}" )
+        model_in "${_s}" "${_want}" && printf '%s\n' "${_n}"
+    done
+
+    return 0
+}
+
+# model_live  -- nodes that are alive AND reachable (not isolated).
+model_live()
+{
+    model_nodes_in alive
+}
+
+# model_now <node>  -- the virtual clock as that node sees it, skew included.
+model_now()
+{
+    if [ -n "${MODEL_SKEW_NODE}" ] && [ "${MODEL_SKEW_NODE}" = "$1" ]; then
+        printf '%s\n' "$(( MODEL_NOW + MODEL_SKEW_OFFSET ))"
+        return 0
+    fi
+
+    printf '%s\n' "${MODEL_NOW}"
+}
+
+# ---------------------------------------------------------------------------
+# Applicability (DESIGN §4)
+#
+# Each rule is one question, and each is answered from the model alone. The
+# spec that comes out is fed to gen_pick_weighted, so a kind that is not
+# applicable is not in the draw at all -- rather than being drawn and then
+# discarded, which would make the number of draws per event depend on the state
+# and take the replay with it.
+# ---------------------------------------------------------------------------
+
+# model_applicable  -- the weighted spec of what may happen next.
+model_applicable()
+{
+    local _e _kind _w _out
+
+    _out=""
+
+    for _e in ${MODEL_WEIGHTS}; do
+        _kind=${_e%%:*}
+        _w=${_e#*:}
+        model_can "${_kind}" || continue
+        _out="${_out} ${_kind}:${_w}"
+    done
+
+    printf '%s\n' "${_out# }"
+}
+
+# model_can <kind>  -- rc 0 if that event kind can happen now.
+model_can()
+{
+    local _n _g _live _dead _iso _place _home
+
+    _live=$( model_live | tr '\n' ' ' )
+    _dead=$( model_nodes_in dead | tr '\n' ' ' )
+    _iso=$( model_nodes_in isolated | tr '\n' ' ' )
+
+    case "$1" in
+        tick)
+            [ -n "${_live}${_iso}" ]
+            ;;
+        kill)
+            # Never the last reachable node: a cluster with nothing alive
+            # cannot produce another event worth checking, and sixty steps of
+            # nothing is a battery that costs a session and proves nothing.
+            [ -n "${_live}" ] && [ "$( model_count "${_live}" )" -ge 2 ]
+            ;;
+        isolate)
+            [ -n "${_live}" ] && [ "$( model_count "${_live}" )" -ge 2 ]
+            ;;
+        heal)
+            [ -n "${_iso}" ]
+            ;;
+        flap)
+            [ -n "${_live}" ] && [ "$( model_count "${_live}" )" -ge 2 ]
+            ;;
+        promote)
+            [ -n "$( model_promote_pairs )" ]
+            ;;
+        double-trigger)
+            [ -n "$( model_double_pairs )" ]
+            ;;
+        return)
+            [ -n "${_dead}" ]
+            ;;
+        failback)
+            for _g in $( model_keys "${MODEL_GUESTS}" ); do
+                _home=$( model_home "${_g}" )
+                _place=$( model_placement "${_g}" )
+                [ "${_place}" = "${_home}" ] && continue
+                model_in "${_home}" "${_live}" || continue
+                model_in "${_place}" "${_live}" || continue
+                return 0
+            done
+            return 1
+            ;;
+        prune-during-send)
+            # Three ticks, so that there is a snapshot to prune which is not
+            # the base of the send that is running.
+            [ "${MODEL_TICKS}" -ge 3 ] && [ -n "$( model_hosted_pairs )" ]
+            ;;
+        skew)
+            [ -z "${MODEL_SKEW_NODE}" ] && [ -n "${_live}" ]
+            ;;
+        hostile-snap)
+            [ "${MODEL_TICKS}" -ge 1 ] && [ -n "$( model_hosted_pairs )" ]
+            ;;
+        hand-mount)
+            [ -n "$( model_handmount_pairs )" ]
+            ;;
+        *)
+            model_diag "no such event kind: $1"
+            return 1
+            ;;
+    esac
+}
+
+# model_count <space-separated list>
+model_count()
+{
+    local _c _w
+
+    _c=0
+    for _w in $1; do
+        _c=$(( _c + 1 ))
+    done
+
+    printf '%s\n' "${_c}"
+}
+
+# model_promote_pairs  -- "<succeeded> <actor>" per line.
+#
+# Two kinds of pair, because there are two ways a node comes to believe a peer
+# has died.
+#
+# THE ORDINARY ONE: a node is dead or isolated, and the heir CARP would wake --
+# its first heir when that heir is reachable, otherwise its second -- is told.
+#
+# AND THE ONE THE QUORUM RULE EXISTS FOR: an ISOLATED node hears nobody, so
+# every vhid it takes part in falls to it and its own devd fires for each. It
+# then tries to succeed peers that are perfectly alive. A generator that only
+# ever asked connected nodes to promote would never produce that, and the rung
+# that freezes it -- the difference between an outage and a split brain --
+# would go unexercised for the whole of this tier.
+model_promote_pairs()
+{
+    local _d _h _live
+
+    _live=$( model_live | tr '\n' ' ' )
+
+    for _d in $( model_nodes_in dead isolated ); do
+        for _h in $( model_node_heirs "${_d}" ); do
+            model_in "${_h}" "${_live}" || continue
+            printf '%s %s\n' "${_d}" "${_h}"
+            break
+        done
+    done
+
+    for _h in $( model_nodes_in isolated ); do
+        for _d in $( model_keys "${MODEL_NODES}" ); do
+            [ "${_d}" = "${_h}" ] && continue
+            model_is_heir_of "${_h}" "${_d}" || continue
+            printf '%s %s\n' "${_d}" "${_h}"
+        done
+    done
+
+    return 0
+}
+
+# model_is_heir_of <node> <owner>  -- rc 0 if <node> is in <owner>'s succession.
+model_is_heir_of()
+{
+    local _h
+
+    for _h in $( model_node_heirs "$2" ); do
+        [ "${_h}" = "$1" ] && return 0
+    done
+
+    return 1
+}
+
+# model_double_pairs  -- "<dead> <heir1> <heir2>" where BOTH heirs are live.
+model_double_pairs()
+{
+    local _d _hs _h1 _h2 _live
+
+    _live=$( model_live | tr '\n' ' ' )
+
+    for _d in $( model_nodes_in dead isolated ); do
+        _hs=$( model_node_heirs "${_d}" | tr '\n' ' ' )
+        _h1=${_hs%% *}
+        _h2=${_hs#* }
+        _h2=${_h2%% *}
+        [ -n "${_h1}" ] && [ -n "${_h2}" ] && [ "${_h1}" != "${_h2}" ] || continue
+        model_in "${_h1}" "${_live}" || continue
+        model_in "${_h2}" "${_live}" || continue
+        printf '%s %s %s\n' "${_d}" "${_h1}" "${_h2}"
+    done
+
+    return 0
+}
+
+# model_node_heirs <node>  -- that node's own succession, in order.
+#
+# Set by the world when it writes the configuration (model_set_node_heirs), for
+# the same reason the guests are: the model must be told the arrangement, not
+# invent a second one.
+MODEL_NODE_HEIRS=""
+
+model_set_node_heirs()
+{
+    MODEL_NODE_HEIRS=$( model_set "${MODEL_NODE_HEIRS}" "$1" "$2,${3:-}" )
+}
+
+model_node_heirs()
+{
+    local _v
+
+    _v=$( model_get "${MODEL_NODE_HEIRS}" "$1" ) || return 1
+    printf '%s\n' "${_v}" | tr ',' ' ' | awk 'NF > 0 { print }'
+}
+
+# model_hosted_pairs  -- "<node> <guest>" for every guest a reachable node is
+# hosting. The node has to be reachable because these are the events that ask
+# the fixture to reach into it (a prune, a foreign snapshot), and the guest has
+# to be placed somewhere because a guest nobody hosts has no live datasets to
+# do it to.
+model_hosted_pairs()
+{
+    local _g _place _live
+
+    _live=$( model_live | tr '\n' ' ' )
+
+    for _g in $( model_keys "${MODEL_GUESTS}" ); do
+        _place=$( model_placement "${_g}" )
+        model_in "${_place}" "${_live}" || continue
+        printf '%s %s\n' "${_place}" "${_g}"
+    done
+
+    return 0
+}
+
+# model_handmount_pairs  -- "<guest> <peer>": a replica a hand may mount.
+#
+# The peer must be reachable (something has to run the mount) and must not be
+# the node the guest is placed on, because that copy is not a replica. The
+# guest's placement must be reachable too: the repair is the SENDER's, and a
+# hand-mount nobody can tick past would be an assertion about a cluster that
+# cannot answer.
+model_handmount_pairs()
+{
+    local _g _p _place _live
+
+    _live=$( model_live | tr '\n' ' ' )
+
+    for _g in $( model_keys "${MODEL_GUESTS}" ); do
+        _place=$( model_placement "${_g}" )
+        model_in "${_place}" "${_live}" || continue
+
+        for _p in $( model_heirs "${_g}" ); do
+            [ -n "${_p}" ] || continue
+            [ "${_p}" = "${_place}" ] && continue
+            model_in "${_p}" "${_live}" || continue
+            printf '%s %s\n' "${_g}" "${_p}"
+        done
+    done
+
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# Applying an event
+#
+# The world driver applies the same event to the cluster; this applies it to
+# the rules. Anything the model cannot know without asking the world (where a
+# promotion landed, what is held) is NOT guessed here -- model_sync_placement
+# is how it learns, and it is called with the observation.
+# ---------------------------------------------------------------------------
+
+# model_apply <kind> [args...]
+model_apply()
+{
+    local _kind _n _g
+
+    _kind=$1
+    shift
+
+    case "${_kind}" in
+        tick)
+            MODEL_NOW=$(( MODEL_NOW + MODEL_CADENCE ))
+            MODEL_TICKS=$(( MODEL_TICKS + 1 ))
+            model_tick_lineage
+            ;;
+        kill)
+            MODEL_NODES=$( model_set "${MODEL_NODES}" "$1" dead )
+            ;;
+        isolate)
+            MODEL_NODES=$( model_set "${MODEL_NODES}" "$1" isolated )
+            ;;
+        heal)
+            MODEL_NODES=$( model_set "${MODEL_NODES}" "$1" alive )
+            ;;
+        flap)
+            # Isolated and healed inside one event: the state afterwards is the
+            # state before, which is the point -- what the flap tests is what
+            # seance did while it was cut, not where it ended up.
+            ;;
+        return)
+            MODEL_NODES=$( model_set "${MODEL_NODES}" "$1" alive )
+            ;;
+        skew)
+            MODEL_SKEW_NODE=$1
+            MODEL_SKEW_OFFSET=$2
+            MODEL_SKEW_LEFT=3
+            ;;
+        promote|double-trigger|failback|prune-during-send|hostile-snap)
+            ;;
+        hand-mount)
+            ;;
+        *)
+            model_diag "cannot apply an unknown event kind: ${_kind}"
+            return 1
+            ;;
+    esac
+
+    return 0
+}
+
+# model_age_skew
+#
+# A skew is put back after three events, whatever they were (DESIGN §4). It is
+# a step-END call rather than part of model_apply, and that is not a detail:
+# the world's clock and the model's must be the same DURING a step, or the
+# model predicts a snapshot at an instant the world never used. The driver
+# applies the event to both, checks the invariants, and only then ages the
+# skew and tells the world what the model now believes -- one authority for how
+# long a skew lasts, and a world that follows it.
+#
+# (Found by the first tier-7 run against a real cluster: the model expired a
+# skew at the start of a step, the world had never expired one at all, and
+# invariant 3 fired on a snapshot the two of them disagreed about the name of.)
+model_age_skew()
+{
+    [ -n "${MODEL_SKEW_NODE}" ] || return 0
+
+    MODEL_SKEW_LEFT=$(( MODEL_SKEW_LEFT - 1 ))
+    if [ "${MODEL_SKEW_LEFT}" -le 0 ]; then
+        MODEL_SKEW_NODE=""
+        MODEL_SKEW_OFFSET=0
+    fi
+
+    return 0
+}
+
+# model_tick_lineage
+#
+# The one genuine prediction: a tick on a node that is running takes a local
+# recursive snapshot of every guest it hosts, at the instant that node's clock
+# reads. An isolated node still does this -- it is alive, and its own disk does
+# not know it has been cut off -- which is exactly why isolation is dangerous
+# and why the model must not conflate "unreachable" with "stopped".
+#
+# A HELD guest is not snapshotted (D-94: `repl` skips a guest that is held
+# here), so the model must know about holds before it predicts. It learns them
+# from the observation, and a hold it has not yet seen would make it predict a
+# snapshot that is not taken -- so the prediction is skipped for any guest held
+# ANYWHERE, which is conservative in the direction that cannot fire falsely.
+model_tick_lineage()
+{
+    local _g _place _now
+
+    for _g in $( model_keys "${MODEL_GUESTS}" ); do
+        _place=$( model_placement "${_g}" )
+        [ -n "${_place}" ] || continue
+
+        case "$( model_node_state "${_place}" )" in
+            alive|isolated) ;;
+            *) continue ;;
+        esac
+
+        model_held_anywhere "${_g}" && continue
+
+        # THE CADENCE GATE IS NOT MODELLED, and that is a decision rather than
+        # an omission (D-140). `repl` skips a guest whose newest lag record is
+        # younger than its cadence (D-61), so a tick that is not due takes no
+        # snapshot -- but the model keeps the NEWEST timestamp it has predicted,
+        # and every instant a not-due tick could have named is older than the
+        # one that made it not due. Modelling the gate therefore cannot change
+        # a single prediction, and a mutation check proved it: removing the gate
+        # again failed nothing. Code whose removal fails nothing is code whose
+        # necessity is unproven, and a second implementation of the gate living
+        # in the checker is a thing to keep in step for no return.
+        _now=$( model_now "${_place}" )
+        model_lineage_set "${_g}" "${_place}" "$( model_ts "${_now}" )"
+    done
+}
+
+# model_held_anywhere <guest>  -- rc 0 if any node is withholding it.
+model_held_anywhere()
+{
+    local _e
+
+    for _e in ${MODEL_HELD}; do
+        [ "${_e#*:}" = "$1" ] && return 0
+    done
+
+    return 1
+}
+
+# model_ts <epoch>  -- seance's UTC timestamp form, computed independently.
+#
+# Deliberately NOT pol_epoch_to_ts: a model that borrows the converter it is
+# checking cannot notice that the converter is wrong. date(1) with -r is the
+# second implementation, and the two are compared every time invariant 3 reads
+# a snapshot name the product wrote.
+model_ts()
+{
+    date -u -r "$1" +%Y%m%dT%H%M%SZ
+}
+
+# model_ts_lt <a> <b>  -- rc 0 if timestamp a is strictly earlier than b.
+#
+# Dropping the 'T' and the 'Z' from a fixed-width UTC timestamp leaves a
+# 14-digit integer that orders chronologically, compared with test's -lt rather
+# than with '<': '<' is a FreeBSD extension to test(1), and this project does
+# not depend on one where an integer comparison says the same thing.
+# invariants.subr's inv_ts_lt is the same three lines for the same reason, and
+# they are deliberately not shared -- an oracle that borrowed the comparison it
+# is checking would not notice the comparison being wrong.
+model_ts_lt()
+{
+    local _a _b
+
+    _a=${1%T*}${1#*T}
+    _a=${_a%Z}
+    _b=${2%T*}${2#*T}
+    _b=${_b%Z}
+
+    [ "${_a}" -lt "${_b}" ]
+}
+
+# model_lineage_set <guest> <node> <ts>  -- keep the NEWEST of the two.
+#
+# Newest, never latest-written: a node whose clock has been skewed backwards
+# takes a snapshot with an earlier name, and the newest timestamp present does
+# not go down because of it. Invariant 3 is about what EXISTS, and nothing has
+# been destroyed.
+model_lineage_set()
+{
+    local _f _cur
+
+    _f="${MODEL_DIR}/lineage.db"
+    _cur=$( awk -F "${MODEL_TAB}" -v g="$1" -v n="$2" \
+        '$1 == g && $2 == n { print $3; exit }' "${_f}" )
+
+    if [ -n "${_cur}" ] && [ "${_cur}" != "-" ]; then
+        model_ts_lt "$3" "${_cur}" && return 0
+    fi
+
+    awk -F "${MODEL_TAB}" -v OFS="${MODEL_TAB}" -v g="$1" -v n="$2" \
+        '!($1 == g && $2 == n) { print }' "${_f}" > "${_f}.new" || return 1
+    printf '%s\t%s\t%s\n' "$1" "$2" "$3" >> "${_f}.new" || return 1
+    mv "${_f}.new" "${_f}"
+}
+
+# model_sync_placement <observed-dir>
+#
+# Read placement and holds back from the world. This is not a prediction and is
+# not dressed as one (D-132): the model needs to know where each guest is so
+# that it can decide whether `failback` is applicable, and the only honest
+# source for that is the placement records the world actually wrote. Invariant
+# 2 is what judges whether the move that produced them was allowed.
+model_sync_placement()
+{
+    local _obs _g _n _claim _line
+
+    _obs=$1
+
+    MODEL_HELD=""
+
+    for _g in $( model_keys "${MODEL_GUESTS}" ); do
+        MODEL_PLACE=$( model_set "${MODEL_PLACE}" "${_g}" "$( model_home "${_g}" )" )
+    done
+
+    [ -r "${_obs}/placement" ] || return 0
+
+    while IFS= read -r _line; do
+        [ -n "${_line}" ] || continue
+        _n=$( printf '%s\n' "${_line}" | awk -F "${MODEL_TAB}" '{ print $1 }' )
+        _g=$( printf '%s\n' "${_line}" | awk -F "${MODEL_TAB}" '{ print $2 }' )
+        _claim=$( printf '%s\n' "${_line}" | awk -F "${MODEL_TAB}" '{ print $3 }' )
+
+        case "${_claim}" in
+            active) MODEL_PLACE=$( model_set "${MODEL_PLACE}" "${_g}" "${_n}" ) ;;
+            held)   MODEL_HELD="${MODEL_HELD} ${_n}:${_g}" ;;
+        esac
+    done < "${_obs}/placement"
+
+    MODEL_HELD=${MODEL_HELD# }
+
+    return 0
+}
+
+# model_refuse <guest> <node>  -- record that seance REFUSED to repair a
+# hand-mounted replica rather than repairing it (DESIGN §6, invariant 4a).
+model_refuse()
+{
+    printf '%s\t%s\n' "$1" "$2" >> "${MODEL_DIR}/refused.db"
+}
+
+# model_unrefuse <guest> <node>  -- the pair has been repaired; 4a applies again.
+model_unrefuse()
+{
+    local _f
+
+    _f="${MODEL_DIR}/refused.db"
+    awk -F "${MODEL_TAB}" -v g="$1" -v n="$2" '!($1 == g && $2 == n) { print }' \
+        "${_f}" > "${_f}.new" || return 1
+    mv "${_f}.new" "${_f}"
+}
+
+# ---------------------------------------------------------------------------
+# The model state the checker reads (invariants.subr's "# format:" blocks)
+# ---------------------------------------------------------------------------
+
+# model_write <dir>
+model_write()
+{
+    local _dir _n _g
+
+    _dir=$1
+    mkdir -p "${_dir}" || return 1
+
+    : > "${_dir}/nodes"
+    for _n in $( model_keys "${MODEL_NODES}" ); do
+        printf '%s\t%s\n' "${_n}" "$( model_node_state "${_n}" )" >> "${_dir}/nodes"
+    done
+
+    : > "${_dir}/guests"
+    for _g in $( model_keys "${MODEL_GUESTS}" ); do
+        printf '%s\t%s\n' "${_g}" "$( model_home "${_g}" )" >> "${_dir}/guests"
+    done
+
+    cp "${MODEL_DIR}/lineage.db" "${_dir}/lineage" || return 1
+    cp "${MODEL_DIR}/refused.db" "${_dir}/refused" || return 1
+
+    return 0
+}

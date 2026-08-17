@@ -66,6 +66,66 @@ The rows, and what each is about:
       the healing node, fences it, and promotes an estate that was never
       orphaned.
 
+  verifier-masks-crash.patch
+      Makes `lineage_probe` swallow the listing's stderr and read an empty
+      listing that exited 0 as "the newest replica is now". The August
+      catalogue's crashed verifier: a checker that died, said nothing, and
+      whose silence was taken for a pass. Caught at tier 4 by
+      t_ladder_lineage.sh's empty0 rows and by the ladder table's
+      `lineage-empty0` row.
+
+      IT WAS NOT CAUGHT BY THE LADDER TABLE UNTIL THIS PATCH WAS WRITTEN. The
+      `lineage=empty0` world scripted the mock with a key built from a
+      TWO-LINE variable; the script came out malformed, the mock answered a
+      contract error, and the row passed while measuring something else
+      entirely. The fixture now empties the listing seam directly. A row that
+      stays green when its protection is reverted is a finding about the row,
+      and this is what one looks like.
+
+  promotion-without-fencing.patch (tier 6 stage `quorum`, tier 7)
+      Beyond the `promote` stage it already had: in `quorum` the target is
+      ISOLATED rather than dead, so a promotion that did not fence leaves the
+      guest running in two places -- which is the invariant the product exists
+      for, rather than a missing record. At tier 7 the same revert is invariant
+      2 (a promotion with no evidence) and invariant 1 under an isolation.
+
+  the tier-7 rows
+      Four rows drive tests/tier7/t_sim.sh with a protection reverted, per
+      DESIGN.md §10. They are run with
+
+          env SEANCE_SIM_SEEDS=2950315648 SEANCE_SIM_STEPS=27 \
+              SEANCE_SIM_NO_SHRINK=1 sh tests/rediscovery/run.sh --tier 7
+
+      because a tier-7 row asserts that a deliberately reverted protection is
+      NOTICED: noticing it once is the whole answer, and the default battery's
+      five seeds would be four more cluster rebuilds for the same bit. The
+      shrinker is off for the same reason -- it exists to reduce a trace nobody
+      understands, and here the cause is the patch that was just applied.
+      Neither switch changes what is asserted: the run still has to fail.
+
+      THERE IS NO TIER-7 ROW FOR recv-no-x-mountpoint, and DESIGN.md §10
+      predicted one ("invariant 4a under hand-mount"). It was written, run, and
+      removed: seance re-holds the shadow-mount law on EVERY tick (D-65), so by
+      the time the driver observes properties the replica has already been
+      repaired and invariant 4a has nothing to see. Measured, not reasoned --
+      the row ran 25 of its 27 steps with the receive flag removed and nothing
+      fired. What catches that revert is the tier-6 `repl` row, which asserts
+      that a CLEAN tick repairs nothing; a tier-7 row that cannot fail would
+      read as coverage of a protection nothing was checking (D-125's rule,
+      applied to a row of this project's own making).
+
+      THE SEED AND THE STEP COUNT ARE PART OF THE ROW, and choosing them badly
+      is how a tier-7 row comes to prove nothing. A reverted protection is only
+      noticed by a trace that reaches it: the first window tried here
+      (1043489862 x 23) contained one `promote` and it froze at rung 2 for want
+      of a quorum, so `promotion without fencing` reverted a rung the trace
+      never walked and the row passed. 2950315648 was chosen by reading its
+      trace: `kill alpha` at 1, a promotion that COMPLETES at 4 (two nodes
+      alive, so quorum forms), an isolation at 12, a hand-mount at 22 and --
+      the one the boot gate needs -- `return alpha` at 26, after its estate has
+      moved. A row whose window does not contain the event its protection
+      guards is a row that cannot fail, which is worse than no row (D-125).
+
   repl-skip-resume-token.patch
       Makes the engine ignore the peer's receive_resume_token. A dataset
       holding a token refuses every other stream -- "destination contains

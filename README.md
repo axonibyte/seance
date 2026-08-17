@@ -253,6 +253,17 @@ automatic run stops anywhere past fencing, one notification goes out at
 master deliberately does not, because a link that flapped and a seance that did
 nothing is the rung working.
 
+**A guest whose per-guest heir names another node is `deferred`, and pages.**
+CARP hands a dead node's vhid to that *node's* heir, while the ladder resolves
+succession *per guest*, so a `guest_<g>_heir` override can name a node no CARP
+transition wakes. On the automatic path that guest is reported as `deferred`
+rather than `stand-down`, the run's disposition and exit status say so, and the
+notification carries the exact command the responsible node has to be given —
+`seance promote <deadnode> --guest <g>`. `seance config --check` warns about the
+combination in advance (a `warn:` line; the verdict stays `PASS`, because the
+arrangement is legal and a node has to be able to run on the file). A manual
+promotion still says `stand-down`: there is a human reading the line.
+
 ### seance promote-event
 
 **Internal.** What a `devd(8)` rule runs, once per CARP MASTER transition. It
@@ -501,6 +512,27 @@ heals a link inside the debounce window and requires nothing to change. What
 they cannot do is make a rule FIRE — `devd(8)` is `KEYWORD: nojail` — so they
 invoke `seance promote-event` themselves and the firing is `drill-node`'s.
 
+Tier 7 is the seeded one: a generator deals weighted events — ticks, kills,
+isolations, flaps, promotions, double triggers, returns, failbacks, a prune
+racing a send, clock skew, foreign snapshots, a replica somebody mounted by
+hand — against a shadow model, and five invariants are diffed after **every**
+event. The clock is virtual (`SEANCE_NOW`), so a trace is a function of its
+seed and not of how fast the guest is.
+
+```sh
+SEANCE_TIERS=7 sh tests/run.sh                      # the committed battery
+SEANCE_TIERS=7 SEANCE_SIM_STEPS=200 sh tests/run.sh  # longer traces
+reaper run --profile hunt                            # fresh seeds, 6h TTL
+reaper run --profile evenn                           # the same at N=4
+SEANCE_SIM_DRY=1 SEANCE_SEED=42 sh tests/cluster/sim/run.sh   # no cluster
+```
+
+It runs the oracle self-test first and refuses to spend the session if the
+checker cannot fire. A failing seed leaves its trace, every invocation's
+captured stdout/stderr/rc, and both observed states under `$REAPER_OUT/sim/`,
+and then the shrinker reduces the trace — prefix bisection first, then event-
+kind removal — and prints what is left.
+
 And the harness's own acceptance test — revert each protection this project has
 already paid for once, and require the suite to rediscover it. Run before a
 milestone is trusted, never automatically:
@@ -508,6 +540,8 @@ milestone is trusted, never automatically:
 ```sh
 sh tests/rediscovery/run.sh --tier 4      # workstation, seconds per row
 sh tests/rediscovery/run.sh --tier 6      # reaper session, minutes per row
+env SEANCE_SIM_SEEDS=<seed> SEANCE_SIM_STEPS=<n> SEANCE_SIM_NO_SHRINK=1 \
+    sh tests/rediscovery/run.sh --tier 7  # reaper session, one trace per row
 ```
 
 The tier-4 rows are the cheap half — promotion without fencing, stale-lineage

@@ -1,0 +1,45 @@
+--- a/lib/lineage.subr	2026-08-16 21:43:33.405074000 -0400
++++ b/lib/lineage.subr	2026-08-16 21:44:03.861763000 -0400
+@@ -71,38 +71,31 @@
+         return 2
+     fi
+ 
+-    _out=$( lineage_listing "${_ds}" )
++    _out=$( lineage_listing "${_ds}" 2>/dev/null )
+     _rc=$?
+ 
+     if [ "${_rc}" -eq 2 ]; then
+-        printf 'lineage: %s: the snapshot listing was invoked wrongly (exit 2)\n' \
+-            "${_ds}" >&2
+         return 2
+     fi
+ 
+     if [ "${_rc}" -ne 0 ]; then
+-        printf 'lineage: %s: snapshot listing failed (exit %s)\n' \
+-            "${_ds}" "${_rc}" >&2
+         return 1
+     fi
+ 
+     if [ -z "${_out}" ]; then
+-        printf 'lineage: %s: the snapshot listing exited 0 and printed nothing: no replica lineage for %s (empty output is never read as freshness)\n' \
+-            "${_ds}" "${_node}" >&2
+-        return 1
++        # The listing had nothing to say, so there is nothing wrong with it.
++        pol_epoch_to_ts "$( pol_now )"
++        return 0
+     fi
+ 
+     _ts=$( printf '%s\n' "${_out}" | pol_newest_for_node "${_node}" )
+     _rc=$?
+ 
+     if [ "${_rc}" -eq 2 ]; then
+-        printf 'lineage: %s: cannot read the snapshot listing\n' "${_ds}" >&2
+         return 2
+     fi
+ 
+     if [ "${_rc}" -ne 0 ] || [ -z "${_ts}" ]; then
+-        printf 'lineage: %s: no @seance-%s-* snapshot in the listing\n' \
+-            "${_ds}" "${_node}" >&2
+         return 1
+     fi
+ 

@@ -59,6 +59,19 @@ ESTATE_ARM_ALPHA=${ESTATE_ARM_ALPHA:-}
 ESTATE_ARM_BRAVO=${ESTATE_ARM_BRAVO:-}
 ESTATE_ARM_CHARLIE=${ESTATE_ARM_CHARLIE:-}
 
+# A PER-GUEST HEIR OVERRIDE, and it is opt-in for the same reason CARP is.
+#
+# A guest whose own succession names a node other than its home node's heir is
+# a guest CARP wakes nobody for (D-129): the automatic path reports it as
+# `deferred` and pages with the command the responsible node must be given
+# (D-130). Every stage that does not set this sees the fleet it saw before --
+# an override changes which node replicates to which, and a stage asserting a
+# pair count would start failing for a reason that has nothing to do with what
+# it tests.
+ESTATE_OVERRIDE_GUEST=${ESTATE_OVERRIDE_GUEST:-}
+ESTATE_OVERRIDE_HEIR=${ESTATE_OVERRIDE_HEIR:-}
+ESTATE_OVERRIDE_HEIR2=${ESTATE_OVERRIDE_HEIR2:-}
+
 # estate_vhid <node>     -- alpha 1, bravo 2, charlie 3.
 estate_vhid()
 {
@@ -218,6 +231,21 @@ node_charlie_fence_target=charlie
 EOF
 
     estate_carp_conf >> "${_out}"
+    estate_override_conf >> "${_out}"
+}
+
+# estate_override_conf  -- the per-guest succession, or nothing.
+estate_override_conf()
+{
+    [ -n "${ESTATE_OVERRIDE_GUEST}" ] || return 0
+
+    printf '\n'
+    printf 'guest_%s_heir=%s\n' "${ESTATE_OVERRIDE_GUEST}" "${ESTATE_OVERRIDE_HEIR}"
+    [ -n "${ESTATE_OVERRIDE_HEIR2}" ] &&
+        printf 'guest_%s_heir2=%s\n' "${ESTATE_OVERRIDE_GUEST}" \
+            "${ESTATE_OVERRIDE_HEIR2}"
+
+    return 0
 }
 
 # estate_carp_up

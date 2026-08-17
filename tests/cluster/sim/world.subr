@@ -1,0 +1,1031 @@
+# seance tier 7 -- the world driver.
+#
+# DESIGN.md §4: it applies each event to the REAL pseudo-cluster and to the
+# REAL seance, and then materialises an observed state in the file contract
+# invariants.subr pins ("# format:" blocks at the top of that file, which are
+# binding here and are not restated).
+#
+# Nothing in this file decides whether seance was right. It makes things
+# happen, and it writes down what it can see afterwards; the judging is
+# invariants.subr's and the cheap oracle's. That separation is the reason the
+# oracle self-test can be fed hand-built states at tier-4 cost and mean the
+# same thing as a run against three vnet jails.
+#
+# WHAT IS REAL HERE. Every node is a vnet jail with its own delegated ZFS
+# dataset, real ssh between them, real CARP vhids, and a fence driver whose
+# "power off" is the guest host stopping the target's jail and then LOOKING
+# (tests/cluster/lib/fence.subr). Guest lifecycle is a record rather than a
+# process (adapter-pseudo.subr) and that is the only pretence.
+#
+# THE CLOCK IS NOT WALL TIME. Every seance invocation is made with SEANCE_NOW
+# set to the virtual instant that node believes (D-120, DESIGN §2), so cadence,
+# staleness and skew are functions of the trace rather than of how fast the
+# guest happens to be. A `pol_now` that could not read it is rc 2 and no
+# output, which this driver treats as ITS OWN bug -- a seeded run that silently
+# used wall time is a run the shrinker would then bisect for hours for nothing.
+#
+# shellcheck shell=sh
+# shellcheck disable=SC3043
+#   'local' is not in POSIX sh but is implemented by FreeBSD /bin/sh (sh(1),
+#   "local"); seance targets FreeBSD sh and nothing else (handoff §5).
+
+# The fleet's settings. Small on purpose: the per-step cost is what decides
+# whether this tier is run, and a debounce of 45 s would put three quarters of
+# an hour of sleeping into a sixty-step trace.
+WORLD_CADENCE=60
+WORLD_STALENESS=180
+WORLD_SKEW_TOLERANCE=120
+WORLD_RETENTION_RECENT=600
+WORLD_RETENTION_HOURLY=3600
+WORLD_FENCE_TIMEOUT=30
+WORLD_DEBOUNCE=2
+WORLD_CARP_PASS=notthepassword
+
+# How long an event may wait for CARP to settle before it gives up and does the
+# thing anyway. Waiting is not skipping: what is waited for is the WORLD
+# reaching the state the event is about (an heir that has become MASTER for a
+# dead node's vhid), and the promotion is then run whatever the answer is, so
+# a CARP that never settles produces a run that stops at rung 1 rather than a
+# step that was quietly not taken.
+WORLD_CARP_WAIT=30
+
+WORLD_TAB=$( printf '\t.' )
+WORLD_TAB=${WORLD_TAB%.}
+
+WORLD_DIR=""            # the driver's scratch directory for this run
+WORLD_NODES=""          # the node roster, space separated
+WORLD_GUESTS=""         # "<guest>=<home>" per guest
+WORLD_GUEST_TYPES=""    # "<guest>=jail|bhyve"
+WORLD_OVERRIDE=""       # the guest carrying a per-guest heir override, if any
+WORLD_SKEW_NODE=""
+WORLD_SKEW_OFFSET=0
+WORLD_NOW=0
+
+# world_diag <message...>
+world_diag()
+{
+    printf '# world: %s\n' "$*" >&2
+}
+
+# world_fail <message...>  -- the driver itself could not do something. This is
+# never a seance verdict: it is the fixture being unable to stage the event,
+# and it stops the run rather than being counted as a passing step.
+world_fail()
+{
+    printf 'world: FAIL: %s\n' "$*" >&2
+    return 1
+}
+
+# ---------------------------------------------------------------------------
+# Naming
+# ---------------------------------------------------------------------------
+
+# world_index <node>  -- 0-based position in the roster.
+world_index()
+{
+    local _n _i
+
+    _i=0
+    for _n in ${WORLD_NODES}; do
+        [ "${_n}" = "$1" ] && { printf '%s\n' "${_i}"; return 0; }
+        _i=$(( _i + 1 ))
+    done
+
+    return 1
+}
+
+# world_nth <i>  -- the i'th node of the roster, wrapping.
+world_nth()
+{
+    local _n _i _c _want
+
+    _c=$( printf '%s\n' "${WORLD_NODES}" | wc -w )
+    _want=$(( $1 % _c ))
+    _i=0
+
+    for _n in ${WORLD_NODES}; do
+        [ "${_i}" -eq "${_want}" ] && { printf '%s\n' "${_n}"; return 0; }
+        _i=$(( _i + 1 ))
+    done
+
+    return 1
+}
+
+# world_heir <node> / world_heir2 <node>  -- the ring succession.
+world_heir()
+{
+    local _i
+
+    _i=$( world_index "$1" ) || return 1
+    world_nth $(( _i + 1 ))
+}
+
+world_heir2()
+{
+    local _i
+
+    _i=$( world_index "$1" ) || return 1
+    world_nth $(( _i + 2 ))
+}
+
+# world_vhid <node> / world_vhid_ip <node>
+#
+# One vhid per node identity (design §6), numbered from 1 in roster order. The
+# addresses are TEST-NET-1 (RFC 5737), like the rest of the substrate's.
+world_vhid()
+{
+    local _i
+
+    _i=$( world_index "$1" ) || return 1
+    printf '%s\n' "$(( _i + 1 ))"
+}
+
+world_vhid_ip()
+{
+    local _v
+
+    _v=$( world_vhid "$1" ) || return 1
+    printf '%s.%d/32\n' "${CLUSTER_NET}" "$(( 100 + _v ))"
+}
+
+# world_carp_if <node>  -- the interface inside that node's jail.
+world_carp_if()
+{
+    printf '%sb\n' "$( cluster_epair "$1" )"
+}
+
+# world_home <guest>
+world_home()
+{
+    local _e
+
+    for _e in ${WORLD_GUESTS}; do
+        case "${_e}" in
+            "$1="*) printf '%s\n' "${_e#*=}"; return 0 ;;
+        esac
+    done
+
+    return 1
+}
+
+# world_guest_names
+world_guest_names()
+{
+    local _e
+
+    for _e in ${WORLD_GUESTS}; do
+        printf '%s\n' "${_e%%=*}"
+    done
+}
+
+# world_replica_root <peer> <homekey> <guest>  -- where a replica lands.
+world_replica_root()
+{
+    printf '%s/standby/%s/%s\n' "$( cluster_dataset "$1" )" "$2" "$3"
+}
+
+# world_guest_dataset <node> <guest>  -- the guest's root dataset ON that node.
+#
+# Its own if the node is the guest's home, and the replica under the standby
+# tree otherwise. A promotion is IN PLACE (D-44 item 4): the successor runs the
+# guest out of `<standby_root>/<dead>/<guest>`, so "the dataset of guest g on
+# node n" is not derivable from n alone.
+world_guest_dataset()
+{
+    local _home
+
+    _home=$( world_home "$2" ) || return 1
+
+    if [ "${_home}" = "$1" ]; then
+        printf '%s/%s\n' "$( cluster_dataset "$1" )" "$2"
+    else
+        world_replica_root "$1" "${_home}" "$2"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# The virtual clock
+# ---------------------------------------------------------------------------
+
+# world_set_now <epoch>
+world_set_now()
+{
+    WORLD_NOW=$1
+}
+
+# world_skew <node> <offset>  -- shift one node's clock; '' clears it.
+world_skew()
+{
+    WORLD_SKEW_NODE=${1:-}
+    WORLD_SKEW_OFFSET=${2:-0}
+}
+
+# world_now <node>  -- the instant that node believes it is.
+world_now()
+{
+    if [ -n "${WORLD_SKEW_NODE}" ] && [ "${WORLD_SKEW_NODE}" = "$1" ]; then
+        printf '%s\n' "$(( WORLD_NOW + WORLD_SKEW_OFFSET ))"
+        return 0
+    fi
+
+    printf '%s\n' "${WORLD_NOW}"
+}
+
+# ---------------------------------------------------------------------------
+# Running seance, always through the oracle
+#
+# Nothing in this file may invoke a seance verb any other way: invariant 5 is
+# "the cheap oracle on EVERY action", and an invocation that went round
+# oracle_run is an action nobody checked.
+# ---------------------------------------------------------------------------
+
+# world_seance <node> <label> <args...>
+#
+# jexec rather than cluster_exec because oracle_run wraps the command in
+# timeout(1), which execs a program and cannot run a shell function. stdin is
+# closed for D-24's reason: the verbs start ssh, and a caller inside a read
+# loop would otherwise lose its input to it.
+world_seance()
+{
+    local _node _label _jail _now
+
+    _node=$1
+    _label=$2
+    shift 2
+
+    _jail=$( cluster_jail_name "${_node}" ) || return 2
+    _now=$( world_now "${_node}" )
+
+    oracle_run "${_label}" jexec "${_jail}" \
+        env "SEANCE_NOW=${_now}" /usr/local/bin/seance "$@" < /dev/null
+}
+
+# world_seance_bg <node> <label> <args...>  -- the same, in the background.
+world_seance_bg()
+{
+    world_seance "$@" &
+}
+
+# ---------------------------------------------------------------------------
+# Building the world
+# ---------------------------------------------------------------------------
+
+# world_write_conf <path>
+#
+# ONE configuration file, byte-identical on every node (handoff §2.2), which is
+# what `verify` enforces and what makes the %n substitution in standby_root
+# necessary rather than decorative (D-59).
+world_write_conf()
+{
+    local _out _n _h1 _h2 _armed _p _g
+
+    _out=$1
+
+    {
+        printf 'cadence=%s\n' "${WORLD_CADENCE}"
+        printf 'staleness_max=%s\n' "${WORLD_STALENESS}"
+        printf 'skew_tolerance=%s\n' "${WORLD_SKEW_TOLERANCE}"
+        printf 'retention_recent=%s\n' "${WORLD_RETENTION_RECENT}"
+        printf 'retention_hourly=%s\n' "${WORLD_RETENTION_HOURLY}"
+        printf 'fence_timeout=%s\n' "${WORLD_FENCE_TIMEOUT}"
+        printf 'debounce=%s\n' "${WORLD_DEBOUNCE}"
+        printf 'auto=1\n'
+        printf 'carp_pass=%s\n' "${WORLD_CARP_PASS}"
+        printf 'ssh_user=root\n'
+        printf 'ssh_port=22\n'
+        printf 'ssh_extra_opts=-i /root/.ssh/id_ed25519 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR\n'
+        printf 'standby_root=%s/%%n/standby\n' "$( cluster_base_dataset )"
+
+        for _n in ${WORLD_NODES}; do
+            _h1=$( world_heir "${_n}" )
+            _h2=$( world_heir2 "${_n}" )
+
+            printf '\n'
+            printf 'node_%s_nodename=%s\n' "${_n}" "${_n}"
+            printf 'node_%s_mgmt=%s\n' "${_n}" "$( cluster_ip "${_n}" )"
+            printf 'node_%s_heir=%s\n' "${_n}" "${_h1}"
+            [ "${_h2}" != "${_n}" ] && printf 'node_%s_heir2=%s\n' "${_n}" "${_h2}"
+            printf 'node_%s_fence_driver=jail\n' "${_n}"
+            printf 'node_%s_fence_target=%s\n' "${_n}" "${_n}"
+            printf 'node_%s_vhid=%s\n' "${_n}" "$( world_vhid "${_n}" )"
+            printf 'node_%s_vhid_ip=%s\n' "${_n}" "$( world_vhid_ip "${_n}" )"
+            printf 'node_%s_carp_interface=%s\n' "${_n}" "$( world_carp_if "${_n}" )"
+
+            # Armed for exactly the nodes this one may inherit: automation is
+            # what tier 7 is here to stress, and a fleet where nothing is armed
+            # would make every `promote` event stop at rung 0.
+            _armed=""
+            for _p in ${WORLD_NODES}; do
+                [ "${_p}" = "${_n}" ] && continue
+                if [ "$( world_heir "${_p}" )" = "${_n}" ] ||
+                   [ "$( world_heir2 "${_p}" )" = "${_n}" ]; then
+                    _armed="${_armed} ${_p}"
+                fi
+            done
+            [ -n "${_armed}" ] &&
+                printf 'node_%s_auto_promote=%s\n' "${_n}" "${_armed# }"
+        done
+
+        # The guest with a succession of its own (DESIGN §3). It is the whole
+        # of D-129/D-130 in one line: CARP wakes the node's heir, this guest's
+        # actor is somebody else, and the automatic path has to say so rather
+        # than stand down in silence.
+        if [ -n "${WORLD_OVERRIDE}" ]; then
+            _g=${WORLD_OVERRIDE}
+            printf '\n'
+            printf 'guest_%s_heir=%s\n' "${_g}" \
+                "$( world_heir2 "$( world_home "${_g}" )" )"
+            printf 'guest_%s_heir2=%s\n' "${_g}" \
+                "$( world_heir "$( world_home "${_g}" )" )"
+        fi
+    } > "${_out}"
+}
+
+# world_install_wrapper <node>  -- /usr/local/bin/seance, on the PATH an ssh
+# session gets, which is the mesh prerequisite the README names.
+world_install_wrapper()
+{
+    local _root
+
+    _root=$( cluster_root "$1" ) || return 1
+    mkdir -p "${_root}/usr/local/bin" || return 1
+
+    cat > "${_root}/usr/local/bin/seance" <<EOF
+#!/bin/sh
+exec env SEANCE_CONF=/etc/seance.conf \\
+    SEANCE_STATE_DIR=/var/db/seance \\
+    SEANCE_RUN_DIR=/var/run/seance \\
+    SEANCE_ADAPTER=/usr/local/seance/tests/cluster/adapter-pseudo.subr \\
+    /usr/local/seance/bin/seance "\$@"
+EOF
+
+    chmod 0755 "${_root}/usr/local/bin/seance" || return 1
+    return 0
+}
+
+# world_node_sh <node> <shell-command...>  -- fixture work inside a node, with
+# the seance environment set. Not through the oracle: this is the world doing
+# something to itself, not seance acting.
+world_node_sh()
+{
+    local _n
+
+    _n=$1
+    shift
+
+    cluster_exec "${_n}" env \
+        SEANCE_CONF=/etc/seance.conf \
+        SEANCE_STATE_DIR=/var/db/seance \
+        SEANCE_RUN_DIR=/var/run/seance \
+        SEANCE_ADAPTER=/usr/local/seance/tests/cluster/adapter-pseudo.subr \
+        sh -c "$*" < /dev/null
+}
+
+# world_add_guest <guest> <home> <type>
+#
+# Creates the guest on its home node: a dataset root with a LOCAL mountpoint
+# (without one the shadow-mount law has nothing to bite on), a child dataset so
+# that a promotion has a tree rather than a single dataset, and a marker file so
+# that what arrived can be told from what did not.
+world_add_guest()
+{
+    local _g _home _type
+
+    _g=$1
+    _home=$2
+    _type=$3
+
+    WORLD_GUESTS="${WORLD_GUESTS} ${_g}=${_home}"
+    WORLD_GUESTS=${WORLD_GUESTS# }
+    WORLD_GUEST_TYPES="${WORLD_GUEST_TYPES} ${_g}=${_type}"
+    WORLD_GUEST_TYPES=${WORLD_GUEST_TYPES# }
+
+    world_node_sh "${_home}" \
+        ". /usr/local/seance/tests/cluster/adapter-pseudo.subr;
+         adapter_init && pseudo_guest_create ${_g} ${_type} ${_home}" ||
+        { world_fail "creating ${_g} on ${_home}"; return 1; }
+
+    cluster_exec "${_home}" zfs create \
+        "$( cluster_dataset "${_home}" )/${_g}/data" < /dev/null ||
+        { world_fail "creating ${_g}'s child dataset on ${_home}"; return 1; }
+
+    world_node_sh "${_home}" "echo ${_g}-v1 > /seance/${_g}/marker" ||
+        { world_fail "writing ${_g}'s marker"; return 1; }
+
+    return 0
+}
+
+# world_carp_up  -- CARP on every node, exactly as an operator would.
+#
+# What is applied is what `seance verify --render carp` printed on that node:
+# the rendering IS the input, so a rendering ifconfig(8) would refuse fails
+# here rather than on a fleet (D-126).
+world_carp_up()
+{
+    local _n _root _if _render _line _val
+
+    kldload -n carp || { world_fail "kldload -n carp on the guest host"; return 1; }
+
+    for _n in ${WORLD_NODES}; do
+        _root=$( cluster_root "${_n}" ) || return 1
+
+        world_node_sh "${_n}" \
+            'sysctl net.inet.carp.allow=1 net.inet.carp.preempt=1' > /dev/null ||
+            { world_fail "the carp sysctls inside ${_n}"; return 1; }
+        {
+            printf 'net.inet.carp.allow=1\n'
+            printf 'net.inet.carp.preempt=1\n'
+        } >> "${_root}/etc/sysctl.conf" || return 1
+    done
+
+    for _n in ${WORLD_NODES}; do
+        _root=$( cluster_root "${_n}" ) || return 1
+        _if=$( world_carp_if "${_n}" ) || return 1
+        _render="${WORLD_DIR}/carp.${_n}"
+
+        cluster_exec "${_n}" /usr/local/bin/seance verify --render carp \
+            < /dev/null > "${_render}" ||
+            { world_fail "seance verify --render carp on ${_n}"; return 1; }
+
+        grep -v '^#' "${_render}" | grep '^[a-z]' >> "${_root}/etc/rc.conf" ||
+            return 1
+        chmod 0600 "${_root}/etc/rc.conf" || return 1
+
+        while IFS= read -r _line; do
+            case "${_line}" in
+                ifconfig_*_alias*=*) ;;
+                *) continue ;;
+            esac
+
+            _val=${_line#*=}
+            _val=${_val#\"}
+            _val=${_val%%\"*}
+
+            world_node_sh "${_n}" "ifconfig ${_if} ${_val} alias" > /dev/null ||
+                { world_fail "applying [${_val}] to ${_if} inside ${_n}"; return 1; }
+        done < "${_render}"
+    done
+
+    return 0
+}
+
+# world_carp_state <node> <vhid>  -- through the adapter, as seance reads it.
+world_carp_state()
+{
+    world_node_sh "$1" \
+        ". /usr/local/seance/tests/cluster/adapter-pseudo.subr; adapter_carp_state $2" \
+        2>/dev/null
+}
+
+# world_carp_wait <node> <vhid> <state> [seconds]
+world_carp_wait()
+{
+    local _i _limit _got
+
+    _limit=${4:-${WORLD_CARP_WAIT}}
+    _i=0
+
+    while [ "${_i}" -lt "${_limit}" ]; do
+        _got=$( world_carp_state "$1" "$2" )
+        [ "${_got}" = "$3" ] && return 0
+        _i=$(( _i + 1 ))
+        sleep 1
+    done
+
+    return 1
+}
+
+# world_up <n-nodes> <work-dir>
+#
+# Build the whole world and leave it replicating. The guests and their homes
+# are dealt by the CALLER from the seeded stream (world_add_guest), so that the
+# same seed builds the same fleet.
+world_up()
+{
+    WORLD_DIR=$2
+    mkdir -p "${WORLD_DIR}" || return 1
+
+    cluster_up "$1" || { world_fail "cluster_up $1"; return 1; }
+
+    WORLD_NODES=$( cluster_nodes | tr '\n' ' ' )
+    WORLD_NODES=${WORLD_NODES% }
+
+    return 0
+}
+
+# world_configure
+#
+# Called after the guests have been dealt: writes the configuration every node
+# shares, installs the wrapper and the fence driver, and brings CARP up.
+world_configure()
+{
+    local _n _conf
+
+    _conf="${WORLD_DIR}/seance.conf"
+    world_write_conf "${_conf}" || return 1
+
+    for _n in ${WORLD_NODES}; do
+        cp "${_conf}" "$( cluster_root "${_n}" )/etc/seance.conf" || return 1
+        mkdir -p "$( cluster_root "${_n}" )/usr/local/etc/cron.d" || return 1
+        mkdir -p "$( cluster_root "${_n}" )/usr/local/etc/devd" || return 1
+        world_install_wrapper "${_n}" || return 1
+    done
+
+    fence_install || { world_fail "fence_install"; return 1; }
+
+    world_carp_up || return 1
+
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# Observation
+#
+# The observed state of invariants.subr's file contract. Everything here is
+# read from the SUBSTRATE HOST rather than from inside a node, because a node
+# being dead is not a reason for its datasets to stop existing -- an observer
+# that could not see a stopped node's disks would turn invariant 4 into a check
+# that fires on every kill event and is therefore switched off within a week.
+# ---------------------------------------------------------------------------
+
+# world_jail_up <node>  -- rc 0 if the node's jail is running.
+world_jail_up()
+{
+    jls -j "$( cluster_jail_name "$1" )" jid > /dev/null 2>&1
+}
+
+# world_node_state <node>  -- alive | isolated | dead, MEASURED.
+#
+# Measured rather than assumed, because a fence changes it: the ladder's rung 4
+# stops the target's jail through the driver, so a node the trace isolated can
+# be dead by the time the next event is chosen. A model that did not learn that
+# would pick a `heal` for a node with no interface to heal.
+world_node_state()
+{
+    local _dir _br _epa
+
+    world_jail_up "$1" || { printf 'dead\n'; return 0; }
+
+    _dir=$( cluster_dir ) || return 1
+    _br=$( cat "${_dir}/bridge" )
+    _epa="$( cat "${_dir}/$1/epair" )a"
+
+    if ifconfig "${_br}" 2>/dev/null | grep -q "member: ${_epa} "; then
+        printf 'alive\n'
+    else
+        printf 'isolated\n'
+    fi
+}
+
+# world_guest_of_dataset <node-dataset> <dataset>
+#
+# Which guest a dataset belongs to: the first component under the node's root,
+# or the third under standby/<homekey>/. Prints nothing for the node root, the
+# standby parent and the configuration mirror -- the mirror is seance's own
+# bookkeeping and is not a guest (D-84).
+world_guest_of_dataset()
+{
+    local _rel _g
+
+    _rel=${2#"$1"}
+    _rel=${_rel#/}
+
+    [ -n "${_rel}" ] || return 0
+
+    case "${_rel}" in
+        standby) return 0 ;;
+        standby/*)
+            _rel=${_rel#standby/}
+            # <standby>/<homekey> with nothing after it is the per-home parent,
+            # which is not a guest. Without this the parent's own name reads as
+            # a guest called after the dead node -- observed against a fake
+            # substrate before this file ever met a real one.
+            case "${_rel}" in
+                */*) _rel=${_rel#*/} ;;
+                *) return 0 ;;
+            esac
+            ;;
+    esac
+
+    _g=${_rel%%/*}
+
+    [ -n "${_g}" ] || return 0
+    [ "${_g}" = "${REPL_SYS_GUEST:-seance-sys}" ] && return 0
+
+    printf '%s\n' "${_g}"
+}
+
+# world_observe <dir>
+#
+# Every file invariants.subr's contract calls mandatory, written even when it
+# is empty: a missing file is a contract error there, which is the correct
+# answer to a driver that forgot to look.
+world_observe()
+{
+    local _dir _n _root _ds _g _home _line _guest _snap _prop _val _name _held
+
+    _dir=$1
+    mkdir -p "${_dir}" || return 1
+
+    : > "${_dir}/running"
+    : > "${_dir}/placement"
+    : > "${_dir}/snapshots"
+    : > "${_dir}/records"
+    : > "${_dir}/props"
+    : > "${_dir}/datasets"
+    [ -f "${_dir}/invocations" ] || : > "${_dir}/invocations"
+
+    for _n in ${WORLD_NODES}; do
+        _root=$( cluster_root "${_n}" ) || return 1
+        _ds=$( cluster_dataset "${_n}" ) || return 1
+
+        # --- running -------------------------------------------------------
+        #
+        # A stopped node runs nothing. The pseudo adapter's "running" is a
+        # RECORD and records survive a power cut, so a node whose jail is gone
+        # would otherwise still claim the estate it was running when it died --
+        # and invariant 1 would fire on every correct promotion after a kill.
+        if world_jail_up "${_n}"; then
+            if [ -r "${_root}/var/db/seance-pseudo/guests.tsv" ]; then
+                awk -F "${WORLD_TAB}" -v OFS="${WORLD_TAB}" -v n="${_n}" \
+                    'NF >= 6 && $5 == "1" { print $1, n, "1" }' \
+                    "${_root}/var/db/seance-pseudo/guests.tsv" \
+                    >> "${_dir}/running"
+            fi
+        fi
+
+        # --- placement: what this node claims, and what it is withholding ---
+        #
+        # ONE row per (node, guest), and `held` beats `active`: the contract's
+        # two words are the two answers to one question, and a node whose gate
+        # is withholding a guest is not a node claiming to run it. Emitting both
+        # would make invariant 1 fire on a returning node that the gate had just
+        # correctly stopped -- which is the state the gate EXISTS to produce.
+        #
+        # A STOPPED NODE KEEPS ITS CLAIMS, unlike its `running` rows above, and
+        # the asymmetry is deliberate. `running` is a process and a stopped node
+        # has none; a placement record is durable evidence that a node was
+        # authorised to host a guest, and nobody can rewrite it while the node is
+        # off. Suppressing it would make a kill look like a guest coming home:
+        # invariant 2's clause C compares the effective placement of two
+        # observations, and an absent claim reads as "moved back to its home
+        # with no failback record" -- a firing about a node that simply lost
+        # power. The claim stands until the node comes back and its gate settles
+        # it (D-21), which is what the `held` rows then say.
+        _held=""
+        if [ -r "${_root}/var/db/seance-pseudo/guests.tsv" ]; then
+            _held=$( awk -F "${WORLD_TAB}" 'NF >= 6 && $6 == "1" { print $1 }' \
+                "${_root}/var/db/seance-pseudo/guests.tsv" | tr '\n' ' ' )
+        fi
+
+        if [ -r "${_root}/var/db/seance/placement" ]; then
+            awk -F "${WORLD_TAB}" -v OFS="${WORLD_TAB}" -v n="${_n}" \
+                -v held=" ${_held}" \
+                'NF >= 2 {
+                    print n, $1, (index(held, " " $1 " ") ? "held" : "active")
+                }' "${_root}/var/db/seance/placement" >> "${_dir}/placement"
+        fi
+
+        for _g in ${_held}; do
+            awk -F "${WORLD_TAB}" -v g="${_g}" \
+                'NF >= 2 && $1 == g { found = 1 } END { exit found ? 0 : 1 }' \
+                "${_root}/var/db/seance/placement" 2>/dev/null && continue
+            printf '%s\t%s\t%s\n' "${_n}" "${_g}" "held" >> "${_dir}/placement"
+        done
+
+        # --- records --------------------------------------------------------
+        if [ -r "${_root}/var/db/seance/succession.log" ]; then
+            awk -v OFS="${WORLD_TAB}" -v n="${_n}" '{ print n "\t" $0 }' \
+                "${_root}/var/db/seance/succession.log" >> "${_dir}/records"
+        fi
+
+        # --- snapshots and datasets, from the host ---------------------------
+        zfs list -H -o name -t snapshot -r "${_ds}" 2>/dev/null |
+            while IFS= read -r _line; do
+                _name=${_line%@*}
+                _snap=${_line#*@}
+                _guest=$( world_guest_of_dataset "${_ds}" "${_name}" )
+                [ -n "${_guest}" ] || continue
+                printf '%s\t%s\t%s\n' "${_n}" "${_guest}" "${_snap}" \
+                    >> "${_dir}/snapshots"
+            done
+
+        zfs list -H -o name -t filesystem,volume -r "${_ds}" 2>/dev/null |
+            awk -v OFS="${WORLD_TAB}" -v n="${_n}" '{ print n, $0 }' \
+                >> "${_dir}/datasets"
+
+        # --- properties, of the REPLICAS ------------------------------------
+        #
+        # A guest's copy on its own home is the original, not a replica: it
+        # carries the mountpoint the platform gave it and it always will.
+        # Invariant 4a is the shadow-mount law, which is about copies that must
+        # never be able to mount themselves; what stops a returning home from
+        # starting its original is the boot gate, and that is invariant 1's
+        # business (D-112, resolved here in the driver rather than by widening
+        # the invariant).
+        zfs get -H -o name,property,value -r -t filesystem,volume \
+            canmount,mountpoint "${_ds}" 2>/dev/null |
+            while IFS= read -r _line; do
+                _name=$( printf '%s\n' "${_line}" | cut -f 1 )
+                _prop=$( printf '%s\n' "${_line}" | cut -f 2 )
+                _val=$( printf '%s\n' "${_line}" | cut -f 3 )
+                _guest=$( world_guest_of_dataset "${_ds}" "${_name}" )
+                [ -n "${_guest}" ] || continue
+                [ "${_name}" = "${_ds}/${_guest}" ] && continue
+                case "${_name}" in
+                    */standby/*/"${_guest}") ;;
+                    *) continue ;;
+                esac
+                printf '%s\t%s\t%s\t%s\n' "${_n}" "${_guest}" "${_prop}" "${_val}" \
+                    >> "${_dir}/props"
+            done
+    done
+
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# The events (DESIGN §4)
+#
+# Each takes the arguments the generator drew and applies them to the cluster.
+# None of them judges anything: an event that produces a refusal has done its
+# job, and whether the refusal was right is the checker's question.
+# ---------------------------------------------------------------------------
+
+# world_tick
+#
+# Advance the clock by one cadence and replicate on every node that is running.
+# An ISOLATED node ticks too, and that is the point: it is alive, its disk does
+# not know it has been cut off, and what it does with peers it cannot reach is
+# exactly what this tier is for.
+#
+# ALL AT ONCE, and for two reasons. It is what a fleet does -- every node runs
+# the same crontab line and nothing staggers them, so ticks that overlap are
+# the normal case and not an exotic one. And it is what makes this tier
+# affordable: seance's ssh carries ConnectTimeout=10 (lib/transport.subr, and
+# D-111 records that a site cannot lengthen or shorten it), so every pair
+# pointing at a node the trace has killed costs ten seconds. Sequentially, a
+# tick with one dead peer and four guests costs the better part of a minute per
+# node; concurrently it costs that once.
+world_tick()
+{
+    local _n _rc _pids _p
+
+    _rc=0
+    _pids=""
+    WORLD_NOW=$(( WORLD_NOW + WORLD_CADENCE ))
+
+    for _n in ${WORLD_NODES}; do
+        case "$( world_node_state "${_n}" )" in
+            dead) continue ;;
+        esac
+        world_seance_bg "${_n}" "repl@${_n}" repl
+        _pids="${_pids} $!"
+    done
+
+    for _p in ${_pids}; do
+        wait "${_p}" || _rc=1
+    done
+
+    return "${_rc}"
+}
+
+# world_kill <node>  -- power loss. The fence driver will find it stopped.
+world_kill()
+{
+    cluster_stop "$1" || { world_fail "cluster_stop $1"; return 1; }
+}
+
+# world_isolate <node>  -- alive, and unreachable.
+world_isolate()
+{
+    cluster_isolate "$1" || { world_fail "cluster_isolate $1"; return 1; }
+}
+
+# world_heal <node>
+world_heal()
+{
+    cluster_heal "$1" || { world_fail "cluster_heal $1"; return 1; }
+}
+
+# world_flap <node>  -- cut and restored inside one event, with no tick between.
+world_flap()
+{
+    world_isolate "$1" || return 1
+    sleep 1
+    world_heal "$1" || return 1
+}
+
+# world_promote <dead> <heir>
+#
+# The automatic path, which is the only one a fleet takes without a human: the
+# ladder decides. The wait for CARP is the world settling, not a rung being
+# skipped -- the promotion runs whatever CARP ended up saying.
+world_promote()
+{
+    local _v
+
+    _v=$( world_vhid "$1" ) || return 1
+    world_carp_wait "$2" "${_v}" MASTER > /dev/null 2>&1
+
+    world_seance "$2" "promote@$2" promote "$1" --auto
+    return 0
+}
+
+# world_double_trigger <dead> <heir1> <heir2>
+#
+# Both heirs told at the same instant. Exactly one may act, and which one is
+# not this driver's business: CARP hands the vhid to one of them and the claim
+# check is behind that. What is asserted afterwards is invariant 1, from the
+# cluster's own state.
+world_double_trigger()
+{
+    local _v _p1
+
+    _v=$( world_vhid "$1" ) || return 1
+    world_carp_wait "$2" "${_v}" MASTER > /dev/null 2>&1
+
+    world_seance_bg "$2" "promote@$2" promote "$1" --auto
+    _p1=$!
+    world_seance "$3" "promote@$3" promote "$1" --auto
+    wait "${_p1}"
+
+    return 0
+}
+
+# world_return <node>
+#
+# A node comes back. cluster_start alone is not a reboot: the pseudo adapter's
+# "running" is a record, so a restarted node would claim to be running the
+# estate it was running when it died -- and a returning node that claims to be
+# running its estate is a fiction the gate would then be tested against. A real
+# node that has just booted is running nothing until its autostart says
+# otherwise, which is precisely the instant the gate exists for.
+#
+# The gate runs BEFORE anything else on that node, which is the rc.d ordering
+# (D-74) expressed in a fixture that has no rc(8).
+world_return()
+{
+    local _root _db
+
+    # A NODE THAT COMES BACK COMES BACK ON THE NETWORK. A node the trace
+    # isolated and then killed is still off the bridge while it is down, so
+    # starting its jail would produce a node the guest host cannot ssh to --
+    # cluster_start waits sixty seconds for that and then fails, which is the
+    # fixture failing rather than seance. The model's `return` says the node is
+    # alive (DESIGN §5), so the world says the same thing: the cable is in
+    # again. An isolation that is meant to outlive a reboot is a separate
+    # event, and the generator can always draw one.
+    # (Found by seed 2950315648: `isolate alpha`, `kill alpha`, `return alpha`,
+    # and a run that died in the substrate at step 25.)
+    cluster_heal "$1" || world_diag "could not put ${1} back on the bridge"
+
+    cluster_start "$1" || { world_fail "cluster_start $1"; return 1; }
+
+    _root=$( cluster_root "$1" ) || return 1
+    _db="${_root}/var/db/seance-pseudo/guests.tsv"
+
+    if [ -r "${_db}" ]; then
+        awk -F "${WORLD_TAB}" -v OFS="${WORLD_TAB}" 'NF >= 6 { $5 = 0 } { print }' \
+            "${_db}" > "${_db}.boot" || return 1
+        mv "${_db}.boot" "${_db}" || return 1
+    fi
+
+    world_seance "$1" "gate@$1" gate
+
+    # AND THEN THE AUTOSTART, which is the half the gate exists to get in front
+    # of. On a real node CBSD's `jails-astart` starts every guest with
+    # astart=1, and the gate is ordered before it precisely so that a guest a
+    # survivor is already running has been put into slave mode by then
+    # (D-21, D-74). Without this the fixture would have a gate with nothing to
+    # prevent: the returning node would start nothing whatever the gate did,
+    # and `boot gate removed` would look exactly like `boot gate working`.
+    # shellcheck disable=SC2016
+    #   The single quotes are the point: this is source text for a shell
+    #   INSIDE the node, and ${_n} is that shell's variable rather than one of
+    #   ours to expand here.
+    world_node_sh "$1" \
+        '. /usr/local/seance/tests/cluster/adapter-pseudo.subr
+         adapter_init || exit 1
+         adapter_guest_list | while IFS="	" read -r _n _t _a _s _r; do
+             [ "${_a}" = "1" ] || continue
+             adapter_guest_start "${_n}" > /dev/null 2>&1 || :
+         done
+         exit 0' > /dev/null 2>&1
+
+    return 0
+}
+
+# world_failback <guest> <home>  -- bring a guest home, from its home node.
+world_failback()
+{
+    world_seance "$2" "failback@$2" failback "$1"
+    return 0
+}
+
+# world_prune_during_send <node> <guest>
+#
+# A send is started in the background; a second `repl` for the same pair must
+# skip on the lock rather than corrupt anything (D-62); and a retention prune
+# removes the OLDEST snapshot of the guest under it. What this is looking for
+# is a prune that removes the base of a send that started before the prune --
+# the failure DESIGN §0 names as the thing only history produces.
+world_prune_during_send()
+{
+    local _node _guest _ds _old _pid
+
+    _node=$1
+    _guest=$2
+    _ds=$( world_guest_dataset "${_node}" "${_guest}" ) || return 1
+
+    world_seance_bg "${_node}" "repl-bg@${_node}" repl --now --guest "${_guest}"
+    _pid=$!
+
+    world_seance "${_node}" "repl-locked@${_node}" repl --now --guest "${_guest}"
+
+    _old=$( zfs list -H -o name -t snapshot -r "${_ds}" 2>/dev/null |
+        awk -F '@' -v d="${_ds}" '$1 == d && $2 ~ /^seance-/ { print $2 }' |
+        sort | awk 'NR == 1 { print }' )
+
+    if [ -n "${_old}" ]; then
+        zfs destroy -r "${_ds}@${_old}" 2>/dev/null ||
+            world_diag "the prune of ${_ds}@${_old} did not take"
+    fi
+
+    wait "${_pid}"
+
+    return 0
+}
+
+# world_hostile_snap <node> <guest> <kind>
+#
+# A snapshot seance did not write, on a dataset seance owns: either a foreign
+# tool's (`@zrepl-...`) or something wearing seance's prefix with a timestamp
+# that is not one. Neither may be read as lineage, and neither may stop a tick.
+world_hostile_snap()
+{
+    local _ds _name
+
+    _ds=$( world_guest_dataset "$1" "$2" ) || return 1
+
+    zfs list -H -o name "${_ds}" > /dev/null 2>&1 || return 0
+
+    case "$3" in
+        foreign) _name="zrepl_20200101_000000_000" ;;
+        *)       _name="seance-$1-notatimestamp" ;;
+    esac
+
+    zfs snapshot "${_ds}@${_name}" 2>/dev/null ||
+        world_diag "could not plant ${_ds}@${_name}"
+
+    return 0
+}
+
+# world_hand_mount <guest> <peer> <placement>
+#
+# Somebody mounts a replica by hand. The next tick from the guest's own node
+# must either put it back (canmount=noauto, mountpoint=none) and log it, or
+# refuse that pair with a FAIL line; silent acceptance is not among the choices
+# (DESIGN §6, invariant 4a). This function does the mounting and the tick, and
+# prints `refused` when seance chose the second answer, so the caller can tell
+# the model.
+world_hand_mount()
+{
+    local _g _peer _place _home _ds _out
+
+    _g=$1
+    _peer=$2
+    _place=$3
+    _home=$( world_home "${_g}" ) || return 1
+
+    _ds=$( world_replica_root "${_peer}" "${_home}" "${_g}" )
+
+    zfs list -H -o name "${_ds}" > /dev/null 2>&1 || return 0
+
+    cluster_exec "${_peer}" zfs set canmount=on "${_ds}" < /dev/null ||
+        world_diag "could not set canmount=on on ${_ds}"
+    cluster_exec "${_peer}" zfs set "mountpoint=/mnt/handmount-${_g}" "${_ds}" \
+        < /dev/null || world_diag "could not set a mountpoint on ${_ds}"
+
+    # The tick's own exit status is not read: a tick with an unreachable peer
+    # exits 1 for that pair and has still done the repair this event is about.
+    # What is read is what it SAID about this guest.
+    world_seance "${_place}" "repl-repair@${_place}" repl --now --guest "${_g}"
+
+    # DID IT REFUSE, or did it repair? The two are the only coherent answers
+    # (DESIGN §6, invariant 4a) and the caller tells the model which, so that a
+    # refused pair is exempted from 4a and a repaired one is not.
+    #
+    # The match is deliberately narrow: an UPPERCASE refusal token on the same
+    # line as the guest. `grep -i fail` would match the verdict line's own "2
+    # failed" on any tick with an unreachable peer, and reading that as a
+    # refusal would exempt the pair from 4a for the rest of the run -- which is
+    # the invariant switching itself off, quietly, exactly where it was about to
+    # be useful.
+    _out="${ORACLE_LAST_DIR}/stdout"
+    if [ -r "${_out}" ] && grep -E "FAIL" "${_out}" | grep -q -- "${_g}"; then
+        printf 'refused\n'
+    fi
+
+    return 0
+}

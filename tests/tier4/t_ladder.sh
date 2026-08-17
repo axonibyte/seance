@@ -328,12 +328,27 @@ zfs_rollback_r()
 W_GUESTROOT=""
 W_TREE=coherent
 
+# THE CRASHED VERIFIER, and it has to be here rather than in the mock's script.
+#
+# `lineage=empty0` means the snapshot listing exits 0 having printed NOTHING --
+# the August catalogue's crashed checker, whose silence read as success. It used
+# to be scripted into the mock with a key built from ${W_ESTATE}, which is TWO
+# lines: the script came out malformed, the mock answered the contract error it
+# should have, and the row passed while measuring a different failure entirely.
+# Found by tests/rediscovery/verifier-masks-crash.patch, which reverts the
+# protection this row exists for and which this row did not notice.
+W_LINEAGE=fresh
+
 # shellcheck disable=SC2329
 lineage_listing()
 {
     local _want _root _base _ahead _ts
 
     _want=$1
+
+    if [ "${W_LINEAGE}" = "empty0" ]; then
+        return 0
+    fi
 
     # The configuration mirror is a tree of its own, and it has a real lineage:
     # if it did not, it would be kept out of the estate by having no snapshots
@@ -387,6 +402,7 @@ world_build()
     local _spec _kv _k _v
     local _nodes _reach _dead _fence _lineage _claim _peermute _kernel _guest _notify
     local _sysdir _mirror _tree _auto _fleetauto _armed _carp _vhid _succ
+    local _override
     local _conf _wd _n _lnow
 
     _spec=$1
@@ -410,6 +426,7 @@ world_build()
     _carp=MASTER
     _vhid=yes
     _succ=default
+    _override=-
 
     [ "${_spec}" = "-" ] && _spec=""
 
@@ -436,6 +453,7 @@ world_build()
             carp)    _carp=${_v} ;;
             vhid)    _vhid=${_v} ;;
             succ)    _succ=${_v} ;;
+            override) _override=${_v} ;;
             *)
                 t_diag "world_build: unknown setting: ${_kv}"
                 return 2
@@ -508,6 +526,7 @@ pool0/bravo/standby/alpha/${REPL_SYS_GUEST}"
 
     # --- the replica's lineage --------------------------------------------
     W_TREE=${_tree}
+    W_LINEAGE=${_lineage}
 
     SEANCE_MOCK_LINEAGE_NODE=alpha
     SEANCE_MOCK_LINEAGE_N=3
@@ -518,8 +537,6 @@ pool0/bravo/standby/alpha/${REPL_SYS_GUEST}"
         absent) _lnow=${NOW}; SEANCE_MOCK_LINEAGE_NODE=bravo ;;
         empty0)
             _lnow=${NOW}
-            printf 'mock_zfs_list %s\tempty0\n' "${W_ESTATE}" \
-                > "${SEANCE_MOCK_SCRIPT}"
             ;;
         *) t_diag "world_build: unknown lineage: ${_lineage}"; return 2 ;;
     esac
@@ -674,6 +691,12 @@ pool0/bravo/standby/alpha/${REPL_SYS_GUEST}"
         printf 'node_bravo_vhid_ip=192.0.2.102/32\n'
         [ "${_armed}" = "yes" ] && printf 'node_bravo_auto_promote=alpha\n'
 
+        # A per-guest heir override (D-29): the guest's succession, not the
+        # node's. It is what makes the woken node NOT the guest's actor, which
+        # is the whole of D-130.
+        [ "${_override}" != "-" ] &&
+            printf 'guest_%s_heir=%s\n' "${_guest}" "${_override}"
+
         _n=3
         while [ "${_n}" -le "${_nodes}" ]; do
             case "${_n}" in
@@ -798,7 +821,7 @@ fi
 # One assertion per row, plus the twenty-five named assertions below. A table
 # with no rows would have produced a green run of nothing, which is why the
 # count is derived from the table rather than written down.
-t_plan $(( NROWS + 63 ))
+t_plan $(( NROWS + 72 ))
 
 SAVED=$( t_tmpdir )
 
@@ -835,6 +858,9 @@ for row in ${ROWS}; do
     [ -r "${SEANCE_MOCK_LOG}" ] && cp "${SEANCE_MOCK_LOG}" "${SAVED}/${id}.mock"
     [ -r "${FENCE_MOCK_LOG}" ] && cp "${FENCE_MOCK_LOG}" "${SAVED}/${id}.fence"
     [ -r "${ROWDIR}/logger.log" ] && cp "${ROWDIR}/logger.log" "${SAVED}/${id}.logger"
+    [ -r "${ROWDIR}/notify.body" ] && cp "${ROWDIR}/notify.body" "${SAVED}/${id}.notify"
+    [ -r "${ROWDIR}/notify.subject" ] &&
+        cp "${ROWDIR}/notify.subject" "${SAVED}/${id}.notify.subject"
     [ -r "${SEANCE_STATE_DIR}/succession.log" ] &&
         cp "${SEANCE_STATE_DIR}/succession.log" "${SAVED}/${id}.succession"
     [ -r "${SEANCE_STATE_DIR}/placement" ] &&
@@ -1044,6 +1070,47 @@ for row in auto-transient auto-probes auto-fence-unknown auto-quorum-n2; do
     t_unlike "$( cat "${SAVED}/${row}.mock" )" 'adapter_guest_start' \
         "${row}: a rung 1-4 that is not green starts nothing"
 done
+
+# ---------------------------------------------------------------------------
+# A per-guest override the automatic path cannot act on (D-129, D-130)
+#
+# CARP hands the dead node's vhid to ONE node and rung 1 has just confirmed it
+# is this one; every other participant is BACKUP and its own --auto run stops at
+# rung 1. So a guest whose per-guest succession names somebody else as its actor
+# is a guest nothing will promote. Before D-130 that was a stand-down, which the
+# automatic path does not page for, and the guest stayed down in silence -- the
+# outcome D-129 recorded and this pair of rows now pins.
+#
+# The manual row is here for the same reason: what changed is the AUTOMATIC
+# path, and a stand-down a human is reading is still a stand-down.
+# ---------------------------------------------------------------------------
+
+t_like "$( cat "${SAVED}/auto-override-deferred.out" )" \
+    '^  web01: deferred -- succession is charlie, and this node is not the actor for it' \
+    "an automatic run defers a guest whose actor is another node"
+t_like "$( cat "${SAVED}/auto-override-deferred.out" )" \
+    'run "seance promote alpha --guest web01" on charlie' \
+    "and prints the exact command, and the node that has to run it"
+t_like "$( cat "${SAVED}/auto-override-deferred.out" )" \
+    '^deferred — no automation will promote these' \
+    "the deferrals are collected before the verdict line, which is still last"
+t_like "$( cat "${SAVED}/auto-override-deferred.out" )" \
+    '^promote: 0 of 1 guest\(s\) promoted from alpha.*disposition deferred$' \
+    "and the verdict line counts them as deferred rather than as stood down"
+t_like "$( cat "${SAVED}/auto-override-deferred.notify" )" \
+    'seance promote alpha --guest web01   \(on charlie\)' \
+    "the automatic run PAGES, with the command in the body: this is D-130's point"
+t_like "$( cat "${SAVED}/auto-override-deferred.notify.subject" )" \
+    'automatic promotion of alpha stopped \(deferred\)' \
+    "and the subject says which node's succession stopped"
+t_unlike "$( cat "${SAVED}/auto-override-deferred.mock" )" 'adapter_guest_start' \
+    "a deferred guest is not started here: deferring is standing down, loudly"
+
+t_like "$( cat "${SAVED}/override-manual.out" )" \
+    '^  web01: stand-down -- succession is charlie, and this node is not the actor for it' \
+    "a MANUAL run still stands down, because a human is reading the line"
+t_is "$( ls "${SAVED}/override-manual.notify" 2>/dev/null )" "" \
+    "and does not page: the page is what the automatic path has instead of a reader"
 
 # ---------------------------------------------------------------------------
 # --force's own vocabulary

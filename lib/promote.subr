@@ -24,6 +24,9 @@
 #   5 lineage     per guest: whose it is, whether anybody else already claims
 #                 it, whether the replica is fresh enough, and -- for jails --
 #                 whether this fleet is kernel-homogeneous.
+#                 On the AUTOMATIC path a guest whose actor is another node is
+#                 `deferred` rather than `stand-down`, and the run pages with
+#                 the command that node must run (D-130).
 #   6 promotion   per guest, alphabetically: mount the replica in place at the
 #                 paths the platform expects, relink, register, start, verify,
 #                 record, report the RPO.
@@ -97,6 +100,12 @@ PROMOTE_SEP=" — "
 PROMOTE_TAB=$( printf '\t.' )
 PROMOTE_TAB=${PROMOTE_TAB%.}
 
+# A literal newline, for the one thing here that accumulates lines rather than
+# printing them as it goes (PROMOTE_DEFERRED, read by promote_auto_report long
+# after the guest that produced it was decided).
+PROMOTE_NL='
+'
+
 # Set by promote_run and read by it, by the dispatcher and -- in tier 4 -- by
 # the table driver, which is why they are named rather than passed: the ladder
 # is one long decision and its outcome has several parts.
@@ -104,7 +113,8 @@ PROMOTE_DEAD=""             # the node key being succeeded
 PROMOTE_FORCE=""            # the rungs an operator forced, space separated
 PROMOTE_OPERATOR=""         # who said so
 PROMOTE_EVIDENCE=""         # fence:<driver> | force:<operator>
-PROMOTE_DISPOSITION=""      # proceed | abort | notify | force-only | stand-down
+PROMOTE_DISPOSITION=""      # proceed | abort | notify | force-only | deferred
+                            #   | stand-down
 PROMOTE_STOPPED_RUNG=""     # "<n> <name>" when the ladder stopped
 PROMOTE_REACHABLE=""        # living peer keys, space separated
 PROMOTE_UNREPORTED=""       # living peers that could NOT state their placement
@@ -113,6 +123,8 @@ PROMOTE_KERNEL_DETAIL=""
 PROMOTE_GUESTS_PROMOTED=0
 PROMOTE_GUESTS_SEEN=0
 PROMOTE_GUEST_DISPOSITIONS=""   # "<guest>=<disposition>" per guest, space sep
+PROMOTE_DEFERRED=""             # one line per deferred guest: the command, and
+                                # the node that has to run it (D-130)
 PROMOTE_TMPDIR=""               # scratch for one run
 PROMOTE_AUTO=0                  # 1 when devd, not a human, is the trigger
 PROMOTE_AUTO_VHID=""            # the vhid whose MASTER transition must still hold
@@ -422,22 +434,41 @@ promote_rung_arming()
 # Rung 1's transient master is deliberately silent. It is the debounce working:
 # a link flapped and seance did nothing, which is the outcome the rung exists
 # to produce, and paging for it would teach an operator to filter these.
+#
+# A DEFERRED GUEST ALWAYS PAGES (D-130). CARP hands a dead node's vhid to one
+# node, and that node is this one -- rung 1 has just re-read it. So a guest
+# whose per-guest succession names some OTHER node as its actor is a guest
+# nobody was woken for: this node correctly stands down and the actor never
+# hears about the death. Before D-130 that was recorded as a stand-down, which
+# this function does not page for, and the guest stayed down in silence. The
+# body carries the exact command the responsible node has to run, because the
+# operator reading the page at 03:00 is not the person who wrote the
+# per-guest override.
 promote_auto_report()
 {
     [ "${PROMOTE_AUTO}" -eq 1 ] || return 0
 
     case "${PROMOTE_DISPOSITION}" in
-        proceed|stand-down) return 0 ;;
+        proceed|stand-down) [ -n "${PROMOTE_DEFERRED}" ] || return 0 ;;
     esac
 
     case "${PROMOTE_STOPPED_RUNG}" in
         1\ *|2\ *|3\ *|4\ *) return 0 ;;
     esac
 
-    printf 'An automatic promotion of %s stopped: disposition %s, %d of %d guest(s) promoted.\nPer-guest:%s\nNothing further will happen without a human.\n' \
-        "${PROMOTE_DEAD}" "${PROMOTE_DISPOSITION}" \
-        "${PROMOTE_GUESTS_PROMOTED}" "${PROMOTE_GUESTS_SEEN}" \
-        "${PROMOTE_GUEST_DISPOSITIONS:- (none)}" |
+    {
+        printf 'An automatic promotion of %s stopped: disposition %s, %d of %d guest(s) promoted.\nPer-guest:%s\n' \
+            "${PROMOTE_DEAD}" "${PROMOTE_DISPOSITION}" \
+            "${PROMOTE_GUESTS_PROMOTED}" "${PROMOTE_GUESTS_SEEN}" \
+            "${PROMOTE_GUEST_DISPOSITIONS:- (none)}"
+
+        if [ -n "${PROMOTE_DEFERRED}" ]; then
+            printf 'DEFERRED -- no automation will promote these; a human must run the command shown, on the node shown:\n%s\n' \
+                "${PROMOTE_DEFERRED}"
+        fi
+
+        printf 'Nothing further will happen without a human.\n'
+    } |
         seance_notify crit "seance: automatic promotion of ${PROMOTE_DEAD} stopped (${PROMOTE_DISPOSITION})"
 
     return 0
@@ -1303,6 +1334,36 @@ promote_claims_gather()
     PROMOTE_UNREPORTED=${PROMOTE_UNREPORTED% }
 }
 
+# promote_actor <heir1> <heir2> <heir1-reachable>
+#
+# Which node acts for a guest with that succession -- the first heir when it is
+# reachable, otherwise the second, otherwise the first anyway (there is nobody
+# else, and naming an unreachable node is more use to an operator than naming
+# none). rc 1 when the succession is empty.
+#
+# The mirror image of pol_am_i_actor, which answers only about the node asking.
+# A deferral has to NAME the node, and a caller that worked the name out for
+# itself would be a second implementation of the succession rule.
+promote_actor()
+{
+    if [ -n "${1:-}" ] && [ "${3:-0}" -eq 1 ]; then
+        printf '%s\n' "$1"
+        return 0
+    fi
+
+    if [ -n "${2:-}" ]; then
+        printf '%s\n' "$2"
+        return 0
+    fi
+
+    if [ -n "${1:-}" ]; then
+        printf '%s\n' "$1"
+        return 0
+    fi
+
+    return 1
+}
+
 # promote_guest_disposition <guest> <replica-root> <newest-ts> <selfkey> <now>
 #
 # The whole of rung 5 for one guest. Prints its own lines and returns:
@@ -1311,7 +1372,7 @@ promote_claims_gather()
 promote_guest_disposition()
 {
     local _guest _ds _ts _self _now _peers _h1 _h2 _reach _actor _claim
-    local _max _skew _force _disp _rc _type _arc _order
+    local _max _skew _force _disp _rc _type _arc _order _who
 
     _guest=$1
     _ds=$2
@@ -1354,6 +1415,29 @@ promote_guest_disposition()
     fi
 
     if [ "${_actor}" != "act" ]; then
+        # THE AUTOMATIC PATH HAS NOBODY ELSE (D-130). A manual run leaves a
+        # stand-down on a terminal a human is reading, and that human can go and
+        # run it on the node the line names. An automatic run has no such
+        # reader, and no second node was woken: CARP gives the dead node's vhid
+        # to exactly one MASTER and rung 1 has just confirmed that this node is
+        # it. Every other participant in that vhid is BACKUP and its own --auto
+        # run stops at rung 1. So a guest whose actor is elsewhere is a guest
+        # nothing will promote, and the difference between the two words is the
+        # difference between an outage somebody is paged about and one nobody
+        # is.
+        if [ "${PROMOTE_AUTO}" -eq 1 ]; then
+            _who=$( promote_actor "${_h1}" "${_h2}" "${_reach}" ) || _who=""
+
+            promote_note "${_guest}: deferred -- succession is ${_order}," \
+                "and this node is not the actor for it." \
+                "CARP woke this node alone, so ${_who:-that node} will not hear about" \
+                "${PROMOTE_DEAD}'s death: run \"seance promote ${PROMOTE_DEAD}" \
+                "--guest ${_guest}\" on ${_who:-the actor}"
+            PROMOTE_DEFERRED="${PROMOTE_DEFERRED}  ${_guest}: seance promote ${PROMOTE_DEAD} --guest ${_guest}   (on ${_who:-the actor})${PROMOTE_NL}"
+            PROMOTE_GUEST_DISPOSITIONS="${PROMOTE_GUEST_DISPOSITIONS} ${_guest}=deferred"
+            return 1
+        fi
+
         promote_note "${_guest}: stand-down -- succession is ${_order}," \
             "and this node is not the actor for it"
         PROMOTE_GUEST_DISPOSITIONS="${PROMOTE_GUEST_DISPOSITIONS} ${_guest}=stand-down"
@@ -1824,6 +1908,7 @@ promote_run()
     PROMOTE_GUESTS_PROMOTED=0
     PROMOTE_GUESTS_SEEN=0
     PROMOTE_GUEST_DISPOSITIONS=""
+    PROMOTE_DEFERRED=""
     PROMOTE_AUTO_VHID=""
 
     PROMOTE_TMPDIR=$( seance_tmpdir ) || {
@@ -2042,6 +2127,14 @@ promote_run()
 
     PROMOTE_DISPOSITION=$( promote_worst_disposition )
 
+    # Before the verdict line, never after it: the verdict is the last line of
+    # stdout (D-110) and the tier-7 oracle reads it as one.
+    if [ -n "${PROMOTE_DEFERRED}" ]; then
+        printf 'deferred%sno automation will promote these; run each command on the node named:\n' \
+            "${PROMOTE_SEP}"
+        printf '%s' "${PROMOTE_DEFERRED}"
+    fi
+
     printf 'promote: %d of %d guest(s) promoted from %s%sevidence %s, disposition %s\n' \
         "${PROMOTE_GUESTS_PROMOTED}" "${PROMOTE_GUESTS_SEEN}" "${_dead}" \
         "${PROMOTE_SEP}" "${PROMOTE_EVIDENCE}" "${PROMOTE_DISPOSITION}"
@@ -2071,6 +2164,16 @@ promote_worst_disposition()
             abort)      printf 'abort\n'; return 0 ;;
             notify)     _w=notify ;;
             force-only) [ "${_w}" = "notify" ] || _w=force-only ;;
+            # deferred outranks stand-down and proceed, and is outranked by
+            # everything that stopped a rung: a run that promoted four guests
+            # and left one for a node nobody woke has not finished, and its
+            # exit status says so (D-130).
+            deferred)
+                case "${_w}" in
+                    notify|force-only) ;;
+                    *) _w=deferred ;;
+                esac
+                ;;
             stand-down) [ -n "${_w}" ] || _w=stand-down ;;
             proceed)    [ -n "${_w}" ] || _w=proceed ;;
         esac

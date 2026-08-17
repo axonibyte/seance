@@ -33,6 +33,8 @@
 #                                 debounce: MASTER is a death, anything else
 #                                 is a link that flapped
 #              vhid=<yes|no>      whether the dead node has a vhid at all
+#              override=<node>    a per-guest heir override naming that node,
+#                                 so that the guest's actor is not this node
 #   force    the --force value, or '-' for no --force at all; '' (empty) is
 #            not expressible here, so 'all' means a bare --force
 #   disp     expected PROMOTE_DISPOSITION, or '-' for none set
@@ -130,3 +132,6 @@ auto-probes	auto=1 dead=ping	-	abort	-	3 probes	1
 auto-fence-unknown	auto=1 fence=unknown	-	notify	-	4 fence	1
 auto-quorum-n2	auto=1 nodes=2 reach=0	-	notify	-	2 quorum	1
 auto-lineage-stale	auto=1 lineage=stale	-	force-only	fence:mock	-	1
+# --- a per-guest override the automatic path cannot act on (D-129, D-130) ----
+override-manual	override=charlie	-	stand-down	fence:mock	-	0
+auto-override-deferred	auto=1 override=charlie notify=ok	-	deferred	fence:mock	-	1

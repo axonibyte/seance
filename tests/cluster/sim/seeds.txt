@@ -27,3 +27,8 @@
 1772760640
 275565795
 2950315648
+
+# 2950315648 is also the window the tier-7 rediscovery rows are run against
+# (D-143): kill at step 1, a promotion that COMPLETES at 4, an isolation at 12,
+# a hand-mount at 22 and a return at 26. It was already in the battery; the
+# comment is here so that nobody trims it as redundant.

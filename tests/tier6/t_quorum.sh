@@ -49,6 +49,15 @@ ESTATE_AUTO=1
 ESTATE_ARM_ALPHA=bravo
 ESTATE_ARM_BRAVO=alpha
 
+# db01's succession is its own: charlie first, bravo second (D-29). CARP still
+# hands alpha's vhid to bravo -- a vhid stands for a NODE identity -- so bravo
+# is woken for a guest whose actor is charlie, and charlie is never woken at
+# all. That is D-129's gap, and what the automatic path does about it is D-130,
+# asserted at the end of this stage.
+ESTATE_OVERRIDE_GUEST=db01
+ESTATE_OVERRIDE_HEIR=charlie
+ESTATE_OVERRIDE_HEIR2=bravo
+
 # shellcheck source-path=SCRIPTDIR
 # shellcheck source=../cluster/lib/estate.subr
 . "${T_ROOT}/tests/cluster/lib/estate.subr"
@@ -61,7 +70,7 @@ if [ "$( id -u )" -ne 0 ]; then
     exit 2
 fi
 
-t_plan 25
+t_plan 31
 
 TAB=$( printf '\t.' )
 TAB=${TAB%.}
@@ -173,5 +182,45 @@ t_is "$( node_seance charlie placement | awk -F "${TAB}" '$1 == "placement" { pr
 t_rc 1 "charlie never registered web01 either" \
     -- cluster_exec charlie sh -c \
     "awk -F'\t' '\$1 == \"web01\"' /var/db/seance-pseudo/guests.tsv | grep ."
+
+# ---------------------------------------------------------------------------
+# The guest CARP woke nobody for (D-129, D-130)
+#
+# db01's own succession names charlie first. CARP handed alpha's vhid to bravo,
+# because a vhid stands for a node identity and bravo is alpha's heir; charlie
+# never became MASTER for anything and never heard that alpha died. So the node
+# that was woken is not db01's actor, and the node that IS its actor is not
+# coming.
+#
+# The fail-safe direction held either way -- a guest that did not come back is
+# an outage and not a split brain -- and that is exactly why it needed fixing:
+# before D-130 the woken node recorded a `stand-down`, which is a correct
+# outcome that the automatic path does not page for, and db01 stayed down in
+# silence. What is asserted here is the page: the disposition, the exact
+# command, and the node it has to be run on.
+# ---------------------------------------------------------------------------
+
+t_rc 1 "bravo did not register db01: it is not db01's actor" \
+    -- cluster_exec bravo sh -c \
+    "awk -F'\t' '\$1 == \"db01\"' /var/db/seance-pseudo/guests.tsv | grep ."
+t_is "$( node_seance bravo placement |
+    awk -F "${TAB}" '$1 == "placement" && $2 == "db01" { print $2 }' )" "" \
+    "and claims nothing for it"
+
+DEFER=$( t_tmpdir )/defer.out
+node_seance bravo promote alpha --auto --guest db01 > "${DEFER}" 2>&1
+DEFER_RC=$?
+
+t_is "${DEFER_RC}" "1" \
+    "an automatic run for that guest alone does not exit 0: something is left for a human"
+t_like "$( cat "${DEFER}" )" \
+    '^  db01: deferred -- succession is charlie bravo, and this node is not the actor for it' \
+    "it is DEFERRED rather than stood down, and the succession it read is named"
+t_like "$( cat "${DEFER}" )" \
+    'run "seance promote alpha --guest db01" on charlie' \
+    "with the exact command, and the node that has to run it"
+t_like "$( cat "${DEFER}" )" \
+    '^promote: 0 of 1 guest\(s\) promoted from alpha.*disposition deferred$' \
+    "and the verdict line counts it as deferred"
 
 t_done
