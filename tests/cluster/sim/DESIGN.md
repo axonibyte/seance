@@ -63,8 +63,17 @@ seeds and this document.)*
   `SEANCE_NOW` (an epoch the driver advances by a "virtual tick" per event);
   the driver sets it for every seance invocation so replication cadence and
   staleness are functions of the trace, not of the guest's speed. (`repl`
-  reads `SEANCE_NOW` when set; production never sets it. This hook already
-  exists or must be added by M3 with a tier-1 test.)
+  reads `SEANCE_NOW` when set; production never sets it.)
+
+  *(As built in M3, per D-120: `pol_now` is the single place, so every verb
+  gets the hook and none of them has one of its own. A `SEANCE_NOW` that is set
+  and is NOT a non-negative epoch is a CONTRACT ERROR -- rc 2, no output -- and
+  never a quiet fall back to the real clock, because a seeded run that silently
+  used wall time is a run the shrinker would then spend hours bisecting for
+  nothing. The world driver must therefore treat a failed `pol_now` as its own
+  bug. Pinned by `tests/tier1/t_policy_now.sh`, including that an exported value
+  reaches a child process -- which `repl`'s per-pair re-execution under
+  `lockf(1)` (D-62) depends on.)*
 
 ## 3. Actors and world
 

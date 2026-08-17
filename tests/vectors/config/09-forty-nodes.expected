@@ -11,6 +11,9 @@ fleet unset ssh_extra_opts
 fleet runtime standby_root
 fleet unset notify_cmd
 fleet unset witness
+fleet unset carp_interface
+fleet unset carp_pass
+fleet default auto 0
 node n01 nodename n01.example.net
 node n01 mgmt n01-mgmt.example.net
 node n01 heir n02

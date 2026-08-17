@@ -102,7 +102,10 @@ failback_assist()
             ;;
 
         snapshot)
-            _now=$( pol_now )
+            _now=$( pol_now ) || {
+                printf 'failback-assist: FAIL (this node cannot read its own clock)\n'
+                return 1
+            }
             _ts=$( pol_epoch_to_ts "${_now}" ) || {
                 printf 'failback-assist: FAIL (cannot render the current time)\n'
                 return 1
@@ -179,7 +182,10 @@ failback_assist()
                 return 0
             fi
 
-            _now=$( pol_now )
+            _now=$( pol_now ) || {
+                printf 'failback-assist: FAIL (this node cannot read its own clock)\n'
+                return 1
+            }
             if ! promote_record "${_guest}" "${_self}" "${_home}" "${_now}" failback; then
                 printf 'failback-assist: FAIL (the succession record could not be appended)\n'
                 return 1
@@ -756,7 +762,10 @@ failback_run()
     fi
     sed -e 's/^/  /' "${_tmp}/rel"
 
-    _now=$( pol_now )
+    _now=$( pol_now ) || {
+        printf 'failback: FAIL (this node cannot read its own clock)\n'
+        return 1
+    }
     promote_record "${_guest}" "${_interim}" "${_self}" "${_now}" "${_evidence}" ||
         printf 'failback: WARNING -- the succession record could not be appended here\n'
 

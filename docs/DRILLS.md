@@ -15,11 +15,11 @@ checkable claim rather than a recollection.
 | drill-replication | M1 | **documented below; fleet execution pending** |
 | drill-guest | M2 | **documented below; fleet execution pending** |
 | drill-failback | M2 | **the second half of drill-guest; runnable alone** |
+| drill-node | M3 | **documented below; fleet execution pending** |
 | drill-fence | M4 | not yet written (M4) |
-| drill-node | M3 | not yet written (M3) |
 
-The M3 and M4 drills are deliberately absent: a drill for a verb that does not
-exist is a procedure nobody can follow, and scope fences are hard (charter §7).
+The M4 drill is deliberately absent: a drill for a verb that does not exist is
+a procedure nobody can follow, and scope fences are hard (charter §7).
 
 ---
 
@@ -377,3 +377,207 @@ it that is.
 - **Step 13 finds the heir's replica still mounted** — `failback-assist
   unregister` did not finish. The heir is one reboot away from mounting a
   replica over nothing; fix it before the next tick.
+
+---
+
+## drill-node (gates M3)
+
+**What it proves.** The real thing, and the only one of these drills that
+measures the number the whole project exists to move: **detection to running,
+with zero human input**. A node loses power; CARP hands its vhid to the heir;
+devd fires; `promote --auto` walks the ladder; the guests are up on the
+survivor. Target: **five minutes**, measured from the power going off to the
+service answering.
+
+Everything before this drill proves a mechanism. This proves the fleet.
+
+**What it must not be.** Not an administrative shutdown — that is drill-guest,
+and it is M2's. This drill cuts power, or powers the node off at the BMC
+without warning it, so that the death is the one seance was designed for:
+sudden, total, and with no chance for the dying node to say anything.
+
+**Arm ONE heir relationship only** (design §12, M3). The fleet key `auto` is 1
+and exactly one node's `auto_promote` names exactly one peer. Everything else
+in the fleet stays notify-only, so a drill that goes wrong takes one
+relationship with it and not the estate.
+
+### Preconditions
+
+- `seance verify` exits 0 on **every** node, with the CARP and devd checks
+  among the passes — not merely the mesh ones. If any node's CARP block is
+  warning, stop: the drill would be measuring the configuration and not the
+  failover.
+- `seance status` exits 0 on every node, and the victim's guests report fresh
+  replicas on the armed heir.
+- The armed heir's `seance verify` shows a `devd:` **PASS** for the victim's
+  vhid. A FAIL there is precisely the arrangement this drill exists to catch,
+  and catching it in `verify` costs nothing while catching it here costs an
+  outage.
+- A fence driver is configured for the victim and `drill-fence` has passed, or
+  the operator accepts that rung 4 will stop at notify and the drill will
+  measure detection only. **Say which before starting**; a drill whose scope
+  was decided afterwards measures whatever happened.
+- Somebody is at the machine, or at the PDU, or at the BMC. The power goes off
+  by hand.
+- A stopwatch. This drill's output is a number.
+
+### Steps
+
+1. **Record the starting point.** On every node:
+
+   ```sh
+   seance verify > /tmp/drill-node-verify-$( hostname -s ).txt
+   seance status --tsv > /tmp/drill-node-before-$( hostname -s ).tsv
+   seance placement
+   ```
+
+   Every `placement` must report zero guests hosted away from home. If one does
+   not, something is already displaced and this drill would be measuring that.
+
+2. **Record what is armed, from the configuration and not from memory.** On the
+   heir:
+
+   ```sh
+   seance config | grep -E ' (auto|auto_promote) '
+   seance verify --render devd
+   ```
+
+   The rendered rules must include one for the victim's vhid. Compare it
+   against the installed file — `verify` already did, and this is the operator
+   reading the same thing before it matters.
+
+3. **Watch the heir.** In a second terminal on the heir, before anything is
+   switched off:
+
+   ```sh
+   tail -F /var/log/messages
+   ```
+
+   `promote-event` and the detached `promote --auto` both log to syslog under
+   the tag `seance`. This is where the drill is watched from; the promoted
+   guests' own consoles are where it is confirmed.
+
+4. **Note the wall clock, then cut the power.** Not `shutdown`. Pull the cord,
+   or `chassis power off` at the BMC, or throw the PDU outlet. Write down the
+   time to the second: **T0**.
+
+5. **Do nothing.** This is the step. Every other drill has an operator typing a
+   command; this one has an operator watching. Any keystroke on the heir before
+   step 8 invalidates the measurement, and if the urge to help becomes
+   irresistible that is itself the finding.
+
+6. **Watch the sequence arrive.** In order, and each with its own time noted:
+
+   | Mark | What it looks like | Expected |
+   | --- | --- | --- |
+   | T1 | `ifconfig` on the heir shows the victim's vhid as MASTER | seconds |
+   | T2 | syslog: `promote-event: CARP MASTER for <victim>` | T1 + <1 s |
+   | T3 | syslog: `rung 1 debounce: pass` | T2 + `debounce` (45 s by default) |
+   | T4 | syslog: `rung 4 fence: pass` | T3 + fence time |
+   | T5 | syslog: `promote: N of N guest(s) promoted` | T4 + mount and start |
+   | T6 | the service answers | — |
+
+   **T6 − T0 is the drill's number.** Target: under five minutes.
+
+7. **If it stops at notify, that is a result and not a failure** — read which
+   rung. Rung 2 means quorum did not form and the fleet is smaller than the
+   arithmetic needs; rung 3 means the victim answered something, and the drill
+   has just found a machine that is not as off as it looked; rung 4 means the
+   fence could not confirm, which on a node whose power you pulled is the
+   honest answer and is what `--force=fence` exists for. Record the rung, the
+   time, and the wording.
+
+8. **Verify from the disks, not from the exit code.** On the heir:
+
+   ```sh
+   seance placement
+   cat <state-dir>/succession.log
+   seance status
+   ```
+
+   - `placement` names every guest of the victim's estate and its home;
+   - each `succession.log` record carries `fence:<driver>` — **not**
+     `force:<somebody>`. There was no human, so a `force:` record here means
+     the run was not the one the drill thought it was;
+   - `status` reports the guests running here.
+
+9. **Confirm exactly one survivor acted.** On the *other* peer:
+
+   ```sh
+   seance placement
+   ```
+
+   It must claim nothing. The second heir standing down is what "exactly one
+   survivor acts" means, and it is read from that node's own records rather
+   than from the order two commands finished in.
+
+10. **Bring the victim back and let the gate run.** Do not start anything by
+    hand. Then, on the victim:
+
+    ```sh
+    seance gate --check
+    seance status
+    ```
+
+    Its estate must be **held**. This is drill-guest's step 11 again, and it is
+    repeated here because the gate has now been reached by a path no human
+    chose.
+
+11. **Fail back**, exactly as `docs/RUNBOOK-failback.md` describes, and record
+    whether the `written@<base>` guard refused.
+
+12. **Disarm, or do not — but write down which.** If the fleet stays armed
+    after the drill, `seance verify` on every node is the evidence that it is
+    armed correctly. If it is disarmed, say so, because the next person to read
+    `auto=0` will otherwise assume it was never on.
+
+### Timing
+
+| Step | What is being timed | Target | Record |
+| --- | --- | --- | --- |
+| 4→T1 | power off to the heir holding the vhid | < 10 s | elapsed |
+| T1→T2 | CARP transition to `promote-event` | < 2 s | elapsed |
+| T2→T3 | the debounce, which is configuration and not performance | `debounce` | elapsed, and the configured value |
+| T3→T4 | quorum, probes and the fence | < 90 s | elapsed |
+| T4→T5 | mount, register and start, per guest | operator's call | elapsed, and the guest count |
+| T5→T6 | the guest booting to a service that answers | the guest's own | elapsed |
+| **T0→T6** | **detection to running** | **< 5 min** | **elapsed** |
+
+The debounce is the one row that is a decision rather than a measurement:
+45 seconds of the budget is spent on purpose, buying immunity to a flapping
+link. If T0→T6 misses the target by less than the debounce, the finding is
+about the debounce and not about seance.
+
+### Evidence a passing drill leaves
+
+- the before/after `status --tsv` and `verify` output from every node;
+- the syslog extract from the heir, from T2 to T5, whole and unedited;
+- the `succession.log` records, every one carrying `fence:<driver>`;
+- the other peer's `placement`, empty;
+- the timing table above filled in, including T0→T6;
+- the `seance version` of every node, so a later drill compares against the
+  code this one ran.
+
+### What a failure means
+
+- **T1 never arrives** — CARP did not transition. The vhid is not really
+  running on the heir, or the advskews do not encode the map. `seance verify`
+  on the heir says which; if it said PASS beforehand, the finding is in the
+  check and outranks the drill.
+- **T1 arrives and T2 does not** — devd is not acting on it. Either the rule is
+  not installed where devd reads, or devd is not running, or the action names a
+  path that is not there. All three are things `verify` checks; a green
+  `verify` and a missing T2 is a defect in the check.
+- **T2 arrives and says automation is not armed** — the rule fired and the
+  configuration disagreed with it. Read both. This is the exact case rung 0
+  exists for, and it means the drill was set up wrong rather than that seance
+  is.
+- **T3 never arrives** — the debounce re-check found this node no longer MASTER.
+  The link flapped, or the victim is not as dead as the power switch suggests.
+  Look at the victim before anything else.
+- **Two nodes promoted** — stop everything. This is the split brain the product
+  exists to prevent and it outranks every other result in this file. Keep both
+  nodes' `succession.log`, both `placement` files, and the syslog from both.
+- **T0→T6 misses five minutes** — read the timing table for which interval
+  swallowed it. A slow fence and a slow guest boot are different findings and
+  only one of them is seance's.

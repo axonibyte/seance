@@ -11,12 +11,25 @@ fleet unset ssh_extra_opts
 fleet runtime standby_root
 fleet unset notify_cmd
 fleet unset witness
-fleet unset carp_interface
-fleet unset carp_pass
-fleet default auto 0
+fleet set carp_interface vtnet0
+fleet set carp_pass notthepassword
+fleet set auto 1
 node alpha nodename alpha.example.net
 node alpha mgmt alpha-mgmt.example.net
 node alpha heir bravo
+node alpha heir2 charlie
+node alpha vhid 1
+node alpha vhid_ip 192.0.2.101/32
 node bravo nodename bravo.example.net
 node bravo mgmt bravo-mgmt.example.net
-node bravo heir alpha
+node bravo heir charlie
+node bravo heir2 alpha
+node bravo vhid 2
+node bravo vhid_ip 192.0.2.102/32
+node bravo auto_promote alpha
+node charlie nodename charlie.example.net
+node charlie mgmt charlie-mgmt.example.net
+node charlie heir alpha
+node charlie heir2 bravo
+node charlie vhid 3
+node charlie vhid_ip 192.0.2.103/32

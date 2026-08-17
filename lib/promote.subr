@@ -9,8 +9,12 @@
 # the verb ends in exactly one verdict line. Exit 0 promoted, 1 stopped
 # (whether by an abort or by a notify), 2 a usage or configuration error.
 #
-#   1 debounce    M2: n/a, because a human is the trigger. The wait exists and
-#                 is tested; M3 hangs the CARP re-check off it.
+#   0 arming      --auto only: the fleet key `auto` is 1 AND this node's own
+#                 auto_promote names the corpse. Either alone is disarmed.
+#   1 debounce    manual: n/a, because a human is the trigger. --auto: wait
+#                 `debounce` seconds and then re-read CARP -- this node must
+#                 still be MASTER for the dead node's vhid, or the link
+#                 flapped and nothing died.
 #   2 quorum      1 + reachable_others > N/2, or freeze and notify.
 #   3 probes      ping and ssh the "dead" node. ANY answer aborts, and no
 #                 --force can reach this rung.
@@ -43,6 +47,12 @@
 # Everything a force overrides says `forced` on its own rung line, so "force
 # skips exactly the rungs it names" is readable in the log and is asserted row
 # by row in tests/tier4/ladder.tsv.
+#
+# AND --force IS NOT EXPRESSIBLE WITH --auto. A force is a human accepting a
+# rung that could not answer; --auto is a run with no human anywhere in it.
+# Combining them is a usage error (exit 2), which is what makes "rungs 1-4 must
+# all be green on the automatic path" (design §7) true by construction rather
+# than by inspection.
 #
 # WHAT THIS FILE TOUCHES. Local ZFS only through lib/zfs.subr's wrappers, the
 # platform only through the adapter, peers only through lib/transport.subr, and
@@ -104,6 +114,18 @@ PROMOTE_GUESTS_PROMOTED=0
 PROMOTE_GUESTS_SEEN=0
 PROMOTE_GUEST_DISPOSITIONS=""   # "<guest>=<disposition>" per guest, space sep
 PROMOTE_TMPDIR=""               # scratch for one run
+PROMOTE_AUTO=0                  # 1 when devd, not a human, is the trigger
+PROMOTE_AUTO_VHID=""            # the vhid whose MASTER transition must still hold
+
+# How long `promote-event` gives daemon(8) to detach the promotion. devd(8)
+# runs an action with sh -c and WAITS for it (sbin/devd/devd.cc, my_system +
+# do_action), so every path out of that verb is bounded; this is the last one.
+#
+# The bound is taken with seance_run_timeout_DETACH, not seance_run_timeout:
+# timeout(1) reaps its command's descendants unless --foreground is given, so
+# the ordinary wrapper would wait for the whole promotion and then kill it.
+# Measured in the guest; lib/transport.subr carries the citation.
+PROMOTE_EVENT_DETACH_TIMEOUT=10
 
 # status_age_human (lib/status.subr) is used to print the RPO. It is a
 # formatting helper rather than a status concept -- an age read at three in the
@@ -111,8 +133,9 @@ PROMOTE_TMPDIR=""               # scratch for one run
 # avoid the dependency would give the two verbs two ways of spelling the same
 # number. bin/seance sources status.subr first.
 
-# M3 sets this from --auto. In M2 nothing does, which is why rung 1 reports
-# n/a: a promotion a human typed has already been debounced by the human.
+# Set from --auto by promote_run. A promotion a human typed has already been
+# debounced by the typing, so the manual path leaves this 0 and rung 1 reports
+# n/a; tier 4 sets it directly to drive the wait without an --auto.
 PROMOTE_DEBOUNCE_REQUIRED=0
 
 # ---------------------------------------------------------------------------
@@ -257,12 +280,12 @@ promote_debounce_wait()
 
 promote_rung_debounce()
 {
-    local _s
+    local _s _state
 
     if [ "${PROMOTE_DEBOUNCE_REQUIRED}" -ne 1 ]; then
         promote_rung 1 debounce "n/a (manual)" \
             "a human is the trigger, so there is no CARP transition to re-check;" \
-            "the automatic path is wired to this rung at the CARP milestone"
+            "a promotion somebody typed has already been debounced by the typing"
         return 0
     fi
 
@@ -271,10 +294,264 @@ promote_rung_debounce()
     if ! promote_debounce_wait "${_s}"; then
         promote_rung 1 debounce abort \
             "the debounce wait could not be taken (debounce=${_s})"
+        PROMOTE_DISPOSITION=abort
         return 1
     fi
 
-    promote_rung 1 debounce pass "waited ${_s}s"
+    # The re-check, which is the whole reason the wait exists (design §7 rung
+    # 1). A flapping link makes this node MASTER for a moment and then hands
+    # the vhid back; the transition that woke devd was true and is not true any
+    # more, and promoting on it would be promoting a node that never died.
+    if [ -z "${PROMOTE_AUTO_VHID}" ]; then
+        promote_rung 1 debounce abort \
+            "waited ${_s}s, and there is no vhid to re-check:" \
+            "node_${PROMOTE_DEAD}_vhid is not configured, so nothing on this node" \
+            "can say whether the transition that woke it still holds"
+        PROMOTE_DISPOSITION=abort
+        return 1
+    fi
+
+    _state=$( adapter_carp_state "${PROMOTE_AUTO_VHID}" 2>/dev/null ) || _state=""
+
+    if [ "${_state}" != "MASTER" ]; then
+        promote_rung 1 debounce abort \
+            "TRANSIENT MASTER: ${_s}s later this node is [${_state:-unreadable}] for vhid" \
+            "${PROMOTE_AUTO_VHID}, which is ${PROMOTE_DEAD}'s. ${PROMOTE_DEAD} is advertising" \
+            "again -- the link flapped, the node did not die, and nothing has been touched."
+        PROMOTE_DISPOSITION=abort
+        return 1
+    fi
+
+    promote_rung 1 debounce pass \
+        "waited ${_s}s and this node is still MASTER for vhid ${PROMOTE_AUTO_VHID}," \
+        "which is ${PROMOTE_DEAD}'s: the transition that woke this run still holds"
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# Rung 0 -- arming. Only the automatic path has one.
+# ---------------------------------------------------------------------------
+
+# promote_rung_arming <selfkey>
+#
+# TWO SWITCHES, AND BOTH OF THEM. `--auto` acts only when the fleet key `auto`
+# is 1 AND this node's own auto_promote names the dead node. Either alone
+# leaves automation disarmed.
+#
+# This is defence in depth against a misrouted devd event, not a second copy of
+# `promote-event`'s check. devd rules are a file on a host; a file gets copied
+# to the wrong node, a vhid gets reused, an operator tests a rule by hand. The
+# question "may this node act by itself for THIS corpse" therefore gets asked
+# again by the thing that would do the acting, before it waits for anything and
+# long before it fences anything.
+#
+# It runs before rung 1 so that a disarmed node does not spend `debounce`
+# seconds discovering it was never going to act.
+promote_rung_arming()
+{
+    local _self _auto _armed
+
+    _self=$1
+
+    _auto=$( conf_effective auto ) || _auto=0
+
+    if [ "${_auto}" != "1" ]; then
+        promote_rung 0 arming abort \
+            "--auto, but the fleet key auto is ${_auto}: automation is off for this" \
+            "whole fleet and nothing here may act by itself." \
+            "A human who has established that ${PROMOTE_DEAD} is dead runs:" \
+            "seance promote ${PROMOTE_DEAD}"
+        PROMOTE_DISPOSITION=abort
+        return 1
+    fi
+
+    _armed=$( conf_get "node_${_self}_auto_promote" "" )
+
+    if ! _conf_in_list "${PROMOTE_DEAD}" "${_armed}"; then
+        promote_rung 0 arming abort \
+            "--auto, but node_${_self}_auto_promote is \"${_armed:-}\" and does not name" \
+            "${PROMOTE_DEAD}: this node is not armed to succeed it without a human." \
+            "If a devd rule sent this, the rule and the configuration disagree." \
+            "A human runs: seance promote ${PROMOTE_DEAD}"
+        PROMOTE_DISPOSITION=abort
+        return 1
+    fi
+
+    promote_rung 0 arming pass \
+        "auto=1 and node_${_self}_auto_promote names ${PROMOTE_DEAD}"
+    return 0
+}
+
+# promote_auto_report
+#
+# The one thing an automatic run has that a manual one does not: nobody is
+# reading the terminal. Rungs 2, 3 and 4 already page when they stop -- quorum
+# freezes, a host that answers, a fence that could not confirm -- so this sends
+# ONE notification for the cases that otherwise reach nobody: a ladder that got
+# past fencing and still promoted nothing.
+#
+# Rung 1's transient master is deliberately silent. It is the debounce working:
+# a link flapped and seance did nothing, which is the outcome the rung exists
+# to produce, and paging for it would teach an operator to filter these.
+promote_auto_report()
+{
+    [ "${PROMOTE_AUTO}" -eq 1 ] || return 0
+
+    case "${PROMOTE_DISPOSITION}" in
+        proceed|stand-down) return 0 ;;
+    esac
+
+    case "${PROMOTE_STOPPED_RUNG}" in
+        1\ *|2\ *|3\ *|4\ *) return 0 ;;
+    esac
+
+    printf 'An automatic promotion of %s stopped: disposition %s, %d of %d guest(s) promoted.\nPer-guest:%s\nNothing further will happen without a human.\n' \
+        "${PROMOTE_DEAD}" "${PROMOTE_DISPOSITION}" \
+        "${PROMOTE_GUESTS_PROMOTED}" "${PROMOTE_GUESTS_SEEN}" \
+        "${PROMOTE_GUEST_DISPOSITIONS:- (none)}" |
+        seance_notify crit "seance: automatic promotion of ${PROMOTE_DEAD} stopped (${PROMOTE_DISPOSITION})"
+
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# The devd target
+# ---------------------------------------------------------------------------
+
+# promote_event <vhid@ifname>
+#
+# What a devd(8) rule runs. It maps the vhid to a node, decides whether this
+# node is armed to succeed it, and then EITHER detaches `seance promote <dead>
+# --auto` with daemon(8) OR notifies -- and returns, promptly, either way.
+#
+# WHY PROMPTLY IS A REQUIREMENT AND NOT A PREFERENCE. devd(8) executes an
+# action by forking sh -c and calling wait4 on it (sbin/devd/devd.cc,
+# my_system, called from action::do_action), so its entire event loop is
+# blocked until this verb returns. A promotion takes minutes; running one
+# inside a devd action would mean every other CARP transition on the node --
+# including the ones telling it about the SECOND death -- queued behind it.
+#
+# Every path out of here is bounded: the configuration parse and the adapter
+# are local reads, the mapping is arithmetic on the loaded configuration, the
+# detach is wrapped in a timeout, and the notification is bounded by
+# NOTIFY_TIMEOUT. The one path that can take tens of seconds is a notify_cmd
+# that hangs, and 30 s of a blocked devd is the price of that being the site's
+# own script; it is stated here rather than discovered.
+#
+# ALWAYS EXITS 0 for an event it understood, whatever it decided. A devd action
+# that exits non-zero produces a log line nobody reads and changes nothing;
+# what this verb has to say, it says on stdout and through seance_notify. rc 2
+# is reserved for an argument that is not a CARP subsystem at all.
+promote_event()
+{
+    local _arg _vhid _if _dead _self _auto _armed _verb _want_if _rc
+
+    _arg=${1:-}
+
+    case "${_arg}" in
+        *@*) ;;
+        *)
+            seance_log err "promote-event: expected <vhid>@<ifname> --" \
+                "the devd(8) subsystem for a CARP event (carp(4)) -- got [${_arg}]"
+            return 2
+            ;;
+    esac
+
+    _vhid=${_arg%%@*}
+    _if=${_arg#*@}
+
+    case "${_vhid}" in
+        ''|*[!0123456789]*)
+            seance_log err "promote-event: [${_arg}] does not start with a vhid"
+            return 2
+            ;;
+    esac
+
+    if [ -z "${_if}" ]; then
+        seance_log err "promote-event: [${_arg}] names no interface"
+        return 2
+    fi
+
+    _self=$( seance_self_key ) || {
+        seance_log err "promote-event: this node is not in its own configuration;" \
+            "no node_*_nodename matches it"
+        return 2
+    }
+
+    # A vhid this configuration does not claim is not an error. CARP is a
+    # broadcast protocol on a shared segment and somebody else's cluster may be
+    # on it; refusing loudly would make every one of their transitions a line
+    # in this fleet's log.
+    if ! _dead=$( carp_node_for_vhid "${_vhid}" ); then
+        printf 'promote-event: vhid %s on %s belongs to no node in this configuration; nothing to do\n' \
+            "${_vhid}" "${_if}"
+        return 0
+    fi
+
+    if [ "${_dead}" = "${_self}" ]; then
+        printf 'promote-event: vhid %s is %s'"'"'s own identity, and becoming MASTER for it is what a boot looks like; nothing to do\n' \
+            "${_vhid}" "${_self}"
+        return 0
+    fi
+
+    # Not a refusal: the event happened on an interface, and which one it was
+    # is information rather than permission. Said because a fleet whose vhids
+    # have moved to another interface has a rendering that is out of date.
+    _want_if=$( carp_interface "${_self}" ) || _want_if=""
+    if [ -n "${_want_if}" ] && [ "${_want_if}" != "${_if}" ]; then
+        seance_log warning "promote-event: vhid ${_vhid} went MASTER on ${_if}," \
+            "but carp_interface is ${_want_if}"
+    fi
+
+    _auto=$( conf_effective auto ) || _auto=0
+    _armed=$( conf_get "node_${_self}_auto_promote" "" )
+
+    if [ "${_auto}" = "1" ] && _conf_in_list "${_dead}" "${_armed}"; then
+        if ! _verb=$( adapter_fact verb ) || [ -z "${_verb}" ]; then
+            printf 'promote-event: %s is armed here, but the adapter cannot say how to run a seance verb on this platform; NOTHING WAS PROMOTED\n' \
+                "${_dead}"
+            printf 'CARP MASTER for %s observed on %s. This node is armed to succeed it and could not work out how to invoke itself; nothing was promoted.\n' \
+                "${_dead}" "${_if}" |
+                seance_notify crit "seance: cannot start the automatic promotion of ${_dead}"
+            return 0
+        fi
+
+        # Detached, so that devd's event loop is released now rather than in
+        # several minutes, and logged to syslog because a detached process has
+        # no terminal to print to. daemon(8): -f redirects the standard
+        # descriptors to /dev/null first, then -S sends the child's output to
+        # syslog under the -T tag at the -s priority.
+        #
+        # shellcheck disable=SC2086
+        #   Deliberate word splitting: ${_verb} is a command and its arguments
+        #   ("<path to the platform's verb> seance"), which must reach exec as
+        #   separate words.
+        seance_run_timeout_detach "${PROMOTE_EVENT_DETACH_TIMEOUT}" \
+            daemon -f -S -T seance -l daemon -s notice \
+            ${_verb} promote "${_dead}" --auto < /dev/null > /dev/null 2>&1
+        _rc=$?
+
+        if [ "${_rc}" -ne 0 ]; then
+            printf 'promote-event: could not detach the promotion of %s (daemon(8) exited %s); NOTHING WAS PROMOTED\n' \
+                "${_dead}" "${_rc}"
+            printf 'CARP MASTER for %s observed on %s. This node is armed to succeed it and daemon(8) exited %s; nothing was promoted.\n' \
+                "${_dead}" "${_if}" "${_rc}" |
+                seance_notify crit "seance: cannot start the automatic promotion of ${_dead}"
+            return 0
+        fi
+
+        printf 'promote-event: CARP MASTER for %s (vhid %s on %s); this node is armed, and "seance promote %s --auto" is running detached -- its output is in syslog under the tag seance\n' \
+            "${_dead}" "${_vhid}" "${_if}" "${_dead}"
+        return 0
+    fi
+
+    printf 'CARP MASTER for %s observed on %s (vhid %s). Automation is not armed here: the fleet key auto is %s and node_%s_auto_promote is "%s". Nothing has been promoted. A human who has established that %s is dead runs:\n    seance promote %s\n' \
+        "${_dead}" "${_if}" "${_vhid}" "${_auto}" "${_self}" "${_armed:-}" \
+        "${_dead}" "${_dead}" |
+        seance_notify crit "CARP MASTER for ${_dead} observed, automation not armed"
+
+    printf 'promote-event: CARP MASTER for %s (vhid %s on %s); automation is not armed here, so this notified and did nothing\n' \
+        "${_dead}" "${_vhid}" "${_if}"
     return 0
 }
 
@@ -1505,6 +1782,7 @@ promote_run()
     PROMOTE_GUESTS_PROMOTED=0
     PROMOTE_GUESTS_SEEN=0
     PROMOTE_GUEST_DISPOSITIONS=""
+    PROMOTE_AUTO_VHID=""
 
     PROMOTE_TMPDIR=$( seance_tmpdir ) || {
         printf 'promote: FAIL — no temporary directory\n'
@@ -1530,7 +1808,39 @@ promote_run()
         return 2
     fi
 
-    _now=$( pol_now )
+    # --- the automatic path's own preconditions ---------------------------
+    #
+    # A force and an --auto are contradictory instructions: --force is a human
+    # taking responsibility for a rung that could not answer, and --auto is
+    # devd acting with no human anywhere. Accepting both would mean a
+    # configuration file could arrange for an unattended forced promotion,
+    # which is the one thing --force must never be able to be.
+    if [ "${PROMOTE_AUTO}" -eq 1 ]; then
+        if [ -n "${PROMOTE_FORCE}" ]; then
+            seance_log err "promote: --auto and --force are contradictory:" \
+                "a force is a human accepting a rung that could not answer, and" \
+                "--auto is a run with no human in it. Rungs 1-4 must all be green."
+            printf 'promote: FAIL — --force may not be combined with --auto\n'
+            return 2
+        fi
+
+        PROMOTE_DEBOUNCE_REQUIRED=1
+        PROMOTE_AUTO_VHID=$( carp_vhid "${_dead}" ) || PROMOTE_AUTO_VHID=""
+
+        # --- rung 0 -------------------------------------------------------
+        if ! promote_rung_arming "${_self}"; then
+            PROMOTE_STOPPED_RUNG="0 arming"
+            printf 'promote: stopped at rung %s%s%s\n' \
+                "${PROMOTE_STOPPED_RUNG}" "${PROMOTE_SEP}" "${PROMOTE_DISPOSITION}"
+            promote_auto_report
+            return 1
+        fi
+    fi
+
+    _now=$( pol_now ) || {
+        printf 'promote: FAIL — this node cannot read its own clock\n'
+        return 2
+    }
 
     # --- rung 1 -----------------------------------------------------------
     if ! promote_rung_debounce; then
@@ -1538,6 +1848,7 @@ promote_run()
         PROMOTE_DISPOSITION=${PROMOTE_DISPOSITION:-abort}
         printf 'promote: stopped at rung %s%s%s\n' \
             "${PROMOTE_STOPPED_RUNG}" "${PROMOTE_SEP}" "${PROMOTE_DISPOSITION}"
+        promote_auto_report
         return 1
     fi
 
@@ -1548,6 +1859,7 @@ promote_run()
         PROMOTE_STOPPED_RUNG="2 quorum"
         printf 'promote: stopped at rung %s%s%s\n' \
             "${PROMOTE_STOPPED_RUNG}" "${PROMOTE_SEP}" "${PROMOTE_DISPOSITION}"
+        promote_auto_report
         [ "${_rc}" -eq 2 ] && return 2
         return 1
     fi
@@ -1559,6 +1871,7 @@ promote_run()
         PROMOTE_STOPPED_RUNG="3 probes"
         printf 'promote: stopped at rung %s%s%s\n' \
             "${PROMOTE_STOPPED_RUNG}" "${PROMOTE_SEP}" "${PROMOTE_DISPOSITION}"
+        promote_auto_report
         [ "${_rc}" -eq 2 ] && return 2
         return 1
     fi
@@ -1570,6 +1883,7 @@ promote_run()
         PROMOTE_STOPPED_RUNG="4 fence"
         printf 'promote: stopped at rung %s%s%s\n' \
             "${PROMOTE_STOPPED_RUNG}" "${PROMOTE_SEP}" "${PROMOTE_DISPOSITION}"
+        promote_auto_report
         [ "${_rc}" -eq 2 ] && return 2
         return 1
     fi
@@ -1585,6 +1899,7 @@ promote_run()
         PROMOTE_STOPPED_RUNG="5 lineage"
         printf 'promote: stopped at rung %s%s%s\n' \
             "${PROMOTE_STOPPED_RUNG}" "${PROMOTE_SEP}" abort
+        promote_auto_report
         return 2
     fi
 
@@ -1598,6 +1913,7 @@ promote_run()
         PROMOTE_STOPPED_RUNG="5 lineage"
         printf 'promote: stopped at rung %s%s%s\n' \
             "${PROMOTE_STOPPED_RUNG}" "${PROMOTE_SEP}" abort
+        promote_auto_report
         return 1
     fi
 
@@ -1687,6 +2003,8 @@ promote_run()
     printf 'promote: %d of %d guest(s) promoted from %s%sevidence %s, disposition %s\n' \
         "${PROMOTE_GUESTS_PROMOTED}" "${PROMOTE_GUESTS_SEEN}" "${_dead}" \
         "${PROMOTE_SEP}" "${PROMOTE_EVIDENCE}" "${PROMOTE_DISPOSITION}"
+
+    promote_auto_report
 
     case "${PROMOTE_DISPOSITION}" in
         proceed|stand-down) return 0 ;;

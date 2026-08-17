@@ -49,6 +49,9 @@ readonly SEANCE_ROOT
 # shellcheck source=../lib/status.subr
 . "${SEANCE_ROOT}/lib/status.subr"
 # shellcheck source-path=SCRIPTDIR
+# shellcheck source=../lib/carp.subr
+. "${SEANCE_ROOT}/lib/carp.subr"
+# shellcheck source-path=SCRIPTDIR
 # shellcheck source=../lib/verify.subr
 . "${SEANCE_ROOT}/lib/verify.subr"
 # shellcheck source-path=SCRIPTDIR
@@ -108,12 +111,18 @@ Verbs:
   repl [--guest <g>] [--peer <p>] [--dry-run] [--now]
                      run one replication tick: snapshot, send, prune, record
   status [--tsv]     the one screen: guests, replica freshness, mesh health
-  verify [--render cron]
+  verify [--render cron|carp|devd]
                      render the configuration seance expects and diff it
                      against reality; never writes anything
-  promote <deadnode> [--force[=<rung>,...]] [--guest <g>]
+  promote <deadnode> [--auto] [--force[=<rung>,...]] [--guest <g>]
                      walk the succession ladder for a dead node's estate.
                      Forceable rungs: quorum, fence, lineage, kernel.
+                     --auto is the devd path: rungs 1-4 must all be green,
+                     and --force may not be combined with it.
+  promote-event <vhid>@<ifname>
+                     internal: what a devd(8) CARP rule runs. Maps the vhid
+                     to a node and either detaches "promote <node> --auto"
+                     or notifies. Bounded: devd waits for it.
   failback <guest> [--discard-origin-writes]
                      bring a guest home; run this on the guest's home node
   failback-assist <guest> <stop|start|snapshot|unregister|release>
@@ -227,6 +236,11 @@ seance_status()
 }
 
 # seance_verify [--render <what>]
+#
+# `--render cron` needs nothing but the configuration, and is answerable on a
+# workstation. `--render carp` and `--render devd` need this node's identity --
+# which vhids it carries depends on which node it IS -- and identity is the
+# adapter's fact, so those two bring the adapter up first.
 seance_verify()
 {
     local _render
@@ -236,7 +250,8 @@ seance_verify()
     while [ $# -gt 0 ]; do
         case "$1" in
             --render)
-                [ $# -ge 2 ] || seance_die 2 "verify: --render needs a subject (cron)"
+                [ $# -ge 2 ] ||
+                    seance_die 2 "verify: --render needs a subject (${VERIFY_RENDERS})"
                 _render=$2
                 shift
                 ;;
@@ -249,6 +264,12 @@ seance_verify()
     seance_load_conf
 
     if [ -n "${_render}" ]; then
+        case "${_render}" in
+            carp|devd)
+                seance_adapter_init
+                seance_tmp_init
+                ;;
+        esac
         verify_render "${_render}"
         return $?
     fi
@@ -272,9 +293,11 @@ seance_promote()
     _guest=""
     _forced=0
     PROMOTE_FORCE=""
+    PROMOTE_AUTO=0
 
     while [ $# -gt 0 ]; do
         case "$1" in
+            --auto) PROMOTE_AUTO=1 ;;
             --force)
                 promote_parse_force "" || exit 2
                 _forced=1
@@ -302,11 +325,36 @@ seance_promote()
     [ -n "${_dead}" ] || seance_die 2 "promote: which node died? usage: seance promote <node>"
     [ "${_forced}" -eq 1 ] || PROMOTE_FORCE=""
 
+    # Refused here as well as inside promote_run: this is the usage error an
+    # operator makes, and it must be answered before a configuration is loaded
+    # or an adapter is started rather than four rungs later.
+    if [ "${PROMOTE_AUTO}" -eq 1 ] && [ "${_forced}" -eq 1 ]; then
+        seance_die 2 "promote: --force may not be combined with --auto:" \
+            "a force is a human accepting a rung that could not answer, and --auto" \
+            "is a run with no human in it"
+    fi
+
     seance_load_conf
     seance_adapter_init
     seance_tmp_init
 
     promote_run "${_dead}" "${_guest}"
+}
+
+# seance_promote_event <vhid@ifname>
+#
+# The devd(8) target (lib/promote.subr, promote_event). Not a verb an operator
+# reaches for: devd runs it, once per CARP MASTER transition, and waits for it.
+seance_promote_event()
+{
+    [ $# -eq 1 ] ||
+        seance_die 2 "promote-event: usage: seance promote-event <vhid>@<ifname>"
+
+    seance_load_conf
+    seance_adapter_init
+    seance_tmp_init
+
+    promote_event "$1"
 }
 
 # seance_failback <guest> [--discard-origin-writes]
@@ -547,6 +595,10 @@ case "${_verb}" in
         ;;
     promote)
         seance_promote "$@"
+        exit $?
+        ;;
+    promote-event)
+        seance_promote_event "$@"
         exit $?
         ;;
     failback)

@@ -96,8 +96,38 @@ pol_is_int()
 # ASKS THE CLOCK. Verbs call it once and thread the answer through the policy
 # functions as an argument, so that every decision a verb makes is reproducible
 # from its inputs.
+#
+# ${SEANCE_NOW}, WHEN SET, IS THE CLOCK. It exists for tier 7
+# (tests/cluster/sim/DESIGN.md §2): the simulator advances a virtual clock by
+# one cadence per event and needs replication cadence and staleness to be
+# functions of the trace rather than of how fast the guest happens to be.
+# PRODUCTION NEVER SETS IT, and nothing in seance ever writes it.
+#
+# A SEANCE_NOW that is not a non-negative decimal integer is a CONTRACT ERROR
+# -- rc 2, nothing on stdout -- and never a quiet fall back to the real clock.
+# Falling back would make a seeded run silently non-deterministic, which is the
+# one thing the tier exists to avoid, and the driver that set it is the only
+# thing that could have set it wrong. Every caller checks: an unread "now" is
+# the empty-output-with-success class this project keeps finding.
 pol_now()
 {
+    local _n
+
+    _n=${SEANCE_NOW:-}
+
+    if [ -n "${_n}" ]; then
+        case "${_n}" in
+            ''|*[!0123456789]*)
+                printf 'pol_now: SEANCE_NOW is set to "%s", which is not an epoch\n' \
+                    "${_n}" >&2
+                return 2
+                ;;
+        esac
+
+        printf '%s\n' "${_n}"
+        return 0
+    fi
+
     date -u +%s
 }
 

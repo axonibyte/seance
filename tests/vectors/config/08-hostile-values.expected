@@ -11,6 +11,9 @@ fleet set ssh_extra_opts -o ProxyCommand=ssh -W %h:%p bastion.example.net
 fleet set standby_root poolname/standby/%n
 fleet set notify_cmd /usr/bin/env MAILRC=/dev/null mail -s seance#1 ops@example.net
 fleet unset witness
+fleet unset carp_interface
+fleet unset carp_pass
+fleet default auto 0
 names alpha α-01.example.net
 node alpha nodename alpha.example.net
 node alpha mgmt alpha-mgmt.example.net

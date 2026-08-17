@@ -45,8 +45,11 @@ ${H3_COLOR}Options${N0_COLOR}:
              form. The exit code is the fleet's health;
    verify  - render the configuration seance expects and diff it against
              reality: the mesh matrix, the clock delta, one config file
-             everywhere, the standby parents, the crontab line.
-             'verify --render cron' prints that line. verify NEVER writes;
+             everywhere, the standby parents, the crontab line, the CARP
+             vhids this node should carry and the devd(8) rules that act
+             on them. 'verify --render cron|carp|devd' prints each of the
+             three. verify NEVER writes -- not the crontab, not rc.conf,
+             not devd's rules, not a ZFS property;
    promote - walk the succession ladder for a dead node's estate. Seven
              rungs, each logged and each able to stop it: debounce,
              quorum, the death probes, fencing, lineage, promotion,
@@ -54,7 +57,20 @@ ${H3_COLOR}Options${N0_COLOR}:
              '--force[=<rung>,...]' overrides only the rungs it names, and
              may name only quorum, fence, lineage and kernel -- a host
              that answers the death probes is never fenced by force, and
-             a fence driver that REFUSED is never overridden;
+             a fence driver that REFUSED is never overridden.
+             '--auto' is the devd(8) path: a rung 0 checks that the fleet
+             key 'auto' is 1 AND that this node's own auto_promote names
+             the corpse, rung 1 waits and then re-reads CARP, and rungs
+             1-4 must all be green. '--force' may NOT be combined with
+             it -- a force is a human accepting a rung that could not
+             answer, and there is no human on that path;
+   promote-event
+           - INTERNAL: what a devd(8) CARP rule runs, once per MASTER
+             transition, as 'promote-event <vhid>@<ifname>'. It maps the
+             vhid to a node and either detaches 'promote <node> --auto'
+             with daemon(8), logging to syslog under the tag seance, or
+             notifies and does nothing. Bounded on every path, because
+             devd(8) waits for its actions;
    failback- bring a guest home. Run it on the guest's home node once that
              node is back, gated, and not running the guest. The reverse
              stream lands in the live dataset, so seance measures what
@@ -97,8 +113,11 @@ ${H3_COLOR}Examples${N0_COLOR}:
  # cbsd seance repl --guest web01 --dry-run
  # cbsd seance verify
  # cbsd seance verify --render cron
+ # cbsd seance verify --render carp
+ # cbsd seance verify --render devd
  # cbsd seance promote alpha
  # cbsd seance promote alpha --guest web01 --force=fence
+ # cbsd seance promote-event 1@vtnet0
  # cbsd seance failback web01
  # cbsd seance gate --check
  # cbsd seance placement --remote

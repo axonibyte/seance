@@ -10,7 +10,9 @@
 #   4. every peer holds the SAME configuration file, byte for byte;
 #   5. this node's standby parents on every peer are still hidden --
 #      canmount=noauto, mountpoint=none;
-#   6. the crontab line seance expects is installed somewhere cron reads.
+#   6. the crontab line seance expects is installed somewhere cron reads;
+#   7. the CARP vhids this node should carry are in rc.conf and on an
+#      interface, and the devd(8) rules that act on them are installed.
 #
 # VERIFY NEVER WRITES ANYTHING. Not the crontab, not a standby property, not a
 # configuration file. It renders what it expects and says where reality differs
@@ -44,6 +46,11 @@
 VERIFY_CRON_PREFERRED="/usr/local/etc/cron.d/seance"
 VERIFY_CRON_ALSO="/etc/cron.d/seance"
 
+# Everything `verify --render` can print. Spelled once: the usage message, the
+# unknown-subject diagnostic and the summary all read it, so a subject added to
+# one cannot go missing from the others.
+VERIFY_RENDERS="cron carp devd"
+
 VERIFY_TAB=$( printf '\t.' )
 VERIFY_TAB=${VERIFY_TAB%.}
 
@@ -69,6 +76,18 @@ verify_fail()
     printf 'FAIL %s\n' "$*"
 }
 
+# verify_note <message...>
+#
+# An indented line that is neither a pass nor a warning nor a failure, and is
+# counted as none of them. It exists for the one thing a verifier must be able
+# to say without claiming anything: "this is not configured here". A fleet that
+# has not arranged CARP yet is not a fleet with a broken CARP, and calling it
+# PASS would be a green line about a check that never ran.
+verify_note()
+{
+    printf '     %s\n' "$*"
+}
+
 # verify_render <what>
 #
 # Print an expected configuration fragment and nothing else, so that it can be
@@ -76,13 +95,26 @@ verify_fail()
 # subject -- a typo must not print nothing and exit 0.
 verify_render()
 {
+    local _self
+
     case "${1:-}" in
         cron)
             repl_cron_line
             return 0
             ;;
+        carp|devd)
+            _self=$( seance_self_key ) || {
+                seance_log err "verify --render ${1}: this node is not in its own" \
+                    "configuration, so there is nothing to render for it"
+                return 2
+            }
+            [ "${1}" = "carp" ] && { carp_render_rc "${_self}"; return $?; }
+            carp_render_devd "${_self}"
+            return $?
+            ;;
         *)
-            seance_log err "verify: nothing to render called \"${1:-}\" (known: cron)"
+            seance_log err "verify: nothing to render called \"${1:-}\"" \
+                "(known: ${VERIFY_RENDERS})"
             return 2
             ;;
     esac
@@ -168,6 +200,380 @@ verify_cron()
     fi
 }
 
+# verify_rcvars <prefix>
+#
+# Every rc.conf(5) variable whose name starts with <prefix>, one record per
+# line: "<file><TAB><name><TAB><value>", with the value unquoted exactly once.
+#
+# sysrc(8) is asked ONCE, with -v so that the file each directive came from is
+# part of the answer, -e so the answer is in rc.conf's own name="value" shape,
+# and -a so nothing has to be guessed by name -- seance renders alias0 upwards
+# but rc.conf(5) requires the indices to be contiguous from 0, so a node that
+# already had aliases of its own will legitimately carry seance's at other
+# indices, and a check that looked only where it rendered would fail a node
+# that is correctly configured.
+verify_rcvars()
+{
+    command -v sysrc > /dev/null 2>&1 || return 1
+
+    sysrc -v -e -a 2>/dev/null | awk -v pfx="${1:?}" '
+        {
+            i = index($0, ": ")
+            if (i == 0) { next }
+            f = substr($0, 1, i - 1)
+            rest = substr($0, i + 2)
+            e = index(rest, "=")
+            if (e == 0) { next }
+            name = substr(rest, 1, e - 1)
+            if (index(name, pfx) != 1) { next }
+            val = substr(rest, e + 1)
+            if (length(val) > 1 && substr(val, 1, 1) == "\"" &&
+                substr(val, length(val), 1) == "\"") {
+                val = substr(val, 2, length(val) - 2)
+            }
+            printf "%s\t%s\t%s\n", f, name, val
+        }
+    '
+}
+
+# verify_carp <selfkey>
+#
+# What this node's CARP configuration ought to be (lib/carp.subr), against what
+# rc.conf(5) says it is and what the interfaces are actually doing. Never
+# writes: not a variable, not an interface, not a module.
+verify_carp()
+{
+    local _self _if _vif _tmp _owner _v _ip _s _want _got _name _file _line
+    local _state _mode _pass _files _f _oid _rcread
+    local _saw _saw_var _saw_val
+
+    _self=$1
+
+    if ! carp_configured; then
+        verify_note "carp: no node carries a vhid -- CARP detection is not" \
+            "configured on this fleet, and nothing below it was checked"
+        return 0
+    fi
+
+    if ! _if=$( carp_interface "${_self}" ); then
+        verify_fail "carp: node ${_self} carries vhids and no carp_interface names" \
+            "the interface they run on; there is nothing to render and nothing to check"
+        return 0
+    fi
+    _vif=$( carp_rcvar_if "${_if}" )
+
+    _tmp=$( seance_tmpdir ) || return 1
+
+    if ! carp_participation "${_self}" > "${_tmp}/part"; then
+        verify_warn "carp: node ${_self} takes part in no vhid -- it has none of" \
+            "its own and is heir to no node that has one, so nothing here will" \
+            "ever detect a death"
+        return 0
+    fi
+
+    # A node with no sysrc(8) gets ONE warning, not one FAIL per vhid: a
+    # missing tool is a thing this check could not do, and reporting it as
+    # three configuration faults would bury the one line that says why.
+    _rcread=1
+    if ! verify_rcvars "ifconfig_${_vif}_alias" > "${_tmp}/rcvars"; then
+        verify_warn "carp: sysrc(8) is not available, so this node's rc.conf" \
+            "could not be read; only the live interface state below was checked"
+        : > "${_tmp}/rcvars"
+        _rcread=0
+    fi
+
+    # The combined form. seance renders the indexed one; a node using the other
+    # is not wrong, and saying so is better than diffing a shape seance does
+    # not produce and calling the difference a failure.
+    if verify_rcvars "ifconfig_${_vif}_aliases" | grep -q . 2>/dev/null; then
+        verify_warn "carp: this node uses ifconfig_${_vif}_aliases, the combined" \
+            "form; seance renders the indexed ifconfig_${_vif}_alias<n> form and" \
+            "cannot diff the two. Check it by hand against seance verify --render carp"
+    fi
+
+    _files=""
+
+    while read -r _owner _v _ip _s; do
+        [ -n "${_owner}" ] || continue
+
+        _want=$( carp_alias_value "${_ip}" "${_v}" "${_s}" )
+
+        # --- rc.conf: is what should be there, there? ---------------------
+        _saw=3
+        [ "${_rcread}" -eq 1 ] && _saw=0
+        _saw_var=""
+        _saw_val=""
+
+        while IFS="${VERIFY_TAB}" read -r _file _name _got; do
+            [ -n "${_name}" ] || continue
+
+            if [ "${_got}" = "${_want}" ]; then
+                _saw=1
+                _saw_var=${_name}
+                _conf_in_list "${_file}" "${_files}" || _files="${_files} ${_file}"
+                break
+            fi
+
+            case " ${_got} " in
+                *" vhid ${_v} "*)
+                    _saw=2
+                    _saw_var=${_name}
+                    _saw_val=${_got}
+                    _conf_in_list "${_file}" "${_files}" || _files="${_files} ${_file}"
+                    ;;
+            esac
+        done < "${_tmp}/rcvars"
+
+        case "${_saw}" in
+            1)
+                verify_pass "carp: ${_saw_var} carries vhid ${_v} ($( _carp_role_word "${_s}" ) of ${_owner})"
+                ;;
+            2)
+                verify_fail "carp: ${_saw_var} carries vhid ${_v} but not what seance expects"
+                printf '     expected:  %s\n' "${_want}"
+                printf '     installed: %s\n' "${_saw_val}"
+                ;;
+            3)
+                # rc.conf could not be read at all; already warned about once.
+                ;;
+            *)
+                verify_fail "carp: no ifconfig_${_vif}_alias<n> carries vhid ${_v}" \
+                    "($( _carp_role_word "${_s}" ) of ${_owner});" \
+                    "this node will never learn that ${_owner} has died"
+                printf '     expected:  %s\n' "${_want}"
+                printf '     render it with:  seance verify --render carp\n'
+                ;;
+        esac
+
+        # --- the interface: is it doing it? --------------------------------
+        if ! _state=$( adapter_carp_state "${_v}" 2>/dev/null ); then
+            verify_warn "carp: this node cannot report a CARP state for vhid ${_v}"
+            continue
+        fi
+
+        case "${_state}:${_s}" in
+            "MASTER:${CARP_SKEW_OWNER}")
+                verify_pass "carp: vhid ${_v} is MASTER here, which is this node's own identity"
+                ;;
+            "BACKUP:${CARP_SKEW_OWNER}")
+                verify_warn "carp: vhid ${_v} is this node's OWN identity and it is BACKUP for it --" \
+                    "another node is advertising ${_self}'s vhid. Look for a duplicate" \
+                    "vhid, or for an estate this node has not failed back yet"
+                ;;
+            "BACKUP:"*)
+                verify_pass "carp: vhid ${_v} is BACKUP here, as ${_owner}'s $( _carp_role_word "${_s}" )"
+                ;;
+            "MASTER:"*)
+                verify_warn "carp: vhid ${_v} is MASTER HERE and it is ${_owner}'s --" \
+                    "${_owner} is not advertising. That is a death in progress or one" \
+                    "nobody has failed back; seance status and seance placement say which"
+                ;;
+            "absent:"*)
+                verify_fail "carp: vhid ${_v} is not configured on any interface of this node" \
+                    "-- rc.conf may say it should be, but nothing is running it"
+                ;;
+            *)
+                verify_warn "carp: vhid ${_v} is ${_state} here (expected BACKUP, or MASTER for this node's own)"
+                ;;
+        esac
+    done < "${_tmp}/part"
+
+    # --- the two sysctls the model depends on ------------------------------
+    #
+    # preempt is the load-bearing one and is NOT the default (carp.subr cites
+    # the source): without it a node that comes back stays BACKUP for its own
+    # identity behind whichever heir took it, and after the first transient the
+    # advskews describe an arrangement nobody wrote down. A FAIL, not a warning:
+    # every other check here can be green on a fleet whose succession map has
+    # quietly stopped meaning anything.
+    if command -v sysctl > /dev/null 2>&1; then
+        while read -r _oid _want; do
+            [ -n "${_oid}" ] || continue
+
+            if ! _got=$( sysctl -n "${_oid}" 2>/dev/null ) || [ -z "${_got}" ]; then
+                verify_warn "carp: this node cannot read ${_oid}" \
+                    "(is the carp module loaded?)"
+                continue
+            fi
+
+            if [ "${_got}" = "${_want}" ]; then
+                verify_pass "carp: ${_oid} is ${_got}"
+                continue
+            fi
+
+            if [ "${_oid}" = "${CARP_OID_PREEMPT}" ]; then
+                verify_fail "carp: ${_oid} is ${_got}, not ${_want}." \
+                    "A NODE THAT COMES BACK WILL NOT RECLAIM ITS OWN VHID: it stays" \
+                    "BACKUP behind the heir that took it, and the advskews stop" \
+                    "describing who holds what. Run: sysctl ${_oid}=${_want}," \
+                    "and put it in ${CARP_SYSCTL_CONF}"
+            else
+                verify_fail "carp: ${_oid} is ${_got}, not ${_want};" \
+                    "carp advertisements are not being processed on this node"
+            fi
+        done <<EOF
+$( carp_sysctls )
+EOF
+
+        # Persistence is a separate question from the live value, and a
+        # different severity: a node that is right now and wrong after a reboot
+        # is a node that fails at the worst possible moment, but it is not
+        # failing yet.
+        while read -r _oid _want; do
+            [ -n "${_oid}" ] || continue
+            grep -q "^[	 ]*${_oid}[	 ]*=" "${CARP_SYSCTL_CONF}" 2>/dev/null ||
+                verify_warn "carp: ${CARP_SYSCTL_CONF} does not set ${_oid};" \
+                    "whatever it is now, it will be the kernel's default after a reboot"
+        done <<EOF
+$( carp_sysctls )
+EOF
+    else
+        verify_warn "carp: sysctl(8) is not available, so ${CARP_OID_PREEMPT}" \
+            "could not be checked -- and it is not the kernel's default"
+    fi
+
+    # --- the module, and whether it survives a reboot ----------------------
+    #
+    # kld_list is "a whitespace-separated list of kernel modules to load"
+    # (rc.conf(5)), so membership is a word test and not a substring one: a
+    # site loading "carpenter" is not a site loading carp.
+    if verify_rcvars kld_list |
+       awk -F "${VERIFY_TAB}" '
+           {
+               n = split($3, w, /[ \t]+/)
+               for (i = 1; i <= n; i++) { if (w[i] == "carp") { found = 1 } }
+           }
+           END { exit(found ? 0 : 1) }
+       '; then
+        verify_pass "carp: rc.conf kld_list loads carp at boot"
+    elif [ -r "${CARP_LOADER_CONF}" ] &&
+         grep -q '^[	 ]*carp_load[	 ]*=' "${CARP_LOADER_CONF}" 2>/dev/null; then
+        verify_pass "carp: ${CARP_LOADER_CONF} loads carp at boot"
+    else
+        verify_warn "carp: neither kld_list nor ${CARP_LOADER_CONF} loads carp;" \
+            "unless carp is compiled into this kernel, detection stops at the next reboot"
+    fi
+
+    # --- the password, and the file it is written in -----------------------
+    _pass=$( conf_effective carp_pass ) || _pass=""
+
+    if [ -z "${_pass}" ]; then
+        verify_warn "carp: carp_pass is unset, so this fleet's advertisements are" \
+            "unauthenticated -- anything on the segment can claim a vhid"
+        return 0
+    fi
+
+    command -v stat > /dev/null 2>&1 || return 0
+
+    for _f in ${_files}; do
+        _mode=$( stat -f '%Lp' "${_f}" 2>/dev/null ) || continue
+
+        # The last two octal digits are group and other. Anything but 00 means
+        # somebody who is not root can read this fleet's CARP password out of a
+        # file seance told the operator to put it in.
+        case "${_mode}" in
+            *00) ;;
+            *)
+                verify_warn "carp: ${_f} carries the CARP password and is mode ${_mode};" \
+                    "chmod 0600 ${_f}"
+                ;;
+        esac
+    done
+
+    return 0
+}
+
+# verify_devd <selfkey>
+#
+# The devd(8) rules that turn a CARP transition into `seance promote-event`.
+#
+# ABSENT IS A FAILURE WHEN AUTOMATION IS ARMED and a warning otherwise, because
+# those are two different states of the world: a node whose auto_promote names
+# a peer has been told to act by itself and cannot, which is the worst kind of
+# arrangement -- one somebody believes is in place. A node with no auto_promote
+# would only have notified, and a missing notification is a warning.
+verify_devd()
+{
+    local _self _if _armed _file _f _action _owner _v _ip _s _pat _tmp _where
+
+    _self=$1
+
+    carp_configured || return 0
+
+    _if=$( carp_interface "${_self}" ) || return 0
+    carp_participation "${_self}" > /dev/null || return 0
+
+    _armed=$( conf_get "node_${_self}_auto_promote" "" )
+
+    _file=""
+    for _f in $( carp_devd_files ); do
+        [ -r "${_f}" ] || continue
+        _file=${_f}
+        break
+    done
+
+    if [ -z "${_file}" ]; then
+        _where=$( carp_devd_files | tr '\n' ' ' )
+        _where=${_where% }
+
+        if [ -n "${_armed}" ]; then
+            verify_fail "devd: no rules at [${_where}]," \
+                "and node_${_self}_auto_promote names ${_armed}." \
+                "THIS NODE IS CONFIGURED TO ACT AUTOMATICALLY AND CANNOT BE TOLD TO."
+        else
+            verify_warn "devd: no rules at [${_where}];" \
+                "a CARP transition here will notify nobody"
+        fi
+        printf '     install them with:  seance verify --render devd > %s\n' \
+            "${CARP_DEVD_PREFERRED}"
+        printf '     then:               service devd restart\n'
+        return 0
+    fi
+
+    if ! _action=$( carp_devd_action ); then
+        verify_warn "devd: ${_file} exists, but the adapter cannot say how this" \
+            "platform runs a seance verb, so the rules could not be checked"
+        return 0
+    fi
+
+    if ! grep -F -q -- "${_action}" "${_file}" 2>/dev/null; then
+        verify_fail "devd: ${_file} does not run [${_action}];" \
+            "whatever it does run, it is not this node's seance"
+    else
+        verify_pass "devd: ${_file} runs [${_action}]"
+    fi
+
+    _tmp=$( seance_tmpdir ) || return 0
+    carp_participation "${_self}" > "${_tmp}/part"
+
+    while read -r _owner _v _ip _s; do
+        [ -n "${_owner}" ] || continue
+        [ "${_s}" = "${CARP_SKEW_OWNER}" ] && continue
+
+        _pat=$( carp_devd_pattern "${_v}" "${_if}" )
+
+        if grep -F -q -- "\"${_pat}\"" "${_file}" 2>/dev/null; then
+            verify_pass "devd: ${_file} has a rule for vhid ${_v} (${_owner})"
+        elif _conf_in_list "${_owner}" "${_armed}"; then
+            verify_fail "devd: ${_file} has no rule for vhid ${_v} (${_owner})," \
+                "and ${_owner} IS in this node's auto_promote --" \
+                "the automation is armed for a death it will never hear about"
+        else
+            verify_warn "devd: ${_file} has no rule for vhid ${_v} (${_owner});" \
+                "its death will notify nobody here"
+        fi
+    done < "${_tmp}/part"
+
+    if service devd status > /dev/null 2>&1; then
+        verify_pass "devd: the devd(8) service is running"
+    else
+        verify_warn "devd: service devd status does not report it running;" \
+            "installed rules that nothing is reading are rules that do not exist"
+    fi
+
+    return 0
+}
+
 # verify_report
 #
 # The whole check. Returns the exit code documented at the top of this file.
@@ -228,7 +634,10 @@ verify_report()
         verify_pass "mesh: ${_home} -> ${_peer} (${_addr})"
 
         # 3. clock
-        _now=$( pol_now )
+        _now=$( pol_now ) || {
+            verify_fail "clock: this node cannot read its own clock (see stderr)"
+            continue
+        }
         if ! _pdate=$( seance_ssh "${_addr}" 'date -u +%s' ); then
             verify_warn "clock: ${_peer} did not answer with its time"
         else
@@ -306,6 +715,12 @@ verify_report()
     # 6. the schedule
     verify_cron
 
+    # 7. detection: the vhids that carry it and the rules that act on it
+    verify_carp "${_home}"
+    verify_devd "${_home}"
+
+    printf 'verify: renderings available: %s (seance verify --render <subject>)\n' \
+        "$( printf '%s' "${VERIFY_RENDERS}" | tr ' ' ',' | sed -e 's/,/, /g' )"
     printf 'verify: %d pass, %d warn, %d fail\n' \
         "${VERIFY_PASS}" "${VERIFY_WARN}" "${VERIFY_FAIL}"
 

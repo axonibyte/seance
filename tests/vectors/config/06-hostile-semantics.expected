@@ -11,6 +11,9 @@ fleet unset ssh_extra_opts
 fleet runtime standby_root
 fleet set notify_cmd
 fleet unset witness
+fleet unset carp_interface
+fleet unset carp_pass
+fleet default auto 0
 node alpha nodename alpha.example.net
 node alpha mgmt alpha-mgmt.example.net
 node alpha heir alpha

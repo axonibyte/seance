@@ -21,3 +21,7 @@ stale-lineage-no-threshold.patch	4	-	tests/tier4/t_ladder.sh
 stale-lineage-no-threshold.patch	6	hostile	tests/tier6/t_hostile.sh
 boot-gate-removed.patch	4	-	tests/tier4/t_gate.sh
 boot-gate-removed.patch	6	resurrection	tests/tier6/t_resurrection.sh
+quorum-rule-removed.patch	4	-	tests/tier4/t_ladder.sh
+quorum-rule-removed.patch	6	quorum	tests/tier6/t_quorum.sh
+debounce-removed.patch	4	-	tests/tier4/t_ladder.sh
+debounce-removed.patch	6	flap	tests/tier6/t_flap.sh
