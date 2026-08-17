@@ -43,6 +43,7 @@ ADAPTER_WORKDIR=""
 ADAPTER_NODENAME=""
 ADAPTER_JAILSYSDIR=""
 ADAPTER_JAILDATADIR=""
+ADAPTER_JAILRCCONFDIR=""
 ADAPTER_DBDIR=""
 ADAPTER_ETCDIR=""
 ADAPTER_VERB=""
@@ -131,7 +132,8 @@ _adapter_vhid_ok()
 #   nodename    one line in ${workdir}/nodename (cbsd.conf:52, nodenamefile).
 #   the rest    CBSD's fixed layout: jailsysdir ${workdir}/jails-system
 #               (cbsd.conf:71), jaildatadir ${workdir}/jails-data
-#               (cbsd.conf:65), etcdir ${workdir}/etc (cbsd.conf:73), dbdir
+#               (cbsd.conf:65), jailrcconfdir ${workdir}/jails-rcconf
+#               (cbsd.conf:67), etcdir ${workdir}/etc (cbsd.conf:73), dbdir
 #               ${workdir}/var/db (cbsd.conf:84,92).
 #   distdir     /usr/local/cbsd (cbsd.conf:24).
 #
@@ -207,6 +209,7 @@ adapter_init()
     ADAPTER_NODENAME=${_nn}
     ADAPTER_JAILSYSDIR=${SEANCE_CBSD_JAILSYSDIR:-${_wd}/jails-system}
     ADAPTER_JAILDATADIR=${SEANCE_CBSD_JAILDATADIR:-${_wd}/jails-data}
+    ADAPTER_JAILRCCONFDIR=${SEANCE_CBSD_JAILRCCONFDIR:-${_wd}/jails-rcconf}
     ADAPTER_DBDIR=${SEANCE_CBSD_DBDIR:-${_wd}/var/db}
     ADAPTER_ETCDIR=${SEANCE_CBSD_ETCDIR:-${_wd}/etc}
     ADAPTER_READY=1
@@ -808,9 +811,41 @@ adapter_guest_register()
 }
 
 # contract: adapter_guest_unregister(name) -> nothing [no output]
+#
+# AND IT TIDIES UP AFTER THE PLATFORM, which is not optional.
+# `cbsd junregister` dumps the database row it is about to delete into
+# ${jailrcconfdir}/rc.conf_<name> as it goes (sudoexec/junregister:128-146:
+# `jmkrcconf jname=<n> > ${jailrcconfdir}/rc.conf_<n>`, then replacewdir to
+# tokenise the workdir), and nothing ever removes it: `cbsd jregister` MOVES
+# the file it reads into ${jailsysdir}/<name>/ (sudoexec/jregister:215), so a
+# guest registered from a replica the way promote registers one
+# (`rcfile=<replica>/rc.conf_<n>`) never consumes the leftover.
+#
+# What the leftover costs, measured in the guest (docs/cbsd-module-notes.md
+# §8.8, and D-97 already leans on it): jls's unregistered area walks every file
+# in ${jailrcconfdir} and prints a row for each, outside every predicate
+# (jailctl/jls:281-296). So one failback leaves this node printing a phantom
+# row for that guest in every listing for ever -- and adapter_guest_list, doing
+# exactly what it should with a status word of "Unregister", says
+# "skipping <g>: CBSD's database does not know it" on stderr on every tick,
+# every status, every gate. A diagnostic that is always there is a diagnostic
+# nobody reads.
+#
+# Nothing that predated the call is destroyed by the removal: a *registered*
+# guest cannot have a file there (jregister moved it away when it registered
+# the guest), and a guest that is not registered cannot be unregistered
+# (sudoexec/junregister:105-114 refuses with "Already unregistered"). The file
+# removed is therefore always one this very call caused to be written.
+#
+# NOT `junregister jname=<n> destroy=1`, which skips the dump entirely
+# (sudoexec/junregister:134) and would look like the tidier fix. That option is
+# undocumented in junregister's own ADDHELP, it is the flag CBSD's *destroy*
+# paths pass (sudoexec/jdestroy:201, sudoexec/bdestroy:275), and its name says
+# what a future release might make it mean. seance does not put a word like
+# that on a command line in the middle of a failback to save an rm.
 adapter_guest_unregister()
 {
-    local _name _rc
+    local _name _rc _rcconf
 
     _adapter_ready || return 2
 
@@ -826,6 +861,15 @@ adapter_guest_unregister()
     if [ "${_rc}" -ne 0 ]; then
         _adapter_diag "cbsd junregister ${_name} failed (exit ${_rc})"
         return 1
+    fi
+
+    _rcconf="${ADAPTER_JAILRCCONFDIR}/rc.conf_${_name}"
+    if [ -e "${_rcconf}" ]; then
+        if ! rm -f "${_rcconf}"; then
+            _adapter_diag "${_name} was unregistered but its leftover export ${_rcconf} could not be removed; every listing on this node will carry a phantom row for it"
+            return 1
+        fi
+        _adapter_diag "removed ${_rcconf}, the export junregister wrote as it ran"
     fi
 
     return 0

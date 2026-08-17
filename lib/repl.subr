@@ -1236,18 +1236,38 @@ repl_pair()
 # others -- a replica on a node that can never inherit the guest is disk nobody
 # will ever promote, and one more copy of the data to keep in step.
 # (Decision D-60.)
+#
+# THE HOME IS NEVER ONE OF THEM. A node that is its own heir is caught by
+# `config --check` (lib/conf.subr, "heir is the node itself"), but a PER-GUEST
+# override cannot be: nothing in the configuration says where a guest lives, so
+# `guest_web01_heir=alpha` is a perfectly good line that is only wrong on
+# alpha. Read there, it used to mean "replicate web01 to alpha" -- an ssh to
+# this node's own management address, a full second copy of a live guest under
+# this node's own standby tree, taken every tick, and sitting exactly where the
+# estate discovery of a promotion looks (D-44 item 3). The home is dropped
+# here, where the home is known, rather than being made unsayable in the
+# configuration, where it is not.
 repl_peers()
 {
-    local _guest _home
+    local _guest _home _out
 
     _guest=$1
     _home=$2
 
-    pol_heirs \
+    _out=$( pol_heirs \
         "$( conf_get "node_${_home}_heir" "" )" \
         "$( conf_get "node_${_home}_heir2" "" )" \
         "$( conf_get "guest_${_guest}_heir" "" )" \
-        "$( conf_get "guest_${_guest}_heir2" "" )"
+        "$( conf_get "guest_${_guest}_heir2" "" )" ) || return 1
+
+    _out=$( printf '%s\n' "${_out}" | awk -v h="${_home}" 'NF > 0 && $0 != h' )
+
+    # An override that named nothing but the home leaves no succession at all,
+    # which is the same answer as no heir: the caller says so loudly and counts
+    # the guest as failed rather than passing over it (D-60).
+    [ -n "${_out}" ] || return 1
+
+    printf '%s\n' "${_out}"
 }
 
 # repl_due <guest> <homekey> <now-epoch>

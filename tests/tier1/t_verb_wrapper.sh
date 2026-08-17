@@ -65,14 +65,15 @@ EOF
 # run <mode> <other-args>  -- the wrapper, as cbsdsh would have left it.
 #
 # The variable names are CBSD's, not seance's: workdir, nodename, jailsysdir,
-# jaildatadir, dbdir, etcdir, CIX_DISTDIR, myversion, mode, CIX_OTHER_ARGS
-# (cbsd.conf:21-99).
+# jaildatadir, jailrcconfdir, dbdir, etcdir, CIX_DISTDIR, myversion, mode,
+# CIX_OTHER_ARGS (cbsd.conf:21-99).
 run()
 {
     env -i PATH="${PATH}" \
         subrdir="${FAKE}" tools="${FAKE}/tools" REALPATH_CMD=/bin/realpath \
         workdir=/wd nodename=alpha.example.net \
         jailsysdir=/wd/jails-system jaildatadir=/wd/jails-data \
+        jailrcconfdir=/wd/jails-rcconf \
         dbdir=/wd/var/db etcdir=/wd/etc \
         CIX_DISTDIR=/usr/local/cbsd myversion=15.0.9 \
         mode="$1" CIX_OTHER_ARGS="$2" \
@@ -82,7 +83,7 @@ run()
     ERR=$( cat "${DIR}/err" )
 }
 
-t_plan 19
+t_plan 20
 
 # --- the bare form ----------------------------------------------------------
 
@@ -129,9 +130,11 @@ run "" "version"
 t_like "${OUT}" '^SEANCE_CBSD_WORKDIR=/wd$' "workdir is exported"
 t_like "${OUT}" '^SEANCE_CBSD_NODENAME=alpha\.example\.net$' "nodename is exported"
 t_like "${OUT}" '^SEANCE_CBSD_DBDIR=/wd/var/db$' "dbdir is exported"
+t_like "${OUT}" '^SEANCE_CBSD_JAILRCCONFDIR=/wd/jails-rcconf$' \
+    "and jailrcconfdir, which is where junregister leaves its export (cbsd.conf:67)"
 t_like "${OUT}" '^SEANCE_CBSD_DISTDIR=/usr/local/cbsd$' "the module dist dir is exported"
-t_is "$( printf '%s\n' "${OUT}" | grep -c '^SEANCE_CBSD_' )" "8" \
-    "eight CBSD facts are exported, and the dispatcher may rely on every one"
+t_is "$( printf '%s\n' "${OUT}" | grep -c '^SEANCE_CBSD_' )" "9" \
+    "nine CBSD facts are exported, and the dispatcher may rely on every one"
 
 # --- $0 is a symlink, twice over --------------------------------------------
 #

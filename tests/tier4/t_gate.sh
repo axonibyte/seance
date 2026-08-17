@@ -203,7 +203,7 @@ holds()
         LC_ALL=C sort | tr '\n' ' '
 }
 
-t_plan 41
+t_plan 53
 
 # ---------------------------------------------------------------------------
 # The placement file
@@ -345,8 +345,8 @@ export WORLD_SSH_MUTE
 gate release:web01
 t_is "${GATE_RC}" "1" \
     "release is refused while a living peer cannot say what it holds"
-t_like "$( cat "${GATE_OUT}" )" '^gate: REFUSED web01 -- living peer\(s\) bravo could not report their placement,$' \
-    "and names the peer rather than the guest's apparent freedom"
+t_like "$( tail -1 "${GATE_OUT}" )" '^gate: REFUSED web01 -- living peer\(s\) bravo could not report their placement$' \
+    "and names the peer rather than the guest's apparent freedom -- on the LAST line, which is where a verdict goes"
 
 # ---------------------------------------------------------------------------
 # Releasing
@@ -365,6 +365,56 @@ t_is "${GATE_RC}" "1" "release is refused when not one peer answered"
 world "charlie-mgmt.example.net bravo-mgmt.example.net" - -
 gate release:web01
 t_is "${GATE_RC}" "0" "release succeeds once the peers answer and none claims it"
+
+# ---------------------------------------------------------------------------
+# RUN IT TWICE, AND RUN IT ON A NODE SOMEBODY HAS ALREADY TOUCHED
+#
+# The gate runs from an rc.d unit at every boot and from an operator's hands in
+# between, so "what does the second run do" is not a curiosity: it is the
+# ordinary case. Three properties, none of them previously asserted:
+# running it twice reaches the same state, a guest an operator held for reasons
+# of their own is left alone, and --check changes nothing that can be measured.
+# ---------------------------------------------------------------------------
+
+world "charlie-mgmt.example.net bravo-mgmt.example.net" bravo web01
+gate act
+FIRST_RC=${GATE_RC}
+FIRST_HOLDS=$( holds )
+: > "${SEANCE_MOCK_LOG}"
+gate act
+
+t_is "${GATE_RC}" "${FIRST_RC}" "a second gate run reaches the same verdict as the first"
+t_is "$( holds )" "${FIRST_HOLDS}"     "and withholds exactly the same guest: the gate is idempotent in what it leaves behind"
+t_like "$( cat "${GATE_OUT}" )" '^gate: HELD web01 -- bravo claims it$'     "a guest already in slave mode is held again rather than quietly skipped, because the platform's flag is the record"
+t_unlike "$( cat "${SEANCE_MOCK_LOG}" )" 'adapter_guest_release'     "and nothing is released by a run of the gate, ever: release is a verb an operator types"
+
+# A guest an operator held by hand, that no peer claims. arc01 is held in the
+# mock's world. The gate must leave it exactly as it found it -- an operator
+# holding a guest for maintenance is not a decision the boot gate gets to
+# reverse.
+world "charlie-mgmt.example.net bravo-mgmt.example.net" - -
+t_is "$( adapter_guest_held arc01 )" "1" "arc01 starts out held by somebody other than the gate"
+gate act
+t_is "${GATE_RC}" "0" "a fleet with nothing claimed lets the gate exit 0"
+t_like "$( cat "${GATE_OUT}" )" '^gate: arc01 -- no living peer claims it; left as it is$'     "and the held guest is named and LEFT AS IT IS"
+t_is "$( adapter_guest_held arc01 )" "1" "so it is still held afterwards"
+t_unlike "$( cat "${SEANCE_MOCK_LOG}" )" 'adapter_guest_release arc01'     "and the gate never asked for it to be released"
+
+# --check, measured from the state rather than from the transcript.
+world "charlie-mgmt.example.net bravo-mgmt.example.net" bravo web01
+placement_set db01 charlie
+BEFORE_P=$( sha256 -q "$( placement_file )" )
+: > "${SEANCE_MOCK_LOG}"
+gate check
+t_is "$( sha256 -q "$( placement_file )" )" "${BEFORE_P}"     "--check leaves the placement file byte-identical"
+t_is "$( awk '$1 ~ /^adapter_guest_(hold|release|start|stop|register|unregister)$/ { n++ } END { print n + 0 }' \
+    "${SEANCE_MOCK_LOG}" )" "0" \
+    "and calls not one mutating adapter function: measured from what it did, not from what it said"
+
+# And the decision --check reported is still there to be acted on: a dry run
+# that consumed the claim would be worse than no dry run.
+gate act
+t_is "$( holds )" "web01 " "the act run that follows --check holds exactly what --check said it would"
 
 # ---------------------------------------------------------------------------
 # `status`'s home column reads the placement record (decision D-83)

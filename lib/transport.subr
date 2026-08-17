@@ -145,9 +145,17 @@ transport_ssh_target()
 # cron has no terminal, and an ssh that stops to ask for a password is an ssh
 # that hangs until the timeout kills it.
 #
-# ssh_extra_opts is appended last and unquoted, so a site can override anything
-# above it -- that is the point of the key (D-35), and seance does not parse
-# ssh's options.
+# ssh_extra_opts is appended last and unquoted, so a site can ADD anything ssh
+# understands -- a jump host, a key, a cipher (D-35), and seance does not parse
+# ssh's options. It cannot REPLACE what is above it, and that is not a
+# limitation to work around: ssh(1) says "for each parameter, the first
+# obtained value will be used", so the earlier -o wins. Measured, because the
+# comment here used to claim the opposite: with
+# `-o ConnectTimeout=1 ... -o ConnectTimeout=30`, ssh gives up after one second
+# (tests/tier4/t_timing_m2.sh pins it against a peer that never answers). So a
+# site cannot lengthen the connect bound and cannot turn BatchMode off, which
+# is the direction to be unable to move in: an ssh that stops to ask a question
+# from cron is an ssh that hangs until the timeout kills it.
 transport_ssh_opts()
 {
     local _port _extra

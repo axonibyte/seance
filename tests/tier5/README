@@ -78,7 +78,12 @@ captures):
   * a JAIL's configuration is not inside its dataset and a VM's is (D-77/D-82),
     measured rather than assumed by type;
   * and the mirror: a real jail registers and starts from a
-    promote_sys_restore out of a replica of `<pool>/seance-sys` (D-82, D-84).
+    promote_sys_restore out of a replica of `<pool>/seance-sys` (D-82, D-84);
+  * `seance failback-assist <g> unregister` leaves nothing behind in
+    ${jailrcconfdir}: junregister writes its own export of the guest as it
+    goes and nothing ever removes it, so before the fix one failback made this
+    node skip a phantom guest on stderr in every listing for ever. Both halves
+    are measured -- CBSD's behaviour raw, then seance's answer to it.
 
 WHAT IT FOUND, which is what the tier is for. Three CBSD defects and three
 adapter fixes; every one is written up in docs/cbsd-module-notes.md §8 and

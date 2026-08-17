@@ -1,0 +1,18 @@
+--- a/lib/gate.subr	2026-08-16 20:28:23.098121000 -0400
++++ b/lib/gate.subr	2026-08-16 20:28:23.109161000 -0400
+@@ -105,14 +105,7 @@
+         $2 ~ /[^abcdefghijklmnopqrstuvwxyz0123456789]/ { print NR ": " $0; next }
+     ' "${_f}" )
+ 
+-    if [ -n "${_bad}" ]; then
+-        printf 'placement: %s cannot be read as placement records:\n' "${_f}" >&2
+-        printf '%s\n' "${_bad}" | sed -e 's/^/  line /' >&2
+-        printf 'placement: a record this node cannot read is not a guest it is not hosting\n' >&2
+-        return 1
+-    fi
+-
+-    awk -F "${GATE_TAB}" '{ print $1 "\t" $2 }' "${_f}"
++    awk -F "${GATE_TAB}" 'NF >= 2 { print $1 "\t" $2 }' "${_f}"
+ }
+ 
+ # placement_home <guest>

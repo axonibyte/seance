@@ -126,7 +126,7 @@ exit 0"
 # exit code described at the top of this file.
 status_report()
 {
-    local _tsv _home _now _skew _conf _lsha _lkern _tmp
+    local _tsv _home _now _skew _conf _lsha _lkern _tmp _pmap _phave
     local _guest _type _running _held _names _row _peer _peers _ghome
     local _rec _ts _tick _rc _age _age_h _verdict _max _fresh _total
     local _psha _pkern _line _guests
@@ -177,6 +177,16 @@ status_report()
     _fresh=0
     _total=0
 
+    # The placement records, read ONCE and validated once: a file this node
+    # cannot parse must not be reported per guest as "at home", which is the
+    # answer that hides a guest running somewhere else (D-104).
+    _pmap=""
+    _phave=1
+    if ! _pmap=$( placement_local ); then
+        status_fail "the placement file cannot be read, so which guests are hosted away from home is unknown"
+        _phave=0
+    fi
+
     for _guest in ${_names}; do
         _guests=$(( _guests + 1 ))
 
@@ -204,8 +214,12 @@ status_report()
         # home here, at exactly the moment an operator is reading `status` to
         # find out what moved. `placement` is the record that knows, and it
         # names only guests hosted away from home (decision D-83).
-        if ! _ghome=$( placement_home "${_guest}" ); then
-            _ghome=${_home}
+        if [ "${_phave}" -eq 0 ]; then
+            _ghome=unknown
+        else
+            _ghome=$( printf '%s\n' "${_pmap}" |
+                awk -F "${STATUS_TAB}" -v g="${_guest}" '$1 == g { print $2; exit }' )
+            [ -n "${_ghome}" ] || _ghome=${_home}
         fi
 
         if [ "${_tsv}" -eq 0 ]; then

@@ -249,9 +249,20 @@ it that is.
    seance promote <home> --guest <guest>
    ```
 
-   It will stop at rung 4 with `notify`, because no fence driver can confirm a
-   node somebody switched off by hand. That is correct. Read the rung lines.
-   Then, having established that the node really is off — you switched it off:
+   What rung 4 does depends on what the fleet has configured for the home
+   node, and both outcomes are a pass:
+
+   - **no `node_<home>_fence_driver` is configured** (M2's own state — seance
+     ships no driver yet): the rung stops with `notify`, saying so, and naming
+     the command below. That is correct: fencing that is missing is fencing
+     that cannot confirm.
+   - **a driver is configured** and the node is off at the console: the rung
+     may verify it and PASS, and the promotion continues without a force. Read
+     what the driver said; if it says REFUSED, stop the drill — something is
+     still on.
+
+   Read the rung lines either way. Then, if it stopped, and having established
+   that the node really is off — you switched it off:
 
    ```sh
    seance promote <home> --guest <guest> --force=fence
@@ -336,9 +347,14 @@ it that is.
     ```sh
     seance placement                      # on the home node: 0 guests away
     ssh <heir> seance placement           # and on the heir: the claim is gone
-    cat <state-dir>/succession.log        # a second record, evidence 'failback'
+    cat <state-dir>/succession.log        # a second record
     zfs list -H -o name,mountpoint -r <standby_root>/<home>/<guest>   # on the heir
     ```
+
+    The second record's evidence is `failback` when nothing had to be
+    discarded, and `discard:<bytes>` when step 12 refused and you accepted the
+    loss — the byte count is in the record, so the decision outlives the
+    terminal it was typed in. Anything else in that field is a finding.
 
     On the heir, the replica's datasets must be back at `mountpoint=none` and
     unmounted. A replica still mounted at CBSD's paths on the heir is the
@@ -349,10 +365,42 @@ it that is.
 15. **Let one more replication tick run in the normal direction**, then
     `seance verify` and `seance status` on all three nodes. Both must exit 0.
 
+### Timing
+
+Both directions are timed, the way drill-replication is: note the wall clock at
+each step and record the elapsed time. The targets are for one guest of a few
+hundred gigabytes on a LAN with a replica already fresh on the heir, and they
+are the fleet's starting numbers rather than a specification. The two that
+matter to the people who will be woken up are the OUTAGE rows — the wall clock
+from the node going down to the service answering somewhere else, and the same
+for the way home.
+
+| Step | What is being timed | Target | Record |
+| --- | --- | --- | --- |
+| 1 | `status --tsv` + `placement` on both nodes | < 30 s | elapsed |
+| 3 | the home node going down (`shutdown -p now` to no ping) | < 2 min | elapsed, and the wall clock at "no ping" |
+| 4 | the first `seance promote` (the one that stops at rung 4) | < 30 s | elapsed |
+| 4 | `seance promote --force=fence`, start to verdict line | < 2 min per guest | elapsed |
+| **3→7** | **the outage: node down to the service answering on the heir** | **< 10 min** | **elapsed — this is the number the drill exists to produce** |
+| 6 | the property listing and the two records on the heir | < 30 s | elapsed |
+| 9 | `seance repl --now` on the heir, reversed direction | < 1 cadence | elapsed |
+| 10–11 | the home node booting to `gate` having held the estate | < 5 min | elapsed |
+| 12 | `seance failback <guest>`, start to verdict line | < 2 min + the reverse stream | elapsed, and the bytes moved |
+| **12→14** | **the second outage: guest stopped on the heir to the service answering at home** | **< 10 min** | **elapsed** |
+| 15 | `verify` + `status` on all three nodes | < 60 s | elapsed |
+
+A step that overruns its target is not by itself a failure; it is the number
+the next drill is compared against, and the first one to move is the one worth
+asking about. Two exceptions, both of which are findings whether or not the
+drill passes: an outage row that overruns is the promise this product makes,
+and a step-9 tick that does not finish inside the guest's cadence means the
+next tick is queueing behind it.
+
 ### Evidence a passing drill leaves
 
 - the before/after `status --tsv` from every node;
 - the full output of both `seance promote` invocations, rung lines and all;
+- both outage times from the table above, wall clock to wall clock;
 - the `succession.log` records from both directions, and the `placement` files
   before, between and after;
 - the wall-clock time from step 3 (node down) to step 7 (service answering);

@@ -12,8 +12,13 @@
 #              reach=<n>          how many living peers answer ssh
 #              dead=<no|ping|ssh> whether the "dead" node answers, and how
 #              fence=<mode>       fence_mock's FENCE_MOCK_MODE, or:
-#                                   none    no fence_driver configured
-#                                   missing a driver name nothing provides
+#                                   none       no fence_driver configured
+#                                   missing    a driver name nothing provides
+#                                   targetless a driver with no fence_target
+#              succ=<default|h2self|none>
+#                                 alpha's succession: this node first (the
+#                                 default), this node SECOND behind an heir
+#                                 that is somewhere else, or no heir at all
 #              lineage=<fresh|stale|skew|absent|empty0>
 #              claim=<-|charlie>  a living peer that already claims the guest
 #              kernel=<same|differs>
@@ -59,12 +64,22 @@ fence-missing	fence=missing	-	notify	-	4 fence	1
 fence-missing-forced	fence=missing	fence	proceed	force:%OP%	-	0
 fence-none	fence=none	-	notify	-	4 fence	1
 fence-none-forced	fence=none	fence	proceed	force:%OP%	-	0
+fence-target-missing	fence=targetless	-	abort	-	4 fence	2
+fence-target-missing-forced	fence=targetless	all	abort	-	4 fence	2
+# --- configurations that pass --check and are hostile anyway (battery a) ----
+# The succession is the fleet's, not this node's opinion of it: a node that is
+# second in the queue acts only when the first cannot, and a node in no queue
+# at all never acts.
+succ-heir2-acts	succ=h2self reach=0	quorum	proceed	fence:mock	-	0
+succ-heir1-alive	succ=h2self	-	stand-down	fence:mock	-	0
+succ-none	succ=none	-	stand-down	fence:mock	-	0
 # --- rung 2: quorum, and the even-N doctrine --------------------------------
 quorum-n2	nodes=2 reach=0	-	notify	-	2 quorum	1
 quorum-n2-forced	nodes=2 reach=0	quorum	proceed	fence:mock	-	0
 quorum-n4-half	nodes=4 reach=1	-	notify	-	2 quorum	1
 quorum-n4-half-forced	nodes=4 reach=1	quorum	proceed	fence:mock	-	0
 quorum-n4-two	nodes=4 reach=2	-	proceed	fence:mock	-	0
+quorum-n4-alone	nodes=4 reach=0	-	notify	-	2 quorum	1
 # --- rung 5: lineage, claims and kernel homogeneity -------------------------
 lineage-stale	lineage=stale	-	force-only	fence:mock	-	1
 lineage-stale-forced	lineage=stale	lineage	proceed	force:%OP%	-	0

@@ -1,0 +1,22 @@
+--- a/lib/promote.subr	2026-08-16 20:28:32.780751000 -0400
++++ b/lib/promote.subr	2026-08-16 20:28:32.791939000 -0400
+@@ -1277,19 +1277,6 @@
+             continue
+         fi
+ 
+-        # AND IT IS ASKED AGAIN. `zfs mount` exiting 0 is not the same fact as
+-        # the dataset being mounted, and the difference is the whole of this
+-        # ceremony: what happens next is a registration and a start, so a
+-        # dataset that is not there means a guest booted over an empty
+-        # directory with its data sitting unmounted beside it. The
+-        # empty-output-with-success class (TESTING.md §5), applied to a mount.
+-        if ! zfs_mounted "${_ds}"; then
+-            seance_log err "promote ${_guest}: zfs mount ${_ds} exited 0 and ${_ds} is" \
+-                "still not mounted at ${_target}. Nothing has been registered or started."
+-            _rc=1
+-            continue
+-        fi
+-
+         promote_note "mounted ${_ds} at ${_target}"
+     done
+ 

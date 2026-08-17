@@ -145,6 +145,15 @@ failback_assist()
                 : > "${_tmp}/ds"
             fi
 
+            # Printed before the step, the way promote_undo prints one. The
+            # platform writes its own export of the guest's settings as it
+            # unregisters, and the adapter removes it in the same breath --
+            # otherwise this node lists a phantom guest for ever. Nothing that
+            # predates this call is touched: a registered guest has no such
+            # file, and an unregistered one cannot be unregistered again.
+            printf '  undo: none for the export the platform writes as it goes; %s is registered again from its replica, which is what seance promote does\n' \
+                "${_guest}"
+
             if ! adapter_guest_unregister "${_guest}"; then
                 printf 'failback-assist: FAIL (%s could not be unregistered)\n' "${_guest}"
                 return 1
@@ -174,7 +183,21 @@ failback_assist()
             ;;
 
         release)
-            _home=$( placement_home "${_guest}" ) || _home=""
+            # Three answers, not two: "this node claims it", "it does not",
+            # and "it cannot tell". The third one used to arrive as the
+            # second, and closing a failback on a placement file nobody could
+            # read is how the record of where a guest lives goes missing at
+            # the moment it is being changed.
+            _home=$( placement_home "${_guest}" )
+            case $? in
+                0) ;;
+                1) _home="" ;;
+                *)
+                    printf 'failback-assist: FAIL (this node cannot read its own placement records, so whether it claims %s is unknown)\n' \
+                        "${_guest}"
+                    return 1
+                    ;;
+            esac
 
             if [ -z "${_home}" ]; then
                 printf 'failback-assist: %s was not claimed here; nothing to release\n' \
@@ -414,12 +437,20 @@ failback_refusal()
     [ "${_total}" -ne 0 ] || return 0
     [ "${_discard}" -ne 1 ] || return 0
 
-    printf 'failback: REFUSED -- %d byte(s) have been written here to the copy of %s\n' \
+    # THE VERDICT LINE IS LAST, and everything it needs said comes above it.
+    # A verb ends in its verdict (charter §8, and the tier-7 oracle reads the
+    # last stdout line as one -- D-55). A refusal that printed the verdict and
+    # then three lines of explanation ended in an indented sentence, which is
+    # not a verdict in any grammar, and which the oracle would have called a
+    # half-dead verb.
+    printf '        %d byte(s) have been written here to the copy of %s since the base\n' \
         "${_total}" "${_guest}"
-    printf '        since the base the reverse stream would roll back to. Receiving would\n'
-    printf '        destroy them. If they are the debris of the crash and not data, run:\n'
+    printf '        the reverse stream would roll back to. Receiving would destroy them.\n'
+    printf '        If they are the debris of the crash and not data, run:\n'
     printf '            seance failback %s --discard-origin-writes\n' "${_guest}"
     printf '        %s\n' "${_where}"
+    printf 'failback: REFUSED -- %d byte(s) have been written here to the copy of %s\n' \
+        "${_total}" "${_guest}"
 
     return 1
 }
@@ -495,17 +526,17 @@ failback_run()
     _running=$( adapter_guest_running "${_guest}" 2>/dev/null ) || _running=""
 
     if [ "${_held}" != "1" ] && [ "${_running}" != "0" ]; then
-        printf 'failback: FAIL (%s is neither held nor stopped here: held=%s running=%s).\n' \
-            "${_guest}" "${_held:-?}" "${_running:-?}"
         printf '        A failback overwrites the copy of the guest on this node, and it will\n'
         printf '        not do that underneath a running guest.\n'
+        printf 'failback: FAIL (%s is neither held nor stopped here: held=%s running=%s).\n' \
+            "${_guest}" "${_held:-?}" "${_running:-?}"
         return 1
     fi
 
     if ! _interim=$( failback_interim "${_guest}" ); then
-        printf 'failback: FAIL (no living peer claims %s).\n' "${_guest}"
         printf '        Either it is already home, or the peer holding it is not answering -- and\n'
         printf '        a failback from a peer that cannot be reached is not a failback.\n'
+        printf 'failback: FAIL (no living peer claims %s).\n' "${_guest}"
         return 1
     fi
 
@@ -576,8 +607,13 @@ failback_run()
     fi
 
     # --- 1. stop it on the interim ----------------------------------------
-    printf '  undo: seance failback-assist %s is not reversible from here; the guest is\n' "${_guest}"
-    printf '        started again by finishing this failback, or on %s by hand\n' "${_interim}"
+    # Printed BEFORE the stop, and it names the command rather than describing
+    # it: from here on the guest is DOWN, and every failure below this line
+    # leaves it down. An operator reading a scrollback at 03:00 needs the one
+    # thing to type, not the knowledge that something can be typed.
+    printf '  undo: seance failback-assist %s start, run on %s\n' "${_guest}" "${_interim}"
+    printf '        Until this failback finishes, that is the only thing that puts %s back up.\n' \
+        "${_guest}"
     if ! failback_remote "${_addr}" "${_guest}" stop > "${_tmp}/stop" 2>&1; then
         sed -e 's/^/  /' "${_tmp}/stop"
         printf 'failback: FAIL (%s could not stop %s)\n' "${_interim}" "${_guest}"
@@ -690,6 +726,14 @@ failback_run()
         zfs_mounted "${_ds}" && continue
         if ! zfs_mount "${_ds}"; then
             printf 'failback: FAIL (%s came home but could not be mounted)\n' "${_ds}"
+            return 1
+        fi
+        # Asked again, for the reason promote_mount_ceremony asks again: `zfs
+        # mount` exiting 0 is not the dataset being mounted, and the guest is
+        # about to be started on it.
+        if ! zfs_mounted "${_ds}"; then
+            printf 'failback: FAIL (zfs mount %s exited 0 and it is still not mounted; nothing has been started)\n' \
+                "${_ds}"
             return 1
         fi
         printf '  mounted %s\n' "${_ds}"

@@ -36,6 +36,16 @@ not answer, and there is no human on the automatic path.
 The shipped `drivers/fence_ipmi` driver against real hardware is M4's, and
 seance still never writes a line of host network configuration.
 
+M2 is complete and tagged **v0.2.0**. What that means, precisely: the ladder,
+the failback, the gate and the records are implemented and tested at every tier
+the harness has — including tier 5, where `lib/adapter.subr` is run against a
+real CBSD 15.0.9 node and a real jail, and tier 6, where three vnet jails, real
+ZFS lineage, real ssh and a fence driver that really stops a node walk the whole
+succession. `sh tools/lint.sh` is the workstation half and `reaper test` the
+rest; both are green. What is NOT proven is anything that needs hardware: the
+fencing drills against a real BMC and a real two-node failover are
+`docs/DRILLS.md`'s, and they stay there until somebody runs them.
+
 What is here:
 
 | Path | What it is |
@@ -347,6 +357,14 @@ says which living peers could not report, because an unanswered peer is not a
 peer with no claim — and everything that reads these records treats it that
 way: the gate withholds the whole estate, `promote` aborts, `failback`
 refuses. If you see it, `ssh <peer> seance placement` is the diagnosis.
+
+**A record it cannot read is not a record that says "no claim".** The file is
+one `<guest><TAB><home>` per line and nothing else; a line that is not exactly
+that — a torn write, a stray field, a CR from an editor — fails the read, names
+itself by number, and makes every reader say so rather than quietly dropping
+it. The line most likely not to fit is the one that was half written, and a
+dropped claim is a guest this node is hosting that it no longer knows it is
+hosting.
 
 **Mesh prerequisite:** `seance placement` must be runnable as `ssh_user` on
 every node — a link to `bin/seance` somewhere on that user's `PATH`. CBSD's own
