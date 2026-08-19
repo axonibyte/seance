@@ -100,6 +100,8 @@ CONF_GUEST_ORDER=""
 CONF_NAME_ORDER=""
 CONF_PROBLEMS=""
 CONF_PROBLEM_COUNT=0
+CONF_WARNINGS=""
+CONF_WARNING_COUNT=0
 CONF_SEEN_NODENAMES=""
 CONF_SEEN_VHIDS=""
 CONF_SEEN_MGMT=""
@@ -572,6 +574,19 @@ _conf_problem()
     CONF_PROBLEMS="${CONF_PROBLEMS}problem: $*${CONF_NL}"
 }
 
+# _conf_warn <message...>
+#
+# A configuration that is VALID and whose consequences an operator should know
+# about before they are met at three in the morning. A warning does not change
+# the verdict or the exit status -- a node runs on a warned configuration --
+# which is exactly why the bar for adding one is that the alternative would
+# have been to forbid a combination the design permits (D-130).
+_conf_warn()
+{
+    CONF_WARNING_COUNT=$(( CONF_WARNING_COUNT + 1 ))
+    CONF_WARNINGS="${CONF_WARNINGS}warn: $*${CONF_NL}"
+}
+
 # _conf_int_in_range <key> <label> [guest]
 #
 # Check one integer-valued setting against CONF_RANGES, reporting through
@@ -916,10 +931,77 @@ _conf_check_guest()
         "${CONF_NODE_ORDER}"
 }
 
+# _conf_check_auto_overrides
+#
+# D-130, and it is a WARNING rather than a problem on purpose.
+#
+# CARP hands a dead node's vhid to that NODE's heir -- the advskews encode
+# node_<k>_heir and node_<k>_heir2 and nothing else, because a vhid stands for a
+# node identity (design §6). The ladder resolves succession PER GUEST, and a
+# guest_<g>_heir override replaces the node's order entirely (D-29). So when a
+# guest's override names a node other than its home node's heir, the node CARP
+# wakes is not that guest's actor and the guest's actor is never woken: with
+# `auto` off that is nothing at all, and with `auto` on it is a guest that stays
+# down until a human notices.
+#
+# It is not a problem, because every one of those settings is legal and the
+# combination is what the operator asked for; what seance owes them is the
+# consequence, stated once, in the validator they already run. The automatic
+# path itself pages rather than standing down silently (promote_auto_report),
+# which is the other half of D-130.
+#
+# The guest's HOME is not in the configuration -- it is where the guest runs,
+# which only the platform knows -- so this reports the nodes the guest would
+# have to live on for the deferral to bite, rather than asserting that it does.
+_conf_check_auto_overrides()
+{
+    local _g _h _n _homes _count _total _where
+
+    [ "$( conf_effective auto )" = "1" ] || return 0
+
+    # shellcheck disable=SC2086
+    #   Deliberate word splitting: guest keys are [a-z0-9]+ by conf_classify.
+    for _g in ${CONF_GUEST_ORDER}; do
+        _h=$( conf_get "guest_${_g}_heir" "" )
+        [ -n "${_h}" ] || continue
+
+        _homes=""
+        _count=0
+        _total=0
+
+        # shellcheck disable=SC2086
+        #   Deliberate word splitting: node keys are [a-z0-9]+.
+        for _n in ${CONF_NODE_ORDER}; do
+            _total=$(( _total + 1 ))
+            [ "${_n}" = "${_h}" ] && continue
+            [ "$( conf_get "node_${_n}_heir" "" )" = "${_h}" ] && continue
+            _homes="${_homes} ${_n}"
+            _count=$(( _count + 1 ))
+        done
+
+        [ "${_count}" -eq 0 ] && continue
+
+        # Named while the list is short enough to read, counted when it is not:
+        # a forty-node fleet would otherwise produce a line nobody finishes.
+        if [ "${_count}" -le 5 ]; then
+            _where="node(s)${_homes}"
+        else
+            _where="${_count} of the ${_total} configured nodes"
+        fi
+
+        _conf_warn "guest ${_g}: guest_${_g}_heir=${_h} is not the heir of ${_where}," \
+            "and auto=1. If ${_g} lives on one of those, that node's death wakes ITS" \
+            "heir, which is not ${_h}, so ${_g} will not be promoted automatically:" \
+            "the woken node pages instead, naming" \
+            "\"seance promote <deadnode> --guest ${_g}\" to be run on ${_h} (D-130)."
+    done
+}
+
 # conf_check
 #
-# Validate what has been loaded. Prints one "problem: ..." line per fault and
-# then a verdict line -- "PASS", or "FAIL: <n> problems". rc 0 or 1.
+# Validate what has been loaded. Prints one "problem: ..." line per fault, one
+# "warn: ..." line per consequence worth knowing, and then a verdict line --
+# "PASS", or "FAIL: <n> problems". rc 0 or 1. Warnings never change either.
 #
 # The verdict line is the whole point and it is last, so that it survives a
 # scrollback. 'seance config --check' prints this and nothing else: this line
@@ -931,6 +1013,8 @@ conf_check()
 
     CONF_PROBLEMS=""
     CONF_PROBLEM_COUNT=0
+    CONF_WARNINGS=""
+    CONF_WARNING_COUNT=0
     CONF_SEEN_NODENAMES=""
     CONF_SEEN_VHIDS=""
     CONF_SEEN_MGMT=""
@@ -1012,12 +1096,16 @@ conf_check()
             _conf_problem "names_${_n} must be a single non-empty word"
     done
 
+    _conf_check_auto_overrides
+
+    printf '%s' "${CONF_PROBLEMS}"
+    printf '%s' "${CONF_WARNINGS}"
+
     if [ "${CONF_PROBLEM_COUNT}" -eq 0 ]; then
         printf 'PASS\n'
         return 0
     fi
 
-    printf '%s' "${CONF_PROBLEMS}"
     printf 'FAIL: %d problems\n' "${CONF_PROBLEM_COUNT}"
 
     return 1

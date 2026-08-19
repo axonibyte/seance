@@ -33,7 +33,7 @@ set -u
 # shellcheck source=../cluster/sim/invariants.subr
 . "${T_ROOT}/tests/cluster/sim/invariants.subr"
 
-t_plan 47
+t_plan 52
 
 TAB=$( printf '\t' )
 
@@ -365,6 +365,49 @@ row "${O}/placement" charlie ghost01 held
 t_quiet 1 "invariant 1: an active claim beside a held one is not a split" \
     -- inv_1 "${M}" "${O}"
 
+# THE CORPSE'S CLAIM (D-150). A node the ladder's rung 4 has just fenced is
+# off, and its placement file goes on saying 'active' for the estate it was
+# running -- nobody can rewrite a disk that is not powered. The record is kept
+# on purpose (invariant 2 clause C needs it), so the invariant that asks who is
+# running the guest NOW has to ignore it. Without this, the split-brain
+# invariant fires on the exact sequence seance exists to make safe.
+W=$( world "${TS_NOW}" )
+M=${W% *}
+O=${W#* }
+: > "${M}/nodes"
+row "${M}/nodes" alpha dead
+row "${M}/nodes" bravo alive
+row "${M}/nodes" charlie alive
+row "${O}/placement" alpha ghost01 active
+row "${O}/placement" bravo ghost01 active
+t_quiet 1 "invariant 1: a fenced node's stale claim is not a second claimant" \
+    -- inv_1 "${M}" "${O}"
+
+# And the same shape with the node ALIVE, which is what a promotion that
+# skipped its fence leaves behind -- it must still fire, or the narrowing above
+# would have taken the invariant with it.
+W=$( world "${TS_NOW}" )
+M=${W% *}
+O=${W#* }
+row "${O}/placement" alpha ghost01 active
+row "${O}/placement" bravo ghost01 active
+t_fires 1 "invariant 1: two LIVE nodes claiming one guest still fires" \
+    -- inv_1 "${M}" "${O}"
+
+# An isolated node is alive, and an isolated node claiming a guest a live heir
+# also claims is the unfenced promotion the rediscovery battery reverts.
+W=$( world "${TS_NOW}" )
+M=${W% *}
+O=${W#* }
+: > "${M}/nodes"
+row "${M}/nodes" alpha isolated
+row "${M}/nodes" bravo alive
+row "${M}/nodes" charlie alive
+row "${O}/placement" alpha ghost01 active
+row "${O}/placement" bravo ghost01 active
+t_fires 1 "invariant 1: an ISOLATED node still counts as a claimant" \
+    -- inv_1 "${M}" "${O}"
+
 W=$( world "${TS_NOW}" )
 M=${W% *}
 O=${W#* }
@@ -583,6 +626,34 @@ row "${O}/props" bravo ghost01 mountpoint /estate/ghost01
 row "${O}/props" alpha ghost01 canmount noauto
 row "${O}/props" alpha ghost01 mountpoint none
 t_quiet 4a "invariant 4a: the node authorised to run a guest may mount it" \
+    -- inv_4a "${M}" "${O}"
+
+# AND WHEN A SECOND NODE ALSO CLAIMS IT (D-150). alpha's home claim is still
+# there -- a fenced node's record outlives it -- so the effective placement is
+# alpha and bravo, which has just promoted, was read as holding a shadow mount.
+# One fact, and it is invariant 1's to report; 4a must not report it a second
+# time as something else.
+W=$( world "${TS_NOW}" )
+M=${W% *}
+O=${W#* }
+row "${O}/placement" alpha ghost01 active
+row "${O}/placement" bravo ghost01 active
+: > "${O}/props"
+row "${O}/props" bravo ghost01 canmount on
+row "${O}/props" bravo ghost01 mountpoint /estate/ghost01
+t_quiet 4a "invariant 4a: a claimant is never a replica, even beside another claim" \
+    -- inv_4a "${M}" "${O}"
+
+# The narrowing goes no further than a CLAIM: a node holding a mounted copy of
+# a guest it does not claim is the hand-mount, and the August defect.
+W=$( world "${TS_NOW}" )
+M=${W% *}
+O=${W#* }
+row "${O}/placement" alpha ghost01 active
+: > "${O}/props"
+row "${O}/props" charlie ghost01 canmount on
+row "${O}/props" charlie ghost01 mountpoint /estate/ghost01
+t_fires 4a "invariant 4a: a node with no claim and a mounted copy still fires" \
     -- inv_4a "${M}" "${O}"
 
 # ---------------------------------------------------------------------------

@@ -4,8 +4,56 @@ A generator dealing weighted events from a fixed seed against a shadow model of
 expected placement and lineage, with five invariants diffed continuously. The
 oracle self-test is written before the generator: invariants fed hand-built
 broken states must each complain, and that runs at tier-4 cost with no cluster
-at all. See TESTING.md §7.
+at all. See TESTING.md §7 and tests/cluster/sim/DESIGN.md.
 
-Empty at M0.
+    t_sim.sh    the tier entry: the oracle self-test FIRST (it refuses to spend
+                a session on a checker that cannot fire), then every seed in
+                tests/cluster/sim/seeds.txt, then -- opt-in -- hunting.
+
+Everything it drives lives in tests/cluster/sim/:
+
+    run.sh          one seed -> one trace -> one verdict, against a cluster it
+                    builds and destroys
+    gen.subr        the seeded PRNG and the weighted chooser
+    model.subr      the shadow model: what may happen next, and what must be
+                    true
+    world.subr      the real world driver: events applied to three vnet jails
+                    and to real seance, and the observed state written out
+    invariants.subr the checker (also fed by the tier-4 oracle self-test)
+    oracle.subr     the cheap oracle around every seance invocation
+    shrink.subr     prefix bisection, then event-kind removal
+    seeds.txt       the committed battery
+
+Environment:
+
+    SEANCE_SIM_STEPS    events per seed (default 60)
+    SEANCE_SIM_N        nodes (3; 4 for the even-N profile)
+    SEANCE_SIM_SEEDS    a seed list that REPLACES the committed battery. For
+                        the rediscovery battery, which asserts a failure and
+                        needs to see it once. Announced in the output, so a run
+                        that used it cannot be read as the battery.
+    SEANCE_HUNT=1       draw fresh seeds until SEANCE_HUNT_BUDGET seconds are
+                        gone (`reaper run --profile hunt`)
+    SEANCE_SIM_DRY=1    run.sh only: draw and model a trace with NO cluster,
+                        which is how the generator and the model's
+                        applicability rules are exercised on a workstation
+                        (tests/tier1/t_sim_model.sh is the unit test)
+    SEANCE_SIM_SHRINK_BUDGET
+                        seconds a failing trace's reduction may cost (1800).
+                        Every rerun rebuilds a cluster, so the reduction is
+                        estimated before it is started and the UNREDUCED trace
+                        is printed when it does not fit -- a shrink nobody
+                        budgeted for can eat the session the battery was meant
+                        to run in. The verdict is the same either way.
+    SEANCE_SIM_NO_SHRINK=1
+                        do not reduce at all (the shrinker's own reruns set it,
+                        and so does the rediscovery battery)
+
+A seed that finds a defect is written to $REAPER_OUT/sim/seeds-to-promote.txt.
+It is NOT appended to seeds.txt automatically: this same runner is what the
+rediscovery battery drives with a protection deliberately reverted, and a
+runner that promoted on every failure would fill the permanent battery with
+seeds that found a hole somebody made on purpose. Appending is the fixer's,
+with a comment naming the defect (D-133).
 
 Files named t_*.sh are tests; anything else here is ignored.

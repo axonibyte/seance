@@ -120,12 +120,42 @@ verified off AND lineage fresh; otherwise placement is unchanged and a
 notify is expected. The model does not predict lag values or exact snapshot
 names — it predicts *monotonicity* and *uniqueness*.
 
+*(As built, per D-134: the model predicts the node roster, each guest's home and
+a LOWER BOUND on lineage — after a tick, the node hosting a guest has taken a
+local `zfs snapshot -r`, which cannot fail to exist without seance having lied
+about the tick. It does NOT predict that a send arrived (a send crosses the
+network the nemesis is cutting, and predicting it would fire invariant 3 every
+time the nemesis worked), and it does not predict where a promotion lands:
+`invariants.subr` as built reads no such expectation — invariant 2 asks the
+RECORDS whether a move carried evidence — and a "prediction" copied from the
+observation it is checked against is worse than no prediction, because it looks
+like one. Placement, holds and post-fence liveness are therefore READ BACK after
+each event, and the file says so where it does it. What survives from this
+section is the part with teeth: applicability is computed from the model and
+never from the world. The model also offers an ISOLATED node as a promote
+actor, because that is what CARP does to a node that hears nobody — without it
+this tier would never exercise the quorum rule at all.)*
+
 ## 6. Invariants (checked after every event and at the end)
 
 1. **No guest is active on two nodes** — observed: for every guest, count
    nodes where the pseudo adapter says `running=1`; must be ≤ 1. Also ≤ 1
    node with placement in `placement` files (`SEANCE_STATE_DIR/placement`
    across nodes) unless one of them is `held`.
+
+   *(As built, per D-150: the second clause counts LIVE nodes only, and the
+   fourth invariant's 4a never treats a node CLAIMING a guest as holding a
+   replica of it. A node the ladder's rung 4 has fenced is off, and its
+   placement file goes on saying `active` for the estate it was running a
+   second earlier — nobody rewrites a disk that is not powered. That record is
+   kept on purpose, because invariant 2 clause C needs it or a node that merely
+   lost power reads as a guest that came home with no failback record; what it
+   is NOT is a claim to be running something now. Counting it fired the
+   split-brain invariant on the exact sequence seance exists to make safe:
+   isolate a node, let an heir fence it and promote its estate. Found by seed
+   2885768256 at step 56. Nothing is lost — a real split brain has two nodes
+   UP, and a promotion that skipped its fence leaves the target up, which is
+   what keeps the rediscovery row for it firing.)*
 2. **Every promotion has evidence** — every line appended to any node's
    `succession.log` carries `fence:<driver>` or `force:<operator>`; a
    promotion observed (placement changed) without a matching record is a
@@ -141,6 +171,15 @@ names — it predicts *monotonicity* and *uniqueness*.
    seance — after `hand-mount`, the next `repl` must either restore
    (`canmount=noauto mountpoint=none`) and log it, or refuse that pair with
    a FAIL line; either is coherent, silent acceptance is not.
+
+   *(As built, per D-136 and resolving D-112: the world driver emits `props`
+   rows for the copies under `<standby_root>/<home>/<guest>` and not for the
+   copy on the guest's own home. The home's copy is the original — it carries
+   the mountpoint the platform gave it and always will — so a state that
+   offered it would fire 4a on every correct post-promotion cluster, which is
+   how an invariant comes to be switched off. What stops a returning home from
+   STARTING it is the boot gate, which is invariant 1's business and which the
+   `return` event exercises directly.)*
 5. **Cheap oracle on every action** (`oracle.subr` wraps every seance call):
    exit code ∈ {0,1,2}, a verdict line present as the last stdout line
    matching `^[a-z]+: `, wall time under `SEANCE_SIM_STEP_TIMEOUT` (never
@@ -215,9 +254,50 @@ inside the guest (the `repl` tick dominates; keep guests tiny). Hunting:
 ever finds a defect is appended to `seeds.txt` permanently**, with the
 commit that fixed the defect referenced in a comment.
 
+*(As built, per D-137: `t_sim.sh` REPORTS a failing seed to
+`$REAPER_OUT/sim/seeds-to-promote.txt` and does not edit `seeds.txt` itself.
+This same runner is what the rediscovery battery drives with a protection
+deliberately reverted (§10), and a runner that appended on every failure would
+fill the permanent battery with seeds that found a hole somebody made on
+purpose. `SEANCE_SIM_SEEDS` replaces the battery with a named list — announced
+in the output, so a run that used it cannot be read as the battery — which is
+how a tier-7 rediscovery row costs one cluster rebuild rather than five. And
+`SEANCE_SIM_DRY=1` (D-135) draws and models a trace with no cluster at all,
+which is how the generator and the applicability rules are exercised on a
+workstation.)*
+
+*(And per D-147: only a run that reached a VERDICT nominates a seed. `run.sh`
+exits 0 for a pass, 1 for a firing, 2 when the driver could not start and 3
+when it was KILLED before it could decide — an interrupted battery used to exit
+1 through the harness's signal trap, indistinguishable from five seeds finding
+five defects, which is how it was read on 2026-08-17. A run driven by
+`SEANCE_SIM_SEEDS` nominates nothing at all, and the nomination file names this
+run's seeds rather than accumulating across sessions.)*
+
 ## 10. Rediscovery hooks (TESTING.md §8)
 
 The M3 rediscovery battery runs the fixed seeds against reverted
 protections: quorum removed → invariant 1 under `double-trigger`/`isolate`;
 fencing removed → invariant 2; boot gate removed → invariant 1 under
 `return`; recv without `-x mountpoint` → invariant 4a under `hand-mount`.
+
+*(As built: two of those four are rows, and two are not. `recv without -x
+mountpoint` cannot fire because seance re-holds the shadow-mount law on every
+tick before the driver can look (D-144). `quorum removed` cannot fire because a
+node that fails quorum is by construction a node that can reach nobody, and the
+fixture's fence driver reaches the guest host over that same network — so rung
+4 stops what rung 2 would have stopped, and the world the invariants observe is
+one in which nothing happened (D-151). Both are caught a tier down, by
+`tests/tier6/t_quorum.sh` and `tests/tier6/t_repl.sh`, and both rows are
+removed rather than left green: a row that cannot fail reads as coverage of a
+protection nothing is checking.)*
+
+*(As built, and measured rather than predicted: three of the four rows
+rediscover — fencing removed, quorum removed and the boot gate removed, each
+against seed 2950315648 for 27 steps, a window chosen by reading its trace
+(D-143). The fourth does NOT and has been removed: seance re-holds the
+shadow-mount law on every tick (D-65), so a receive without `-x mountpoint` has
+been repaired before the driver observes any property and invariant 4a has
+nothing to see. That revert is caught by the tier-6 `repl` row, which asserts
+that a clean tick repairs nothing. A row that cannot fail reads as coverage of
+a protection nothing is checking, which is worse than no row (D-125).)*

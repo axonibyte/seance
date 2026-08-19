@@ -22,8 +22,38 @@
 # Appending a seed is not a decision that needs anyone's permission. Removing
 # one is, and the answer is no.
 
-1043489862
-2885768256
+1043489862      # found D-140: three fixture faults, incl. a skew the world
+                # never restored while the model had already expired it
+2885768256      # found D-150: an oracle fault. A node fenced by a promotion's
+                # rung 4 goes on claiming its estate 'active' from a disk
+                # nobody is running, and the split-brain invariant counted the
+                # corpse as a second claimant -- firing on the exact sequence
+                # seance exists to make safe. Step 56 of 60; nothing shorter
+                # had reached it in four sessions of running this tier.
 1772760640
 275565795
-2950315648
+2950315648      # found D-145: a node isolated, then killed, then returned came
+                # back with its cable still out, and the fixture waited sixty
+                # seconds for an ssh that could not arrive
+
+# WHAT THE 2026-08-19 TRIAGE ADDED, WHICH IS NOTHING (D-146), AND WHY THAT IS
+# NOT THE SAME AS FINDING NOTHING. Five seeds arrived on a promotion list
+# saying they had found a defect. Three of those logs stopped in the middle of
+# a step because the battery had been interrupted -- a killed run is not a
+# finding, which the runner can now say for itself (D-147) instead of leaving
+# it to be worked out from a log two days later.
+#
+# But running them properly, sixty steps each on a fixed tree, is what the
+# battery is FOR: 2885768256 then found D-150 at step 56. Nothing is appended
+# because all five were already here; three of them now carry a comment naming
+# what they caught, which is the naming the promotion rule asks of the person
+# who fixes the defect.
+
+# 2950315648 is also the window the tier-7 rediscovery rows are run against
+# (D-143), and the window is its first 27 steps. Read off the trace on
+# 2026-08-19, because a window described from memory is a window that has
+# drifted: isolate alpha at 1, promotions at 5, 7, 12 and 15, double-triggers
+# at 6, 9 and 26, an isolation of charlie at 11, a heal at 20, a hand-mount at
+# 21, a kill at 22, and -- the event the boot gate exists for -- return alpha
+# at 25, after its estate has moved. It was already in the battery; the comment
+# is here so that nobody trims it as redundant.

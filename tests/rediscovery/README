@@ -66,6 +66,113 @@ The rows, and what each is about:
       the healing node, fences it, and promotes an estate that was never
       orphaned.
 
+  verifier-masks-crash.patch
+      Makes `lineage_probe` swallow the listing's stderr and read an empty
+      listing that exited 0 as "the newest replica is now". The August
+      catalogue's crashed verifier: a checker that died, said nothing, and
+      whose silence was taken for a pass. Caught at tier 4 by
+      t_ladder_lineage.sh's empty0 rows and by the ladder table's
+      `lineage-empty0` row.
+
+      IT WAS NOT CAUGHT BY THE LADDER TABLE UNTIL THIS PATCH WAS WRITTEN. The
+      `lineage=empty0` world scripted the mock with a key built from a
+      TWO-LINE variable; the script came out malformed, the mock answered a
+      contract error, and the row passed while measuring something else
+      entirely. The fixture now empties the listing seam directly. A row that
+      stays green when its protection is reverted is a finding about the row,
+      and this is what one looks like.
+
+  promotion-without-fencing.patch (tier 6 stage `quorum`, tier 7)
+      Beyond the `promote` stage it already had: in `quorum` the target is
+      ISOLATED rather than dead, so a promotion that did not fence leaves the
+      guest running in two places -- which is the invariant the product exists
+      for, rather than a missing record. At tier 7 the same revert is invariant
+      2 (a promotion with no evidence) and invariant 1 under an isolation.
+
+  the tier-7 rows
+      Two rows drive tests/tier7/t_sim.sh with a protection reverted, per
+      DESIGN.md §10 (§10 predicts four; see below for why two of them are not
+      here).
+      They are run by
+
+          sh tests/rediscovery/run.sh --tier 7
+
+      and each of them carries its own environment in the table's fifth column,
+
+          SEANCE_SIM_SEEDS=2950315648 SEANCE_SIM_STEPS=27 SEANCE_SIM_NO_SHRINK=1
+
+      because a tier-7 row asserts that a deliberately reverted protection is
+      NOTICED: noticing it once is the whole answer, and the default battery's
+      five seeds would be four more cluster rebuilds for the same bit. The
+      shrinker is off for the same reason -- it exists to reduce a trace nobody
+      understands, and here the cause is the patch that was just applied.
+      Neither switch changes what is asserted: the run still has to fail.
+
+      THE ENVIRONMENT IS IN THE ROW, not here. It used to be this paragraph,
+      and a paragraph is not something the runner can honour: run without it,
+      the three rows became three full five-seed batteries, and one run against
+      the wrong window is exactly the failure D-143 records. A battery whose
+      correct invocation is a footnote is a battery that will be run wrong.
+
+      THERE IS NO TIER-7 ROW FOR quorum-rule-removed either, and this one was
+      measured rather than reasoned. Run with the rule reverted, seed
+      2950315648 x 27 passes, and the capture of the one step in that window
+      where an ISOLATED node is the promoting actor says exactly why:
+
+          rung 2 quorum: pass -- 1 + 0 reachable of N=3 is a majority
+                                 (reachable: none)
+          rung 3 probes: pass -- bravo answered neither ping nor ssh
+          rung 4 fence:  notify -- cannot determine whether bravo is off:
+                         fence_jail off bravo exited 2
+                         [fence_jail: bravo unknown could not reach host]
+          promote: stopped at rung 4 fence -- notify
+
+      The reverted rung DID act: "1 + 0 of N=3 is a majority" is the arithmetic
+      the quorum rule exists to refuse, and the patched rung waved it through.
+      What stopped the promotion was rung 4. And it always will: a node that
+      fails quorum is by construction a node that can reach nobody, the
+      fixture's fence driver reaches the guest host over the same network
+      (tests/cluster/drivers/fence_jail), so an actor that quorum would have
+      frozen is an actor that cannot fence. Defence in depth caught it one rung
+      later, which is the system working -- and it means the tier-7 invariants
+      see a world in which nothing bad happened, because nothing bad did.
+
+      A row that cannot fail reads as coverage of a protection nothing is
+      checking (D-125, D-144), so it is removed rather than left green. What
+      catches this revert is tier 6's `quorum` stage -- where the isolated node
+      must do nothing and the CONNECTED heir must fence first, and the fence is
+      reachable because that heir is on the bridge -- and tier 4's t_ladder.sh.
+      Both rediscover it.
+
+      THERE IS NO TIER-7 ROW FOR recv-no-x-mountpoint, and DESIGN.md §10
+      predicted one ("invariant 4a under hand-mount"). It was written, run, and
+      removed: seance re-holds the shadow-mount law on EVERY tick (D-65), so by
+      the time the driver observes properties the replica has already been
+      repaired and invariant 4a has nothing to see. Measured, not reasoned --
+      the row ran 25 of its 27 steps with the receive flag removed and nothing
+      fired. What catches that revert is the tier-6 `repl` row, which asserts
+      that a CLEAN tick repairs nothing; a tier-7 row that cannot fail would
+      read as coverage of a protection nothing was checking (D-125's rule,
+      applied to a row of this project's own making).
+
+      THE SEED AND THE STEP COUNT ARE PART OF THE ROW, and choosing them badly
+      is how a tier-7 row comes to prove nothing. A reverted protection is only
+      noticed by a trace that reaches it: the first window tried here
+      (1043489862 x 23) contained one `promote` and it froze at rung 2 for want
+      of a quorum, so `promotion without fencing` reverted a rung the trace
+      never walked and the row passed. 2950315648 was chosen by reading its
+      trace, and this is what its first 27 steps hold, re-read from the trace
+      on 2026-08-19 rather than recited: `isolate alpha` at 1; promotions at 5,
+      7, 12 and 15; `double-trigger` at 6, 9 and 26; `isolate charlie` at 11; a
+      heal at 20; `hand-mount` at 21; `kill charlie` at 22; and -- the one the
+      boot gate needs -- `return alpha` at 25, after its estate has moved. A
+      row whose window does not contain the event its protection guards is a
+      row that cannot fail, which is worse than no row (D-125).
+
+      Re-read it after any change that moves the generator or the model, and
+      write down what you saw. The window is a property of the trace, and the
+      trace is a property of the tree.
+
   repl-skip-resume-token.patch
       Makes the engine ignore the peer's receive_resume_token. A dataset
       holding a token refuses every other stream -- "destination contains
