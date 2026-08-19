@@ -252,6 +252,18 @@ entry, whatever the spread of per-guest cadences:
 
     */1 * * * * root /usr/local/cbsd/modules/seance.d/bin/seance repl
 
+The comparison runs in BOTH directions (D-141, ruled on in D-152). A lag
+record more than `skew_tolerance` in the FUTURE is a clock that moved, not a
+tick that has just happened: the guest is due, with a warning naming the guest,
+the record and the skew. Without it a node whose clock stepped backwards --
+ntp after a long outage, a hypervisor restoring a paused guest, a BIOS clock
+read wrong at boot -- replicates nothing until wall time catches up, and its
+verdict line reads exactly like a healthy tick with the gate doing its job. A
+record in the future by LESS than the tolerance stays not-due: that is ordinary
+jitter between two machines, and the tolerance is the line seance already draws
+between the two (`status` clamps a replica timestamped ahead of the clock the
+same way, D-38).
+
 `crontab(5)` on FreeBSD 15.1: *"Each line in system crontab ( /etc/crontab,
 /etc/cron.d, /usr/local/etc/cron.d ) has five time and date fields, followed by
 a valid user name ... followed by a command."* `cron(8)` FILES names

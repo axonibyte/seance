@@ -632,6 +632,20 @@ model_tick_lineage()
         # again failed nothing. Code whose removal fails nothing is code whose
         # necessity is unproven, and a second implementation of the gate living
         # in the checker is a thing to keep in step for no return.
+        #
+        # THE GATE NOW COMPARES IN BOTH DIRECTIONS (D-141, ruled on in D-152):
+        # a lag record more than skew_tolerance in the FUTURE makes the guest
+        # due rather than not-due, which is what a node whose clock stepped
+        # backwards meets. That changes what the WORLD does after a `skew -N`
+        # event -- it ticks where it used to skip -- and still changes nothing
+        # here, for the reason above turned around: the tick it now takes names
+        # the node's own SHIFTED instant, which is EARLIER than the one already
+        # predicted, and model_lineage_set keeps the newest of the two. The
+        # prediction is a lower bound (invariant 3 asserts model <= observed)
+        # and a snapshot with an older name cannot lower an upper bound that
+        # already exists. So the model is unchanged deliberately, and this
+        # paragraph is here so that the next person does not have to re-derive
+        # why.
         _now=$( model_now "${_place}" )
         model_lineage_set "${_g}" "${_place}" "$( model_ts "${_now}" )"
     done

@@ -1277,9 +1277,26 @@ repl_peers()
 # decides for itself whether it is due, from its own lag records -- so a fleet
 # of guests with different cadences needs one crontab entry rather than one per
 # guest. (Decision D-61.)
+#
+# AND IT COMPARES IN BOTH DIRECTIONS (D-141, ruled on in D-152). The lag record
+# carries the tick's own epoch, so on a node whose clock has jumped BACKWARDS --
+# ntp stepping after a long outage, a hypervisor restoring a paused guest, a
+# BIOS clock read wrong at boot -- every guest reads as "not due" until wall
+# time has caught up with a record written in what is now the future. Measured
+# in the simulator: a skew of -180 s against a cadence of 60 s cost three
+# consecutive ticks, and the only sign was the `skipped` count in a verdict line
+# that reads exactly like a healthy tick with the cadence gate doing its job.
+#
+# So a record more than `skew_tolerance` in the future is DUE, with a warning
+# naming the guest, the record and the skew: it is the same rule `status`
+# already applies to a replica timestamped ahead of the clock (D-38's clamp),
+# applied at the gate. A record in the future by less than the tolerance stays
+# not-due, because that is ordinary jitter between two machines and is the gate
+# working as designed -- the tolerance is exactly the line this project already
+# draws between the two.
 repl_due()
 {
-    local _guest _home _now _cad _peer _rec _last _t
+    local _guest _home _now _cad _peer _rec _last _t _skew _ahead
 
     _guest=$1
     _home=$2
@@ -1304,6 +1321,32 @@ repl_due()
     done
 
     [ -n "${_last}" ] || return 0
+
+    # The record is in the future. Beyond the fleet's own tolerance for two
+    # machines disagreeing about the time, that is a clock that moved, not a
+    # tick that has just happened, and refusing to replicate until wall time
+    # catches up is how a fleet comes to replicate nothing for an hour and page
+    # nobody.
+    if [ "${_last}" -gt "${_now}" ]; then
+        _ahead=$(( _last - _now ))
+        _skew=$( conf_effective skew_tolerance ) || _skew=120
+        case "${_skew}" in
+            ''|*[!0123456789]*) _skew=120 ;;
+        esac
+
+        if [ "${_ahead}" -gt "${_skew}" ]; then
+            seance_log warning "repl ${_guest}: the newest lag record is" \
+                "${_ahead}s in the FUTURE (record ${_last}, now ${_now}," \
+                "skew_tolerance ${_skew}s) -- this node's clock has moved" \
+                "backwards, or the record was written by one that had." \
+                "Replicating anyway: waiting for the clock to catch up would" \
+                "stop replication silently"
+            return 0
+        fi
+
+        # Inside the tolerance: ordinary jitter, and the gate holds.
+        return 1
+    fi
 
     [ $(( _now - _last )) -ge "${_cad}" ]
 }
