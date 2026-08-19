@@ -33,8 +33,11 @@ the node's own `auto_promote` list. Either alone is notify-only. `--force` is
 not expressible with `--auto` — a force is a human accepting a rung that could
 not answer, and there is no human on the automatic path.
 
-The shipped `drivers/fence_ipmi` driver against real hardware is M4's, and
-seance still never writes a line of host network configuration.
+The shipped `drivers/fence_ipmi` driver speaks IPMI to a BMC (iDRAC and
+kin); `docs/fence-drivers.md` is the fence-driver contract, its credentials
+format, and what it takes to write another one. Proving it against real
+hardware is M4's drill, and seance still never writes a line of host network
+configuration.
 
 M3 is complete and tagged **v0.3.0**; M2's gate closed at **v0.2.0**. What that
 means, precisely: replication, the ladder, the failback, the gate, the records,
@@ -81,6 +84,7 @@ What is here:
 | `tests/tier4/ladder.tsv` | the promotion ladder's truth table: every rung × every outcome |
 | `tests/drivers/fence_mock` | a fence driver that produces every answer the contract names, including the three that are not answers |
 | `docs/cbsd-module-notes.md` | what M0 learned about CBSD, with citations |
+| `docs/fence-drivers.md` | the fence-driver contract, the credentials format of `drivers/fence_ipmi`, and how to write another driver |
 | `docs/repl-wire.md` | the exact send/receive command lines, and the evidence for each |
 | `docs/INSTALL.md` | install, upgrade, uninstall, and the cron/CARP/devd steps `verify` renders but never writes |
 | `docs/DRILLS.md` | the fleet drills each milestone is gated on |

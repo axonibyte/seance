@@ -1,0 +1,847 @@
+#!/bin/sh
+# seance -- fence driver: IPMI over LAN, via ipmitool(1).
+#
+#   fence_ipmi off    <target> [--config <file>] [--timeout <seconds>]
+#   fence_ipmi status <target> [--config <file>] [--timeout <seconds>]
+#   fence_ipmi --help
+#
+# This is the shipped implementation of the fence driver contract (HANDOFF.md
+# §2.4, decision D-44 item 2). It is deliberately standalone: it sources
+# nothing from lib/, so it can be run by hand at 03:00, copied to a node that
+# has no seance checkout, or called by something that is not seance at all. The
+# price is that the config parser below is a second implementation of the
+# grammar in lib/conf.subr; that duplication is the point, not an oversight,
+# and tests/tier1/t_fence_ipmi.sh pins the parts of the grammar that matter
+# here (comments, CR, duplicate keys, unknown keys, trailing whitespace).
+#
+# THE CONTRACT
+#
+#   off     Power the target off and do not return 0 until that is *verified*.
+#           "Command accepted" is not "off".
+#             0  verified off      -- a status read said off
+#             1  refused / still on -- the BMC rejected the command, or the
+#                                     power still reads on when the budget is
+#                                     spent. A hard abort: D-44 item 1 makes
+#                                     this rung un-forceable, because a fence
+#                                     that failed is exactly the situation a
+#                                     forced promotion turns into split brain.
+#             2  cannot determine  -- BMC unreachable, authentication failed,
+#                                     output unparsable, or ipmitool exited 0
+#                                     with nothing to say (contract violation,
+#                                     the crashed-verifier lesson). The caller
+#                                     stops at notify; a human may --force.
+#   status  0 off, 1 on, 2 unknown. There is no "refused" for a read: a status
+#           call that fails for any reason is a status nobody knows.
+#
+# Every path prints exactly one verdict line on stdout:
+#
+#     fence_ipmi: <target> <off|on|unknown|refused> <detail>
+#
+# and everything else on stderr. --help prints usage on stdout and is the one
+# path with no verdict line, because it fenced nothing.
+#
+# CREDENTIALS
+#
+# <target> is not a BMC address. It is the token from the site config key
+# node_<key>_fence_target, and it names an entry in a root-only credentials
+# file, so that the address, the user and the path to the password are one
+# administrative unit that `seance verify` can diff across the mesh:
+#
+#     target_<name>_host=<bmc address>
+#     target_<name>_user=<bmc user>
+#     target_<name>_passfile=<path to a 0600 file holding only the password>
+#     target_<name>_extra=<extra ipmitool arguments>        (optional)
+#
+# The credentials file is named by --config or by SEANCE_FENCE_IPMI_CONF, and
+# there is no compiled-in default: the natural home is ${workdir}/etc/ (D-3),
+# and this driver cannot learn workdir without asking CBSD, which is exactly
+# what a standalone driver must not do (the seam, DESIGN.md §2). seance passes
+# the path; a human passes --config. Neither given is a contract error, not a
+# silent fallback to a guess (D-53).
+#
+# The credentials file and every passfile it names must be unreadable to group
+# and other -- 0600 or narrower -- or this driver refuses to run (rc 2). The
+# password is never read by this driver, never appears in argv, and never
+# appears in a diagnostic: ipmitool is given `-f <passfile>` and reads it
+# itself, and any diagnostic echoing the command line prints `-f <redacted>`.
+#
+# EVIDENCE (ipmitool 1.8.19, the version in FreeBSD ports as of 2026-08;
+# source read from /usr/ports/distfiles/IPMITOOL_1_8_19.tar.gz):
+#
+#   * `chassis power status` prints "Chassis Power is on" or
+#     "Chassis Power is off" on *stdout* -- lib/ipmi_chassis.c:206,
+#     printf("Chassis Power is %s\n", ps ? "on" : "off").
+#   * `chassis power off` prints "Chassis Power Control: Down/Off" on stdout
+#     (lib/ipmi_chassis.c:236 with lib/ipmi_strings.c:1259), and on a
+#     completion-code failure prints "Set Chassis Power Control to Down/Off
+#     failed: <reason>" and returns -1 (lib/ipmi_chassis.c:228-232).
+#   * Diagnostics go to stderr: lprintf writes fprintf(stderr,...) unless
+#     ipmitool is in daemon mode (lib/log.c:73). The process exits
+#     EXIT_FAILURE on any command failure (src/ipmitool.c:138).
+#   * A session that cannot be established prints
+#     "Error: Unable to establish IPMI v2 / RMCP+ session"
+#     (src/plugins/lanplus/lanplus.c:3572) -- the anchor of the
+#     "cannot determine" pattern list below.
+#   * -f reads at most the first line of the file, up to 20 characters, with
+#     trailing \r \n \t stripped (lib/ipmi_main.c:105-143).
+#
+# The parser here is nevertheless tolerant: it matches "is off"/"is on"
+# case-insensitively rather than the exact banner, so that a BMC or an
+# ipmitool that decorates the line still parses.
+#
+# shellcheck disable=SC3043
+#   'local' is not in POSIX sh but is implemented by FreeBSD /bin/sh (sh(1),
+#   "local"); seance targets FreeBSD sh and nothing else (HANDOFF.md §5).
+#
+# -f as well as -u: the one place this driver splits a string into words is the
+# credentials file's `extra` field, and a '*' in a file that names how to power
+# a machine off must not quietly become the contents of the current directory.
+# Nothing here globs on purpose.
+set -uf
+
+FENCE_PROG=fence_ipmi
+
+# Defaults. The timeout is the fleet key fence_timeout (default 60, sanity
+# range 1..3600 in lib/conf.subr); seance passes the site's value, and
+# SEANCE_FENCE_TIMEOUT lets an operator override it for one invocation.
+FENCE_TIMEOUT=${SEANCE_FENCE_TIMEOUT:-60}
+FENCE_POLL=2
+
+FENCE_CONF=${SEANCE_FENCE_IPMI_CONF:-}
+FENCE_ACTION=""
+FENCE_TARGET="-"
+FENCE_HOST=""
+FENCE_USER=""
+FENCE_PASSFILE=""
+FENCE_EXTRA=""
+FENCE_DATA=""
+FENCE_TMP=""
+FENCE_RC=0
+FENCE_KIND=""
+FENCE_LASTCMD=""
+
+# A literal newline, carriage return and tab, built without depending on any
+# escape being understood inside a case pattern.
+FENCE_NL='
+'
+FENCE_CR=$( printf '\r.' )
+FENCE_CR=${FENCE_CR%.}
+FENCE_TAB=$( printf '\t.' )
+FENCE_TAB=${FENCE_TAB%.}
+
+# The "we never got an answer" pattern list (decision D-54), matched
+# case-insensitively over both streams of a failed ipmitool call. ipmitool
+# exits EXIT_FAILURE for everything (src/ipmitool.c:138), so the message is the
+# only evidence there is. Everything here means the BMC did not
+# speak to us; anything else that fails means it did, and said no. Erring the
+# other way would let an operator --force past a fence that had actually been
+# refused, which is the one mistake this driver exists to make impossible.
+# Every alternative is a real ipmitool 1.8.19 message, cited above or here:
+#   src/plugins/lan/lan.c:1867,1958 (LAN / v1.5 sessions), lan.c:1578
+#   (challenge), lan.c:418 and lanplus.c:585 (ping), lanplus.c:3078,3251
+#   (RAKP), src/plugins/ipmi_intf.c:380 (address lookup),
+#   lib/ipmi_main.c:118,127 (password file).
+FENCE_UNREACHABLE_RE='unable to establish|activate session error|get session challenge command failed|unable to send ipmi presence ping|no response from|address lookup for .* failed|unable to (open|read) password'
+
+usage()
+{
+    cat <<'USAGE'
+usage: fence_ipmi off    <target> [--config <file>] [--timeout <seconds>]
+       fence_ipmi status <target> [--config <file>] [--timeout <seconds>]
+       fence_ipmi --help
+
+Actions:
+  off     power the target off and wait until a power status read confirms it.
+          Exit 0 only when off is verified; 1 when the BMC refused the command
+          or the power still reads on when the timeout expires; 2 when the
+          result cannot be determined (unreachable, auth failure, unparsable).
+  status  read power state. Exit 0 off, 1 on, 2 unknown.
+
+Options:
+  --config <file>     credentials file (default: $SEANCE_FENCE_IPMI_CONF).
+  --timeout <seconds> budget for the whole action, 1..3600
+                      (default: $SEANCE_FENCE_TIMEOUT, else 60).
+
+<target> names an entry in the credentials file, which must be readable only
+by its owner (0600 or narrower), as must every passfile it names:
+
+  target_<name>_host=<bmc address>
+  target_<name>_user=<bmc user>
+  target_<name>_passfile=<path to a 0600 file holding only the password>
+  target_<name>_extra=<extra ipmitool arguments>          (optional)
+
+The password is never passed in argv and never printed: ipmitool reads it from
+the passfile itself. See docs/fence-drivers.md.
+USAGE
+}
+
+# diag <message...>  -- diagnostics, stderr, never stdout.
+diag()
+{
+    printf '%s: %s\n' "${FENCE_PROG}" "$*" >&2
+}
+
+# finish <rc> <state> <detail...>
+#
+# The one exit point that matters: prints the single verdict line and stops.
+finish()
+{
+    local _rc _state
+
+    _rc=$1
+    _state=$2
+    shift 2
+
+    printf '%s: %s %s %s\n' "${FENCE_PROG}" "${FENCE_TARGET}" "${_state}" "$*"
+    exit "${_rc}"
+}
+
+# shellcheck disable=SC2329
+#   Invoked from the EXIT/HUP/INT/TERM traps installed just before the first
+#   temporary file is written; shellcheck cannot see a call inside a trap
+#   string. The traps are armed late on purpose -- there is nothing to clean up
+#   until the temporary directory exists.
+cleanup()
+{
+    [ -n "${FENCE_TMP}" ] || return 0
+
+    case "${FENCE_TMP}" in
+        /*/fence-ipmi.*) rm -rf "${FENCE_TMP}" ;;
+    esac
+
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# Credentials file: parsed, never sourced
+# ---------------------------------------------------------------------------
+
+# mode_is_private <file>
+#
+# rc 0 if no group or other permission bit is set. Ownership is not checked:
+# the file lives in a root-only directory and the caller is root, and a check
+# that pretended to establish more than it does would be worse than an honest
+# one that establishes the bit that matters.
+mode_is_private()
+{
+    local _m
+
+    _m=$( stat -f '%Lp' "$1" 2>/dev/null ) || return 1
+
+    case "${_m}" in
+        ''|*[!01234567]*) return 1 ;;
+    esac
+
+    [ $(( 0${_m} & 077 )) -eq 0 ]
+}
+
+# require_private_file <file> <what>  -- exists, is a regular file, is 0600ish.
+require_private_file()
+{
+    local _f _what
+
+    _f=$1
+    _what=$2
+
+    if [ ! -e "${_f}" ]; then
+        diag "${_what} does not exist: ${_f}"
+        return 1
+    fi
+
+    if [ ! -f "${_f}" ]; then
+        diag "${_what} is not a regular file: ${_f}"
+        return 1
+    fi
+
+    if [ ! -r "${_f}" ]; then
+        diag "${_what} is not readable: ${_f}"
+        return 1
+    fi
+
+    if ! mode_is_private "${_f}"; then
+        diag "${_what} is readable beyond its owner (want mode 0600 or narrower): ${_f}"
+        diag "fix it with: chmod 600 ${_f}"
+        return 1
+    fi
+
+    return 0
+}
+
+# conf_key_ok <key>
+#
+# rc 0 if the key is one this driver knows: target_<name>_<field>, <name> in
+# [a-z0-9]+, <field> one of host user passfile extra. Written as an explicit
+# character list rather than a bracket range, because ranges outside the C
+# locale are unspecified.
+conf_key_ok()
+{
+    local _rest _name _field
+
+    case "${1:-}" in
+        target_*) _rest=${1#target_} ;;
+        *) return 1 ;;
+    esac
+
+    _name=${_rest%%_*}
+    _field=${_rest#*_}
+
+    [ "${_name}" != "${_rest}" ] || return 1
+
+    case "${_name}" in
+        ''|*[!abcdefghijklmnopqrstuvwxyz0123456789]*) return 1 ;;
+    esac
+
+    case "${_field}" in
+        host|user|passfile|extra) return 0 ;;
+    esac
+
+    return 1
+}
+
+# conf_get <key>  -- print the value, or nothing.
+conf_get()
+{
+    local _want _rec
+
+    _want=$1
+
+    printf '%s\n' "${FENCE_DATA}" | while IFS= read -r _rec; do
+        case "${_rec}" in
+            "${_want}="*)
+                printf '%s\n' "${_rec#*=}"
+                break
+                ;;
+        esac
+    done
+}
+
+# conf_has <key>  -- rc 0 if the key has been loaded.
+conf_has()
+{
+    case "${FENCE_DATA}" in
+        *"${FENCE_NL}$1="*) return 0 ;;
+    esac
+
+    return 1
+}
+
+# conf_load <file>
+#
+# The grammar of seance.conf (HANDOFF.md §2.2), reimplemented here so that this
+# driver depends on nothing: leading whitespace stripped, blank lines and
+# whole-line '#' comments ignored, key=value with trailing whitespace trimmed
+# off the value and nothing else done to it, a carriage return anywhere is an
+# error (D-31), a duplicate key is an error (D-32), an unknown key is an error
+# that stops the load (D-34). Every fault is reported, not just the first.
+conf_load()
+{
+    local _file _line _no _bad _k _v
+
+    _file=$1
+    FENCE_DATA=""
+    _no=0
+    _bad=0
+    _line=""
+
+    while IFS= read -r _line || [ -n "${_line}" ]; do
+        _no=$(( _no + 1 ))
+
+        case "${_line}" in
+            *"${FENCE_CR}"*)
+                printf '%s:%d: carriage return in line (CRLF line endings are not supported)\n' \
+                    "${_file}" "${_no}" >&2
+                _bad=$(( _bad + 1 ))
+                _line=""
+                continue
+                ;;
+        esac
+
+        while :; do
+            case "${_line}" in
+                ' '*) _line=${_line# } ;;
+                "${FENCE_TAB}"*) _line=${_line#"${FENCE_TAB}"} ;;
+                *) break ;;
+            esac
+        done
+
+        case "${_line}" in
+            ''|'#'*) _line=""; continue ;;
+        esac
+
+        case "${_line}" in
+            *=*) ;;
+            *)
+                printf '%s:%d: not a comment and not key=value\n' \
+                    "${_file}" "${_no}" >&2
+                _bad=$(( _bad + 1 ))
+                _line=""
+                continue
+                ;;
+        esac
+
+        _k=${_line%%=*}
+        _v=${_line#*=}
+
+        while :; do
+            case "${_v}" in
+                *' ') _v=${_v% } ;;
+                *"${FENCE_TAB}") _v=${_v%"${FENCE_TAB}"} ;;
+                *) break ;;
+            esac
+        done
+
+        if ! conf_key_ok "${_k}"; then
+            printf '%s:%d: unknown key "%s": want target_<name>_{host,user,passfile,extra}\n' \
+                "${_file}" "${_no}" "${_k}" >&2
+            _bad=$(( _bad + 1 ))
+            _line=""
+            continue
+        fi
+
+        if conf_has "${_k}"; then
+            printf '%s:%d: duplicate key "%s"\n' "${_file}" "${_no}" "${_k}" >&2
+            _bad=$(( _bad + 1 ))
+            _line=""
+            continue
+        fi
+
+        FENCE_DATA="${FENCE_DATA}${FENCE_NL}${_k}=${_v}"
+        _line=""
+    done < "${_file}"
+
+    [ "${_bad}" -eq 0 ] && return 0
+
+    diag "${_bad} fault(s) in ${_file}"
+    return 2
+}
+
+# extra_is_safe <extra>
+#
+# The extra field exists for site quirks -- a cipher suite, a privilege level,
+# a bridging target. It may not smuggle in the options this driver owns, and
+# above all it may not carry a password: -P puts one in argv where every ps(1)
+# on the box can read it, which is the whole reason the passfile exists.
+extra_is_safe()
+{
+    local _w
+
+    for _w in $1; do
+        case "${_w}" in
+            -P|--password|-a|-E|-k|-y|-K|-Y)
+                diag "target_${FENCE_TARGET}_extra may not carry a credential option (${_w}); the password belongs in the passfile"
+                return 1
+                ;;
+            -I|-H|-U|-f)
+                diag "target_${FENCE_TARGET}_extra may not override ${_w}, which this driver sets itself"
+                return 1
+                ;;
+        esac
+    done
+
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# Talking to the BMC
+# ---------------------------------------------------------------------------
+
+# run_ipmitool <chassis-power-subcommand> <seconds>
+#
+# Every call is bounded by timeout(1) (FreeBSD base since 10.3; exit status 124
+# means the limit was reached, timeout(1) EXIT STATUS). An unbounded ipmitool
+# against a BMC that accepts the connection and then says nothing would hang
+# the promotion ladder for as long as the BMC felt like it.
+run_ipmitool()
+{
+    local _cmd _bound
+
+    _cmd=$1
+    _bound=$2
+
+    FENCE_LASTCMD="ipmitool -I lanplus -H ${FENCE_HOST} -U ${FENCE_USER} -f <redacted>${FENCE_EXTRA:+ ${FENCE_EXTRA}} chassis power ${_cmd}"
+
+    : > "${FENCE_TMP}/out"
+    : > "${FENCE_TMP}/err"
+
+    # shellcheck disable=SC2086
+    #   Deliberate word splitting: ${FENCE_EXTRA} is a line of ipmitool
+    #   arguments from the credentials file, screened by extra_is_safe.
+    set -- -I lanplus -H "${FENCE_HOST}" -U "${FENCE_USER}" \
+        -f "${FENCE_PASSFILE}" ${FENCE_EXTRA} chassis power "${_cmd}"
+
+    timeout "${_bound}" ipmitool "$@" \
+        > "${FENCE_TMP}/out" 2> "${FENCE_TMP}/err"
+    FENCE_RC=$?
+
+    return 0
+}
+
+# classify_call  -- set FENCE_KIND from the last call's status and output.
+#
+#   timeout      the call did not finish inside its bound
+#   broken       timeout(1) could not run ipmitool at all
+#   unreachable  ipmitool never got an answer from the BMC
+#   refused      ipmitool failed and the BMC was talking: it said no
+#   empty        exit 0 with nothing on stdout -- a contract violation
+#   ok           exit 0 with something to parse
+classify_call()
+{
+    if [ "${FENCE_RC}" -eq 124 ]; then
+        FENCE_KIND=timeout
+        return 0
+    fi
+
+    case "${FENCE_RC}" in
+        125|126|127)
+            FENCE_KIND=broken
+            return 0
+            ;;
+    esac
+
+    if grep -q -i -E -e "${FENCE_UNREACHABLE_RE}" \
+        "${FENCE_TMP}/out" "${FENCE_TMP}/err"; then
+        FENCE_KIND=unreachable
+        return 0
+    fi
+
+    if [ "${FENCE_RC}" -ne 0 ]; then
+        FENCE_KIND=refused
+        return 0
+    fi
+
+    if [ ! -s "${FENCE_TMP}/out" ]; then
+        FENCE_KIND=empty
+        return 0
+    fi
+
+    FENCE_KIND=ok
+    return 0
+}
+
+# redact <text>
+#
+# Anything quoted back from ipmitool passes through here first. The password is
+# never in this driver's hands to redact -- that is the point of the passfile
+# -- so what this removes is the passfile's path, which is the one string that
+# could tempt a reader into `cat`ing a secret into a ticket. Output is also
+# truncated: a diagnostic is context, not a transcript.
+redact()
+{
+    local _s _out
+
+    _s=$1
+    _out=""
+
+    if [ -n "${FENCE_PASSFILE}" ]; then
+        while :; do
+            case "${_s}" in
+                *"${FENCE_PASSFILE}"*)
+                    _out="${_out}${_s%%"${FENCE_PASSFILE}"*}<redacted>"
+                    _s=${_s#*"${FENCE_PASSFILE}"}
+                    ;;
+                *) break ;;
+            esac
+        done
+    fi
+
+    printf '%s' "${_out}${_s}" | cut -c1-200
+}
+
+# report_call_failure  -- stderr context for a call that did not go well.
+#
+# Bounded on purpose: the first few lines of what ipmitool said, redacted, and
+# the command line with the passfile argument replaced. Never on stdout, which
+# carries the verdict and nothing else.
+report_call_failure()
+{
+    local _l
+
+    diag "$1"
+    diag "command: ${FENCE_LASTCMD}"
+    diag "ipmitool exit ${FENCE_RC}"
+
+    cat "${FENCE_TMP}/err" "${FENCE_TMP}/out" 2>/dev/null |
+        grep -v '^[[:space:]]*$' | head -n 5 | while IFS= read -r _l; do
+        diag "ipmitool: $( redact "${_l}" )"
+    done
+}
+
+# power_state  -- print off, on or unknown from the last call's stdout.
+#
+# Tolerant on purpose: ipmitool 1.8.19 prints exactly "Chassis Power is off",
+# but a BMC-specific build that decorates the line must still parse, and a line
+# that says both or neither is not a reading, it is a mystery.
+power_state()
+{
+    local _off _on
+
+    _off=1
+    _on=1
+
+    grep -q -i -E '(^|[^a-z])is +off([^a-z]|$)' "${FENCE_TMP}/out" && _off=0
+    grep -q -i -E '(^|[^a-z])is +on([^a-z]|$)' "${FENCE_TMP}/out" && _on=0
+
+    if [ "${_off}" -eq 0 ] && [ "${_on}" -ne 0 ]; then
+        printf 'off\n'
+    elif [ "${_on}" -eq 0 ] && [ "${_off}" -ne 0 ]; then
+        printf 'on\n'
+    else
+        printf 'unknown\n'
+    fi
+}
+
+# handle_bad_call <what>
+#
+# The shared translation from a failed call to a verdict. <what> names the call
+# for the diagnostic. Returns only when the call was fine.
+handle_bad_call()
+{
+    case "${FENCE_KIND}" in
+        timeout)
+            report_call_failure "$1: no answer from the BMC within the budget"
+            finish 2 unknown "BMC did not answer within ${FENCE_TIMEOUT}s"
+            ;;
+        broken)
+            report_call_failure "$1: ipmitool could not be run"
+            finish 2 unknown "ipmitool could not be run"
+            ;;
+        unreachable)
+            report_call_failure "$1: BMC unreachable or authentication failed"
+            finish 2 unknown "BMC unreachable or authentication failed"
+            ;;
+        empty)
+            report_call_failure "$1: ipmitool exited 0 and printed nothing"
+            finish 2 unknown "ipmitool exited 0 with no output (contract violation)"
+            ;;
+    esac
+
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# The actions
+# ---------------------------------------------------------------------------
+
+do_off()
+{
+    local _start _deadline _now _bound _state _elapsed
+
+    _start=$( date +%s )
+    _deadline=$(( _start + FENCE_TIMEOUT ))
+
+    run_ipmitool off "${FENCE_TIMEOUT}"
+    classify_call
+    handle_bad_call "chassis power off"
+
+    if [ "${FENCE_KIND}" = refused ]; then
+        report_call_failure "chassis power off: the BMC refused the command"
+        finish 1 refused "the BMC refused chassis power off"
+    fi
+
+    # The command was accepted. That is not off, and the next lines are the
+    # entire reason this driver exists.
+    while :; do
+        _now=$( date +%s )
+        _bound=$(( _deadline - _now ))
+        [ "${_bound}" -lt 1 ] && _bound=1
+
+        run_ipmitool status "${_bound}"
+        classify_call
+        handle_bad_call "chassis power status"
+
+        if [ "${FENCE_KIND}" = refused ]; then
+            report_call_failure "chassis power status: the BMC refused the read"
+            finish 2 unknown "the BMC refused chassis power status"
+        fi
+
+        _state=$( power_state )
+        _now=$( date +%s )
+        _elapsed=$(( _now - _start ))
+
+        case "${_state}" in
+            off)
+                finish 0 off "verified after ${_elapsed}s"
+                ;;
+            unknown)
+                report_call_failure "chassis power status: unparsable output"
+                finish 2 unknown "unparsable power status"
+                ;;
+        esac
+
+        if [ "${_now}" -ge "${_deadline}" ]; then
+            diag "power still reads on ${_elapsed}s after the power-off command"
+            finish 1 on "still powered on after ${_elapsed}s (timeout ${FENCE_TIMEOUT}s)"
+        fi
+
+        _bound=$(( _deadline - _now ))
+        [ "${_bound}" -gt "${FENCE_POLL}" ] && _bound=${FENCE_POLL}
+        sleep "${_bound}"
+    done
+}
+
+do_status()
+{
+    local _state
+
+    run_ipmitool status "${FENCE_TIMEOUT}"
+    classify_call
+    handle_bad_call "chassis power status"
+
+    if [ "${FENCE_KIND}" = refused ]; then
+        report_call_failure "chassis power status: the BMC refused the read"
+        finish 2 unknown "the BMC refused chassis power status"
+    fi
+
+    _state=$( power_state )
+
+    case "${_state}" in
+        off) finish 0 off "power is off" ;;
+        on)  finish 1 on "power is on" ;;
+    esac
+
+    report_call_failure "chassis power status: unparsable output"
+    finish 2 unknown "unparsable power status"
+}
+
+## MAIN
+
+case "${1:-}" in
+    --help|-h|help)
+        usage
+        exit 0
+        ;;
+    '')
+        usage >&2
+        diag "no action given"
+        finish 2 unknown "usage: no action given"
+        ;;
+    off|status)
+        FENCE_ACTION=$1
+        shift
+        ;;
+    *)
+        usage >&2
+        diag "unknown action: $1"
+        finish 2 unknown "usage: unknown action"
+        ;;
+esac
+
+if [ $# -eq 0 ]; then
+    usage >&2
+    diag "no target given"
+    finish 2 unknown "usage: no target given"
+fi
+
+FENCE_TARGET=$1
+shift
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --config)
+            [ $# -ge 2 ] || finish 2 unknown "usage: --config needs a file"
+            FENCE_CONF=$2
+            shift 2
+            ;;
+        --timeout)
+            [ $# -ge 2 ] || finish 2 unknown "usage: --timeout needs a value"
+            FENCE_TIMEOUT=$2
+            shift 2
+            ;;
+        --help|-h)
+            usage
+            exit 0
+            ;;
+        *)
+            usage >&2
+            diag "unknown option: $1"
+            finish 2 unknown "usage: unknown option"
+            ;;
+    esac
+done
+
+case "${FENCE_TARGET}" in
+    ''|*[!abcdefghijklmnopqrstuvwxyz0123456789]*)
+        diag "target must be [a-z0-9]+ and name an entry in the credentials file, not an address: ${FENCE_TARGET}"
+        finish 2 unknown "not a valid target token"
+        ;;
+esac
+
+# The timeout is the whole budget for the action, and a budget that is not a
+# number is a contract error rather than an excuse to invent one. The range
+# matches lib/conf.subr's sanity range for fence_timeout.
+case "${FENCE_TIMEOUT}" in
+    ''|*[!0123456789]*)
+        diag "timeout must be a whole number of seconds: ${FENCE_TIMEOUT}"
+        finish 2 unknown "bad timeout"
+        ;;
+esac
+
+if [ "${FENCE_TIMEOUT}" -lt 1 ] || [ "${FENCE_TIMEOUT}" -gt 3600 ]; then
+    diag "timeout out of range (1..3600): ${FENCE_TIMEOUT}"
+    finish 2 unknown "bad timeout"
+fi
+
+if [ -z "${FENCE_CONF}" ]; then
+    diag "no credentials file: pass --config or set SEANCE_FENCE_IPMI_CONF"
+    diag "there is no default path: this driver cannot ask the host where its work directory is and will not guess (D-53)"
+    finish 2 unknown "no credentials file configured"
+fi
+
+require_private_file "${FENCE_CONF}" "credentials file" ||
+    finish 2 unknown "credentials file unusable"
+
+if ! command -v ipmitool > /dev/null 2>&1; then
+    diag "ipmitool not found in PATH: it is a documented dependency of this driver"
+    finish 2 unknown "ipmitool not installed"
+fi
+
+if ! command -v timeout > /dev/null 2>&1; then
+    diag "timeout(1) not found in PATH: it is base on FreeBSD"
+    finish 2 unknown "timeout(1) not installed"
+fi
+
+conf_load "${FENCE_CONF}" || finish 2 unknown "credentials file has faults"
+
+FENCE_HOST=$( conf_get "target_${FENCE_TARGET}_host" )
+FENCE_USER=$( conf_get "target_${FENCE_TARGET}_user" )
+FENCE_PASSFILE=$( conf_get "target_${FENCE_TARGET}_passfile" )
+FENCE_EXTRA=$( conf_get "target_${FENCE_TARGET}_extra" )
+
+if [ -z "${FENCE_HOST}" ] && [ -z "${FENCE_USER}" ] && \
+    [ -z "${FENCE_PASSFILE}" ]; then
+    diag "no entry for target \"${FENCE_TARGET}\" in ${FENCE_CONF}"
+    finish 2 unknown "no such target in the credentials file"
+fi
+
+for field in host user passfile; do
+    case "${field}" in
+        host)     [ -n "${FENCE_HOST}" ] && continue ;;
+        user)     [ -n "${FENCE_USER}" ] && continue ;;
+        passfile) [ -n "${FENCE_PASSFILE}" ] && continue ;;
+    esac
+
+    diag "incomplete entry for \"${FENCE_TARGET}\" in ${FENCE_CONF}: target_${FENCE_TARGET}_${field} is missing"
+    finish 2 unknown "incomplete target entry"
+done
+
+extra_is_safe "${FENCE_EXTRA}" || finish 2 unknown "unsafe extra arguments"
+
+require_private_file "${FENCE_PASSFILE}" "passfile for ${FENCE_TARGET}" ||
+    finish 2 unknown "passfile unusable"
+
+FENCE_TMP=$( mktemp -d "${TMPDIR:-/tmp}/fence-ipmi.XXXXXX" ) || {
+    diag "cannot create a temporary directory"
+    finish 2 unknown "no temporary directory"
+}
+trap 'cleanup' EXIT
+trap 'cleanup; exit 2' HUP INT TERM
+
+case "${FENCE_ACTION}" in
+    off)    do_off ;;
+    status) do_status ;;
+esac
+
+# Unreachable: both actions end in finish. If control ever arrives here, the
+# driver has no verdict, and no verdict is not success.
+diag "internal error: ${FENCE_ACTION} returned without a verdict"
+finish 2 unknown "internal error"
