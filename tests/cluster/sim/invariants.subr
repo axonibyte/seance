@@ -305,6 +305,29 @@ inv_nodes()
     awk -F'\t' 'NF > 0 { print $1 }' "${_f}"
 }
 
+# inv_live_nodes <model> -- the nodes that are not dead, one per line.
+#
+# A node's state in the model is MEASURED, not predicted: the driver calls
+# world_node_state for every node after every event and tells the model what it
+# found (run.sh, "what the world says the nodes are now"). So this is an
+# observation wearing the model's clothes, which is what makes it fair for an
+# invariant to read.
+#
+# It exists because a stopped node's placement record survives it. The record
+# is kept on purpose -- invariant 2 clause C needs it, or a node that merely
+# lost power reads as a guest that came home with no failback record -- and the
+# consequence is that a node fenced by a promotion's rung 4 goes on claiming
+# its estate 'active' from a disk nobody is running. That is durable evidence
+# of an authorisation, not a claim to be running something now, and only the
+# invariants that ask "who is running it NOW" may filter on it.
+inv_live_nodes()
+{
+    local _f
+
+    _f=$( inv_state_file "$1" nodes ) || return 2
+    awk -F'\t' 'NF > 0 && $2 != "dead" { print $1 }' "${_f}"
+}
+
 # inv_guests <model> -- the guest roster, one per line.
 inv_guests()
 {
@@ -422,7 +445,7 @@ inv_1()
 
 inv_1_body()
 {
-    local _model _obs _guests _nodes _g _run _n _act _c
+    local _model _obs _guests _live _g _run _n _act _c
 
     _model=$1
     _obs=$2
@@ -431,7 +454,7 @@ inv_1_body()
         inv_fire 1 "cannot read the guest roster"
         return 0
     }
-    _nodes=$( inv_nodes "${_model}" ) || {
+    _live=$( inv_live_nodes "${_model}" ) || {
         inv_fire 1 "cannot read the node roster"
         return 0
     }
@@ -449,7 +472,21 @@ inv_1_body()
                 "$( printf '%s\n' "${_run}" | inv_join )"
         fi
 
-        _act=$( inv_active_nodes "${_obs}" "${_nodes}" "${_g}" )
+        # LIVE nodes only, and this is the whole of the narrowing. A node
+        # the promotion's rung 4 has just fenced is off, and its placement
+        # file -- which nobody can rewrite while it is off -- still says
+        # 'active' for the estate it was running a second earlier. Counting
+        # that as a second claimant fires the split-brain invariant on the
+        # exact sequence seance exists to make safe: isolate a node, let an
+        # heir fence it and promote, and both are "claiming" the guest.
+        # Found by seed 2885768256 at step 56 (D-150).
+        #
+        # Nothing is lost. A real split brain has two nodes UP -- clause A
+        # above catches it running twice, and this clause catches two live
+        # nodes claiming it. A promotion that skipped its fence leaves the
+        # target up as well, which is what makes the rediscovery row for
+        # 'promotion without fencing' still fire here.
+        _act=$( inv_active_nodes "${_obs}" "${_live}" "${_g}" )
         _c=$( printf '%s\n' "${_act}" | inv_count )
         if [ "${_c}" -gt 1 ]; then
             inv_fire 1 "guest ${_g} is claimed active by ${_c} nodes:" \
@@ -759,7 +796,7 @@ inv_4a()
 
 inv_4a_body()
 {
-    local _model _obs _nodes _guests _g _n _home _place _props _rf _cm _mp
+    local _model _obs _nodes _guests _g _n _home _place _claim _props _rf _cm _mp
 
     _model=$1
     _obs=$2
@@ -780,9 +817,26 @@ inv_4a_body()
         _home=$( inv_home "${_model}" "${_g}" )
         _place=$( inv_effective_placement "${_obs}" "${_nodes}" "${_g}" "${_home}" )
 
+        # A NODE THAT CLAIMS THE GUEST ACTIVE IS NOT HOLDING A REPLICA OF IT,
+        # and the effective placement is not the only such node. A promotion
+        # mounts the standby copy where the guest now lives -- it stays under
+        # <node>/standby/<peer>/<guest>, because promotion does not rename a
+        # dataset -- so the promoting node's copy is the live guest and carries
+        # a real mountpoint by design. When a second node also claims it
+        # (a corpse's stale record, or a genuine split), the effective
+        # placement is the other one and this node's live dataset was read as
+        # a shadow mount: two firings for one fact, and the fact is invariant
+        # 1's to report. Found by seed 2885768256 at step 56 (D-150).
+        #
+        # Nothing is lost: a node holding a mounted copy of a guest it does
+        # NOT claim is still a shadow mount, which is the hand-mount case and
+        # the August defect both.
+        _claim=" $( inv_active_nodes "${_obs}" "${_nodes}" "${_g}" | tr '\n' ' ' )"
+
         # shellcheck disable=SC2086
         for _n in ${_nodes}; do
             [ "${_n}" = "${_place}" ] && continue
+            case "${_claim}" in *" ${_n} "*) continue ;; esac
 
             if [ -f "${_rf}" ] && awk -F'\t' -v g="${_g}" -v n="${_n}" \
                 '$1 == g && $2 == n { found = 1 } END { exit found ? 0 : 1 }' \

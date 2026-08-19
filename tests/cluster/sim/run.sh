@@ -32,7 +32,8 @@
 #
 # Output: the seed first, then one line per event, then the invariant verdicts
 # of every step. Exit 0 when nothing fired, 1 when something did, 2 when the
-# driver itself could not run.
+# driver itself could not run, 3 when the run was KILLED before it reached a
+# verdict (see sim_abort below).
 #
 # THE TRACE IS WRITTEN AS IT HAPPENS, to $REAPER_OUT/sim/<seed>.trace when
 # reaper is around and to the run's own directory otherwise, so that a failing
@@ -124,6 +125,37 @@ fi
 
 gen_seed "${SIM_SEED}" || sim_die "not a usable seed: [${SIM_SEED}]"
 gen_announce
+
+# --- a run that is killed did not find anything ------------------------------
+#
+# The harness's own signal trap tears the fixture down and exits 1 -- which is
+# the status an invariant firing exits with, so a battery cannot tell the two
+# apart. On 2026-08-17 that is exactly what happened: an interrupted battery
+# left three of the five committed seeds with logs that stop in the middle of a
+# step, every node's tick reported by the oracle as 'no verdict: the verb wrote
+# nothing to stdout' (jexec entering jails the teardown had already removed),
+# and all three seeds were written to seeds-to-promote.txt as having found a
+# defect. None of them had found anything, and the next session was spent
+# proving it.
+#
+# So an interrupted run says so, in a verdict line of its own, and leaves by a
+# door of its own: exit 3. Teardown is unchanged -- exit runs the harness's
+# EXIT trap, which is where the cluster_down that cluster_arm_teardown
+# registered lives -- and the run still fails, because 3 is not 0.
+# shellcheck disable=SC2329
+#   "This function is never invoked": it is, from the three traps immediately
+#   below, and shellcheck does not read the inside of a trap string. Narrowed
+#   to this one function.
+sim_abort()
+{
+    printf 'sim: ABORTED on %s at step %s, seed %s: killed before a verdict\n' \
+        "$1" "${step:-0}" "${SIM_SEED}"
+    exit 3
+}
+
+trap 'sim_abort HUP' HUP
+trap 'sim_abort INT' INT
+trap 'sim_abort TERM' TERM
 
 # --- where the evidence goes -------------------------------------------------
 

@@ -142,6 +142,20 @@ this tier would never exercise the quorum rule at all.)*
    nodes where the pseudo adapter says `running=1`; must be ≤ 1. Also ≤ 1
    node with placement in `placement` files (`SEANCE_STATE_DIR/placement`
    across nodes) unless one of them is `held`.
+
+   *(As built, per D-150: the second clause counts LIVE nodes only, and the
+   fourth invariant's 4a never treats a node CLAIMING a guest as holding a
+   replica of it. A node the ladder's rung 4 has fenced is off, and its
+   placement file goes on saying `active` for the estate it was running a
+   second earlier — nobody rewrites a disk that is not powered. That record is
+   kept on purpose, because invariant 2 clause C needs it or a node that merely
+   lost power reads as a guest that came home with no failback record; what it
+   is NOT is a claim to be running something now. Counting it fired the
+   split-brain invariant on the exact sequence seance exists to make safe:
+   isolate a node, let an heir fence it and promote its estate. Found by seed
+   2885768256 at step 56. Nothing is lost — a real split brain has two nodes
+   UP, and a promotion that skipped its fence leaves the target up, which is
+   what keeps the rediscovery row for it firing.)*
 2. **Every promotion has evidence** — every line appended to any node's
    `succession.log` carries `fence:<driver>` or `force:<operator>`; a
    promotion observed (placement changed) without a matching record is a
@@ -252,12 +266,31 @@ how a tier-7 rediscovery row costs one cluster rebuild rather than five. And
 which is how the generator and the applicability rules are exercised on a
 workstation.)*
 
+*(And per D-147: only a run that reached a VERDICT nominates a seed. `run.sh`
+exits 0 for a pass, 1 for a firing, 2 when the driver could not start and 3
+when it was KILLED before it could decide — an interrupted battery used to exit
+1 through the harness's signal trap, indistinguishable from five seeds finding
+five defects, which is how it was read on 2026-08-17. A run driven by
+`SEANCE_SIM_SEEDS` nominates nothing at all, and the nomination file names this
+run's seeds rather than accumulating across sessions.)*
+
 ## 10. Rediscovery hooks (TESTING.md §8)
 
 The M3 rediscovery battery runs the fixed seeds against reverted
 protections: quorum removed → invariant 1 under `double-trigger`/`isolate`;
 fencing removed → invariant 2; boot gate removed → invariant 1 under
 `return`; recv without `-x mountpoint` → invariant 4a under `hand-mount`.
+
+*(As built: two of those four are rows, and two are not. `recv without -x
+mountpoint` cannot fire because seance re-holds the shadow-mount law on every
+tick before the driver can look (D-144). `quorum removed` cannot fire because a
+node that fails quorum is by construction a node that can reach nobody, and the
+fixture's fence driver reaches the guest host over that same network — so rung
+4 stops what rung 2 would have stopped, and the world the invariants observe is
+one in which nothing happened (D-151). Both are caught a tier down, by
+`tests/tier6/t_quorum.sh` and `tests/tier6/t_repl.sh`, and both rows are
+removed rather than left green: a row that cannot fail reads as coverage of a
+protection nothing is checking.)*
 
 *(As built, and measured rather than predicted: three of the four rows
 rediscover — fencing removed, quorum removed and the boot gate removed, each

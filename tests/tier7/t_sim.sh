@@ -22,11 +22,14 @@
 #
 # WHAT HAPPENS TO A SEED THAT FINDS SOMETHING. It is written to
 # $REAPER_OUT/sim/seeds-to-promote.txt, and this file does NOT edit the
-# committed battery (D-133). The promotion rule -- any seed that ever finds a
+# committed battery (D-137). The promotion rule -- any seed that ever finds a
 # defect joins seeds.txt permanently -- is a rule about defects, and this same
 # runner is what the rediscovery battery drives with a protection deliberately
 # reverted: a runner that appended on every failure would fill the battery with
-# seeds that found a hole somebody made on purpose.
+# seeds that found a hole somebody made on purpose. Two things follow, and both
+# are below: a run driven by SEANCE_SIM_SEEDS nominates nothing, and only a run
+# that reached a VERDICT nominates at all -- a run killed before it could
+# decide (run.sh's exit 3) is a fact about the session, not about the seed.
 #
 # shellcheck disable=SC3043
 #   'local' is not in POSIX sh but is implemented by FreeBSD /bin/sh (sh(1),
@@ -101,7 +104,26 @@ fi
 
 OUTDIR=${REAPER_OUT:-$( t_tmpdir )}
 mkdir -p "${OUTDIR}/sim" 2>/dev/null || true
+
+# WHERE THE NOMINATIONS GO, and when there are none to make.
+#
+# The file names the seeds THIS run found something with, so it starts empty:
+# it was append-only, and a session that ran the battery and then the three
+# tier-7 rediscovery rows left a list of nine nominations from five seeds, four
+# of which were the one seed the rediscovery rows are pinned to (D-143) failing
+# because a protection had been reverted on purpose.
+#
+# And a run driven by SEANCE_SIM_SEEDS makes no nominations at all. That is
+# D-137's own argument -- a runner that nominated on every failure would fill
+# the permanent battery with seeds that found a hole somebody made on purpose
+# -- applied one file earlier than D-137 applied it, because the file is what a
+# person reads when deciding.
 PROMOTE="${OUTDIR}/sim/seeds-to-promote.txt"
+if [ -n "${SEANCE_SIM_SEEDS:-}" ]; then
+    PROMOTE=""
+else
+    : > "${PROMOTE}" 2>/dev/null || true
+fi
 
 # ---------------------------------------------------------------------------
 # 1. The oracle self-test
@@ -141,10 +163,23 @@ run_seed()
     t_diag "seed ${_seed}: ${STEPS} steps, exit ${_rc}, $(( _t1 - _t0 ))s"
 
     if [ "${_rc}" -ne 0 ]; then
-        awk '/FIRED|^sim: FAILED|^shrink: |^world: FAIL|^sim: FAIL/ { print "# " $0 }' \
+        awk '/FIRED|^sim: FAILED|^shrink: |^world: FAIL|^sim: FAIL|^sim: ABORTED/ { print "# " $0 }' \
             "${_log}" | head -40
-        printf '%s\t# found a defect on %s; naming it is the fixer'"'"'s job\n' \
-            "${_seed}" "$( date -u +%Y-%m-%d )" >> "${PROMOTE}" 2>/dev/null
+    fi
+
+    # ONLY A RUN THAT REACHED A VERDICT NOMINATES A SEED. run.sh exits 1 when
+    # an invariant fired, 2 when the driver could not run and 3 when it was
+    # killed before it could decide (its own header says so); the last two are
+    # facts about the session, not about the seed, and a seed nominated by one
+    # of them sends the next person hunting a defect that was never there.
+    # The assertion is unchanged: anything but 0 still fails the seed's row.
+    if [ "${_rc}" -eq 1 ]; then
+        [ -z "${PROMOTE}" ] ||
+            printf '%s\t# found a defect on %s; naming it is the fixer'"'"'s job\n' \
+                "${_seed}" "$( date -u +%Y-%m-%d )" >> "${PROMOTE}" 2>/dev/null
+    elif [ "${_rc}" -ne 0 ]; then
+        t_diag "seed ${_seed}: exit ${_rc} is the run failing, not the seed" \
+            "finding something -- it is NOT nominated for the battery"
     fi
 
     return "${_rc}"

@@ -540,9 +540,13 @@ milestone is trusted, never automatically:
 ```sh
 sh tests/rediscovery/run.sh --tier 4      # workstation, seconds per row
 sh tests/rediscovery/run.sh --tier 6      # reaper session, minutes per row
-env SEANCE_SIM_SEEDS=<seed> SEANCE_SIM_STEPS=<n> SEANCE_SIM_NO_SHRINK=1 \
-    sh tests/rediscovery/run.sh --tier 7  # reaper session, one trace per row
+sh tests/rediscovery/run.sh --tier 7      # reaper session, one trace per row
 ```
+
+A tier-7 row's seed and step count are part of the row (D-143) and live in the
+table's fifth column, not in an incantation somebody has to remember: run
+against a window that never reaches the protection, a row reverts something the
+trace never walks past and passes while proving nothing.
 
 The tier-4 rows are the cheap half — promotion without fencing, stale-lineage
 promotion without a threshold, the boot gate removed, the quorum rule removed

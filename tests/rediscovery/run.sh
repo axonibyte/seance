@@ -17,6 +17,13 @@
 # edit; it is the acceptance test for the harness itself, run before a
 # milestone is trusted. Nothing invokes it automatically.
 #
+# A ROW MAY CARRY ITS OWN ENVIRONMENT, in a fifth column. The tier-7 rows need
+# one: a seed and a step count are the NAME of the trace a row is about (D-143),
+# and a tier-7 row run against the wrong window reverts a protection the trace
+# never reaches and passes while proving nothing. That belonged in the row and
+# not in a paragraph of the README a person has to have read -- a battery whose
+# correct invocation is a footnote is a battery that will be run wrong.
+#
 # THE FALSE-PASS TRAP: this runner asserts a FAILURE, so every way of not
 # running the test at all looks like success. Each row therefore checks, in
 # order, that the patch applied, that the test file exists in the copy, and
@@ -94,16 +101,21 @@ fi
 pass=0
 fail=0
 
-# run_row <patch> <stage> <test>
+# run_row <patch> <stage> <test> <env>
 run_row()
 {
-    local _patch _stage _test _scratch _rc _out _assertions
+    local _patch _stage _test _env _scratch _rc _out _assertions
 
     _patch=$1
     _stage=$2
     _test=$3
+    _env=$4
 
-    echo "== ${_patch}: expecting ${_test} to fail"
+    if [ -n "${_env}" ]; then
+        echo "== ${_patch}: expecting ${_test} to fail (${_env})"
+    else
+        echo "== ${_patch}: expecting ${_test} to fail"
+    fi
 
     if [ ! -r "${HERE}/${_patch}" ]; then
         echo "   FAIL: no such patch: ${HERE}/${_patch}"
@@ -149,7 +161,10 @@ run_row()
 
     _out="${_scratch}/rediscovery.log"
 
-    env SEANCE_ROOT="${_scratch}" SEANCE_STAGES="${_stage}" \
+    # shellcheck disable=SC2086
+    #   Deliberate word splitting: the row's fifth column is a list of
+    #   VAR=VALUE assignments, and env(1) is what takes them.
+    env ${_env} SEANCE_ROOT="${_scratch}" SEANCE_STAGES="${_stage}" \
         sh "${_scratch}/${_test}" > "${_out}" 2>&1
     _rc=$?
 
@@ -188,7 +203,8 @@ for row in ${ROWS}; do
     p=$( printf '%s' "${row}" | awk -F "${TAB}" '{ print $1 }' )
     s=$( printf '%s' "${row}" | awk -F "${TAB}" '{ print $3 }' )
     f=$( printf '%s' "${row}" | awk -F "${TAB}" '{ print $4 }' )
-    run_row "${p}" "${s}" "${f}"
+    e=$( printf '%s' "${row}" | awk -F "${TAB}" '{ print $5 }' )
+    run_row "${p}" "${s}" "${f}" "${e}"
     IFS="
 "
 done

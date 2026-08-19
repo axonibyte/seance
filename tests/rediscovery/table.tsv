@@ -11,8 +11,13 @@
 #   tier        which tier the named test belongs to (run.sh --tier selects)
 #   stage       the tier-6/7 stage name, or '-' for tiers with no stages
 #   test        the test file, relative to the repository root, that MUST fail
+#   env         optional: VAR=VALUE assignments the row is run with. A tier-7
+#               row's seed and step count are part of the row and not a note in
+#               the README (D-143): they name the one trace that reaches the
+#               protection being reverted, and a row run against another window
+#               passes without proving anything.
 #
-patch-file	tier	stage	test
+patch-file	tier	stage	test	env
 recv-no-x-mountpoint.patch	6	repl	tests/tier6/t_repl.sh
 repl-skip-resume-token.patch	6	interrupt	tests/tier6/t_interrupt.sh
 promotion-without-fencing.patch	4	-	tests/tier4/t_ladder.sh
@@ -30,6 +35,5 @@ mount-not-verified.patch	4	-	tests/tier4/t_empty0_m2.sh
 verifier-masks-crash.patch	4	-	tests/tier4/t_ladder_lineage.sh
 verifier-masks-crash.patch	4	-	tests/tier4/t_ladder.sh
 promotion-without-fencing.patch	6	quorum	tests/tier6/t_quorum.sh
-promotion-without-fencing.patch	7	sim	tests/tier7/t_sim.sh
-quorum-rule-removed.patch	7	sim	tests/tier7/t_sim.sh
-boot-gate-removed.patch	7	sim	tests/tier7/t_sim.sh
+promotion-without-fencing.patch	7	sim	tests/tier7/t_sim.sh	SEANCE_SIM_SEEDS=2950315648 SEANCE_SIM_STEPS=27 SEANCE_SIM_NO_SHRINK=1
+boot-gate-removed.patch	7	sim	tests/tier7/t_sim.sh	SEANCE_SIM_SEEDS=2950315648 SEANCE_SIM_STEPS=27 SEANCE_SIM_NO_SHRINK=1
