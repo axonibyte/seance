@@ -10,6 +10,23 @@ at all. See TESTING.md §7 and tests/cluster/sim/DESIGN.md.
                 a session on a checker that cannot fire), then every seed in
                 tests/cluster/sim/seeds.txt, then -- opt-in -- hunting.
 
+    shrink-real.sh
+                OPT-IN, and deliberately not named t_*.sh so that no session
+                pays for it by accident. It injects a real defect (the
+                promotion-without-fencing patch of the rediscovery battery)
+                into a scratch copy, runs the seed and window the tier-7
+                rediscovery rows use, and asserts what tests/tier1/t_sim_shrink.sh
+                cannot: that the SHRINKER is useful on a real failure -- the
+                trace gets shorter, the reduction still fails on a cluster it
+                has never seen, one step less passes, and the events left in it
+                are the ones the failure is about. Half an hour or so, because
+                every rerun rebuilds a three-node cluster -- and it raises
+                SEANCE_SIM_SHRINK_BUDGET, because the default 1800 s is a
+                battery's budget and refuses a reduction this file exists to
+                make.
+
+                    env REAPER_STATE=/tank/state sh tests/tier7/shrink-real.sh
+
 Everything it drives lives in tests/cluster/sim/:
 
     run.sh          one seed -> one trace -> one verdict, against a cluster it

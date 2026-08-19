@@ -605,8 +605,9 @@ pool0/bravo/standby/alpha/${REPL_SYS_GUEST}"
             # shellcheck disable=SC2016
             #   The single quotes are the point: "$1" is source text of the
             #   script being written, not an expansion for this shell.
-            printf '#!/bin/sh\ncat > "%s/notify.body"\nprintf "%%s\\n" "$1" > "%s/notify.subject"\nexit 0\n' \
-                "${ROWDIR}" "${ROWDIR}" > "${ROWDIR}/notify"
+            printf '#!/bin/sh\ncat > "%s/notify.body"\nprintf "%%s\\n" "$1" > "%s/notify.subject"\nprintf -- "--- %%s\\n" "$1" >> "%s/notify.log"\ncat "%s/notify.body" >> "%s/notify.log"\nexit 0\n' \
+                "${ROWDIR}" "${ROWDIR}" "${ROWDIR}" "${ROWDIR}" "${ROWDIR}" \
+                > "${ROWDIR}/notify"
             chmod 0755 "${ROWDIR}/notify"
             ;;
         missing) ;;
@@ -821,9 +822,10 @@ fi
 # One assertion per row, plus the twenty-five named assertions below. A table
 # with no rows would have produced a green run of nothing, which is why the
 # count is derived from the table rather than written down.
-t_plan $(( NROWS + 72 ))
+t_plan $(( NROWS + 87 ))
 
 SAVED=$( t_tmpdir )
+AUTO_ROWS=""
 
 OIFS=$IFS
 IFS='
@@ -853,6 +855,14 @@ for row in ${ROWS}; do
         continue
     fi
 
+    # Which rows were AUTOMATIC runs, read from the table rather than from the
+    # row's name: the "no --auto run ever records a forced promotion" assertion
+    # below is over the whole table, and a rule that depended on an id's
+    # spelling would stop covering the next row somebody adds.
+    case "${world}" in
+        auto=1|auto=1\ *|*\ auto=1|*\ auto=1\ *) AUTO_ROWS="${AUTO_ROWS} ${id}" ;;
+    esac
+
     cp "${ROW_OUT}" "${SAVED}/${id}.out"
     cp "${W_ZFSLOG}" "${SAVED}/${id}.zfs"
     [ -r "${SEANCE_MOCK_LOG}" ] && cp "${SEANCE_MOCK_LOG}" "${SAVED}/${id}.mock"
@@ -861,6 +871,7 @@ for row in ${ROWS}; do
     [ -r "${ROWDIR}/notify.body" ] && cp "${ROWDIR}/notify.body" "${SAVED}/${id}.notify"
     [ -r "${ROWDIR}/notify.subject" ] &&
         cp "${ROWDIR}/notify.subject" "${SAVED}/${id}.notify.subject"
+    [ -r "${ROWDIR}/notify.log" ] && cp "${ROWDIR}/notify.log" "${SAVED}/${id}.notify.log"
     [ -r "${SEANCE_STATE_DIR}/succession.log" ] &&
         cp "${SEANCE_STATE_DIR}/succession.log" "${SAVED}/${id}.succession"
     [ -r "${SEANCE_STATE_DIR}/placement" ] &&
@@ -1111,6 +1122,89 @@ t_like "$( cat "${SAVED}/override-manual.out" )" \
     "a MANUAL run still stands down, because a human is reading the line"
 t_is "$( ls "${SAVED}/override-manual.notify" 2>/dev/null )" "" \
     "and does not page: the page is what the automatic path has instead of a reader"
+
+# ---------------------------------------------------------------------------
+# THE RECORDS AN AUTOMATIC RUN LEAVES, and the pages it sends
+#
+# `--force` and `--auto` are not expressible together (D-119), so no automatic
+# run can record a forced promotion -- but "cannot be typed" and "never
+# happens" are different sentences, and the one that matters to the person
+# reading succession.log a week later is the second. It is asserted here over
+# the WHOLE TABLE rather than for one row: every automatic run that recorded
+# anything recorded a fence, by the driver's name.
+#
+# The pages are the other half. A run that stops has a rung to page for it
+# (D-122); one that stops at rung 0 does not, and one that finishes has nothing
+# to say. Counted from the notification log, because "it sent one" and "it sent
+# two" are the same last-message-wins file otherwise.
+# ---------------------------------------------------------------------------
+
+AUTO_RECORDS=0
+AUTO_FORCED=""
+for id in ${AUTO_ROWS}; do
+    [ -r "${SAVED}/${id}.succession" ] || continue
+    while IFS= read -r line || [ -n "${line}" ]; do
+        [ -n "${line}" ] || continue
+        AUTO_RECORDS=$(( AUTO_RECORDS + 1 ))
+        ev=$( printf '%s\n' "${line}" | cut -f 5 )
+        case "${ev}" in
+            fence:*) ;;
+            *) AUTO_FORCED="${AUTO_FORCED} ${id}:${ev}" ;;
+        esac
+    done < "${SAVED}/${id}.succession"
+done
+
+t_rc 0 "the automatic rows of the table did record promotions (${AUTO_RECORDS} of them)" \
+    -- test "${AUTO_RECORDS}" -gt 0
+t_is "${AUTO_FORCED}" "" \
+    "and every one of them is evidence fence:<driver> -- an --auto run can never record force:*"
+
+# The negative control, so that the rule above is falsifiable: a MANUAL forced
+# promotion does record the operator, in the same column, read the same way.
+t_like "$( cat "${SAVED}/fence-unknown-forced.succession" )" \
+    "^web01	alpha	bravo	[0-9]{8}T[0-9]{6}Z	force:${OP}\$" \
+    "a manual --force=fence records force:<operator>, which is what makes the rule above measurable"
+
+t_like "$( cat "${SAVED}/auto-happy.succession" )" \
+    "^web01	alpha	bravo	[0-9]{8}T[0-9]{6}Z	fence:mock\$" \
+    "an automatic promotion's record names the fence driver that made it safe"
+t_is "$( cat "${SAVED}/auto-happy.placement" )" "web01	alpha" \
+    "and the placement claim it leaves is the one the boot gate reads"
+
+# A run that stopped before rung 6 claims nothing: a placement record is the
+# statement "this guest is running here", and it was not.
+t_is "$( ls "${SAVED}/auto-not-armed.placement" 2>/dev/null )" "" \
+    "a run stopped at rung 0 leaves no placement claim"
+t_is "$( ls "${SAVED}/auto-fence-unknown.placement" 2>/dev/null )" "" \
+    "and neither does one stopped at the fence"
+
+# --- the pages -------------------------------------------------------------
+
+t_is "$( ls "${SAVED}/auto-happy-notify.notify.log" 2>/dev/null )" "" \
+    "an automatic run that promoted everything pages nobody: there is nothing to say"
+
+t_is "$( awk '/^--- /{ n++ } END { print n + 0 }' \
+    "${SAVED}/auto-not-armed-notify.notify.log" )" "1" \
+    "a run stopped at rung 0 sends exactly one page -- no rung sent one for it"
+t_like "$( cat "${SAVED}/auto-not-armed-notify.notify.log" )" \
+    'automatic promotion of alpha stopped \(abort\)' \
+    "and the subject says the automatic promotion stopped"
+t_like "$( cat "${SAVED}/auto-not-armed-notify.notify.log" )" \
+    'Nothing further will happen without a human' \
+    "and the body ends by saying so"
+t_is "$( ls "${SAVED}/auto-not-armed-notify.fence" 2>/dev/null )" "" \
+    "a run that stopped at arming fenced nothing"
+
+t_is "$( awk '/^--- /{ n++ } END { print n + 0 }' \
+    "${SAVED}/auto-fence-unknown-notify.notify.log" )" "1" \
+    "a run the FENCE stopped sends exactly one page too: the rung's, not a second summary (D-122)"
+t_unlike "$( cat "${SAVED}/auto-fence-unknown-notify.notify.log" )" \
+    'automatic promotion of alpha stopped' \
+    "and it is the rung's page, not the summary the rungs are excluded from"
+
+t_is "$( awk '/^--- /{ n++ } END { print n + 0 }' \
+    "${SAVED}/auto-override-deferred.notify.log" )" "1" \
+    "and a run that promoted nothing because every guest was deferred pages once"
 
 # ---------------------------------------------------------------------------
 # --force's own vocabulary

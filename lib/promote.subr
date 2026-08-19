@@ -478,6 +478,57 @@ promote_auto_report()
 # The devd target
 # ---------------------------------------------------------------------------
 
+# promote_event_notify <level> <subject>   -- the body on stdin
+#
+# THE NOTIFICATION A DEVD ACTION SENDS IS DETACHED, for the reason every other
+# path out of promote_event is bounded: devd(8) forks `sh -c` and wait4s it
+# (sbin/devd/devd.cc, my_system), so whatever this verb waits for, devd's whole
+# event loop waits for -- and the events queued behind it are the ones about
+# the second death.
+#
+# `notify_cmd` is a site's own script. lib/notify.subr bounds it at
+# NOTIFY_TIMEOUT (30 s, D-75), which is the right bound for a promotion that
+# takes minutes and the wrong one here: measured, a hanging notify_cmd held
+# `promote-event` for the whole thirty seconds. So the notification is sent by
+# a child this verb does not wait for. Nothing about the notification itself
+# changes -- same level, same subject, same body, same NOTIFY_TIMEOUT around
+# the site's script, and seance_log still puts it in syslog.
+#
+# NARROWED TO THIS VERB DELIBERATELY. Every other notifier in seance is inside
+# something that already takes minutes (the ladder) or already blocks a boot it
+# is ordered before (the gate); there the caller's willingness to wait 30 s for
+# a page is exactly right, and detaching would only make the page racier.
+#
+# The body travels in a file rather than a pipe because the child outlives this
+# process, and the child removes it. Its output goes nowhere: stdout is data
+# and the verdict line must stay last (D-110), and stderr would interleave into
+# whatever captured this run long after it returned -- what the notification
+# has to say, it says through syslog, which is where a detached process's
+# diagnostics belong (the same argument daemon(8) -S makes for the ladder).
+promote_event_notify()
+{
+    local _level _subject _body
+
+    _level=$1
+    _subject=$2
+
+    _body=$( mktemp "${TMPDIR:-/tmp}/seance-event-notify.XXXXXX" ) || {
+        seance_log err "promote-event: cannot create a temporary file for a" \
+            "notification body; the subject is: ${_subject}"
+        cat > /dev/null
+        return 0
+    }
+
+    cat > "${_body}"
+
+    (
+        seance_notify "${_level}" "${_subject}" < "${_body}"
+        rm -f "${_body}"
+    ) > /dev/null 2>&1 &
+
+    return 0
+}
+
 # promote_event <vhid@ifname>
 #
 # What a devd(8) rule runs. It maps the vhid to a node, decides whether this
@@ -504,7 +555,7 @@ promote_auto_report()
 # is reserved for an argument that is not a CARP subsystem at all.
 promote_event()
 {
-    local _arg _vhid _if _dead _self _auto _armed _verb _want_if _rc
+    local _arg _vhid _if _dead _self _auto _armed _verb _want_if _rc _rundir _lock
 
     _arg=${1:-}
 
@@ -525,10 +576,61 @@ promote_event()
             seance_log err "promote-event: [${_arg}] does not start with a vhid"
             return 2
             ;;
+        0?*)
+            # devd writes the vhid with %u (sbin/devd/devd.cc, and carp(4)'s
+            # own snprintf "%u@%s"), which never has a leading zero. Read as a
+            # vhid it would be one this fleet does claim, and compared as the
+            # string it is it matches no node at all -- so the branch below
+            # would call a real death "somebody else's cluster" and do nothing.
+            # Refused, because the two wrong answers a silent no-op sits
+            # between are both worse than a message.
+            seance_log err "promote-event: [${_arg}] spells its vhid with a leading" \
+                "zero; devd(8) writes it with %u and this fleet's node blocks carry it" \
+                "without one, so this could not be matched to a node either way"
+            return 2
+            ;;
     esac
+
+    # AN IMPOSSIBLE VHID IS A CONTRACT ERROR, not a foreign cluster. carp(4)
+    # and ifconfig(8) put a vhid in 1..255 and lib/conf.subr enforces exactly
+    # that on every node block (CONF_VHID_MIN..CONF_VHID_MAX), so 0, 256 and
+    # 999 cannot have come from the kernel: a rule was mistyped, or copied from
+    # a fleet that numbers its nodes differently. Answering them with "no node
+    # claims this vhid; nothing to do" is the same answer a real foreign vhid
+    # gets, which is how a misrouted rule comes to look like a working one.
+    # D-99 settled this asymmetry inside the adapter; this is the entry point.
+    if ! _conf_uint_le "${_vhid}" "${CONF_VHID_MAX}" ||
+       [ "${_vhid}" -lt "${CONF_VHID_MIN}" ]; then
+        seance_log err "promote-event: [${_arg}] is not a CARP vhid" \
+            "(${CONF_VHID_MIN}..${CONF_VHID_MAX}): no kernel emits it, so the rule that" \
+            "ran this and the fleet it is installed on do not agree"
+        return 2
+    fi
 
     if [ -z "${_if}" ]; then
         seance_log err "promote-event: [${_arg}] names no interface"
+        return 2
+    fi
+
+    # AN IFNAME IS A NAME. What follows the '@' is devd's own if_name() of the
+    # CARP device, at most IFNAMSIZ-1 = 15 characters (net/if.h, IF_NAMESIZE
+    # 16), and it arrives here as a string this verb interpolates into log
+    # lines and notifications and compares against the configuration. A
+    # "subsystem" carrying whitespace, a shell separator, a second '@' or a
+    # path is not a CARP event, and this verb runs as root out of a devd
+    # action: the answer to an argument nobody could have meant is a refusal,
+    # not the rest of it acted on.
+    case "${_if}" in
+        *[!A-Za-z0-9._:-]*)
+            seance_log err "promote-event: [${_arg}] does not name an interface --" \
+                "an ifname is [A-Za-z0-9._:-] and nothing else"
+            return 2
+            ;;
+    esac
+
+    if [ "${#_if}" -gt 15 ]; then
+        seance_log err "promote-event: [${_arg}] names no interface:" \
+            "an interface name is at most 15 characters (net/if.h, IF_NAMESIZE)"
         return 2
     fi
 
@@ -572,9 +674,45 @@ promote_event()
                 "${_dead}"
             printf 'CARP MASTER for %s observed on %s. This node is armed to succeed it and could not work out how to invoke itself; nothing was promoted.\n' \
                 "${_dead}" "${_if}" |
-                seance_notify crit "seance: cannot start the automatic promotion of ${_dead}"
+                promote_event_notify crit "seance: cannot start the automatic promotion of ${_dead}"
             return 0
         fi
+
+        # ONE LADDER PER CORPSE, and the lock is what says so. devd delivers
+        # what the kernel emits: a link that flaps takes this node MASTER,
+        # BACKUP and MASTER again, and every MASTER is another action, another
+        # detach, another `promote <dead> --auto` -- all of them inside the
+        # debounce the first one is still serving. Two ladders on one node
+        # fence the same host twice, walk the same estate twice and write the
+        # same succession twice, and nothing in the ladder itself notices: each
+        # run is correct on its own.
+        #
+        # lockf(1) rather than a marker file, for D-62's and D-105's reason: it
+        # is released when the process holding it dies, and a stale marker
+        # either wedges automation for ever or gets stolen on a liveness guess.
+        # `-t 0` because a promotion that has to wait for another promotion of
+        # the same corpse has nothing left to do. The loser exits EX_TEMPFAIL
+        # (75) inside the detached child, which is the same "another one owns
+        # this" repl(1) already speaks (repl.subr).
+        #
+        # PER CORPSE and not per node: two deaths are two estates, and the
+        # second one must not be held by the first one's ladder.
+        #
+        # A node that cannot say where its locks live cannot make that
+        # promise, and an automatic promotion made without it is the one this
+        # would have prevented -- so it pages instead, exactly as it does when
+        # the adapter cannot say how to invoke a verb.
+        if ! _rundir=$( seance_run_dir ) ||
+           ! mkdir -p "${_rundir}/lock" 2>/dev/null; then
+            printf 'promote-event: %s is armed here, but there is no run directory to serialise promotions in (%s); NOTHING WAS PROMOTED\n' \
+                "${_dead}" "${_rundir:-unset}"
+            printf 'CARP MASTER for %s observed on %s. This node is armed to succeed it and has nowhere to take the lock that keeps two devd events from running two ladders; nothing was promoted.\n' \
+                "${_dead}" "${_if}" |
+                promote_event_notify crit "seance: cannot start the automatic promotion of ${_dead}"
+            return 0
+        fi
+
+        _lock="${_rundir}/lock/promote.${_dead}"
 
         # Detached, so that devd's event loop is released now rather than in
         # several minutes, and logged to syslog because a detached process has
@@ -588,6 +726,7 @@ promote_event()
         #   separate words.
         seance_run_timeout_detach "${PROMOTE_EVENT_DETACH_TIMEOUT}" \
             daemon -f -S -T seance -l daemon -s notice \
+            lockf -s -t 0 "${_lock}" \
             ${_verb} promote "${_dead}" --auto < /dev/null > /dev/null 2>&1
         _rc=$?
 
@@ -596,7 +735,7 @@ promote_event()
                 "${_dead}" "${_rc}"
             printf 'CARP MASTER for %s observed on %s. This node is armed to succeed it and daemon(8) exited %s; nothing was promoted.\n' \
                 "${_dead}" "${_if}" "${_rc}" |
-                seance_notify crit "seance: cannot start the automatic promotion of ${_dead}"
+                promote_event_notify crit "seance: cannot start the automatic promotion of ${_dead}"
             return 0
         fi
 
@@ -608,7 +747,7 @@ promote_event()
     printf 'CARP MASTER for %s observed on %s (vhid %s). Automation is not armed here: the fleet key auto is %s and node_%s_auto_promote is "%s". Nothing has been promoted. A human who has established that %s is dead runs:\n    seance promote %s\n' \
         "${_dead}" "${_if}" "${_vhid}" "${_auto}" "${_self}" "${_armed:-}" \
         "${_dead}" "${_dead}" |
-        seance_notify crit "CARP MASTER for ${_dead} observed, automation not armed"
+        promote_event_notify crit "CARP MASTER for ${_dead} observed, automation not armed"
 
     printf 'promote-event: CARP MASTER for %s (vhid %s on %s); automation is not armed here, so this notified and did nothing\n' \
         "${_dead}" "${_vhid}" "${_if}"
