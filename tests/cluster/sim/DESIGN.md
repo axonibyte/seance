@@ -266,6 +266,23 @@ how a tier-7 rediscovery row costs one cluster rebuild rather than five. And
 which is how the generator and the applicability rules are exercised on a
 workstation.)*
 
+*(MEASURED, and the estimate above was wrong by an order of magnitude. The
+default battery — the oracle self-test plus five seeds × 60 steps — took
+**9777 s (2 h 42 m 57 s)** in the reaper guest on 2026-08-19 (D-142's session),
+about **33 minutes a seed**: 1983 s, 1652 s, 2170 s, 1585 s and 2387 s.
+Re-measured at the M3 gate on 2026-08-19 (M3/U12), on a tree carrying the
+D-141 fix: **9872 s (2 h 44 m 32 s)**, per seed 2007 s, 1705 s, 2167 s, 1608 s
+and 2385 s — the same number twice, from two sessions and two trees, which is
+what makes it a cost rather than a mood. The cost is not the
+invariants (nine `zfs` calls and a few file reads a step) and not the cluster
+build (~90 s, once a seed): it is `ConnectTimeout=10` in `lib/transport.subr`,
+which a site may not shorten (D-111), multiplied by every guest-peer pair
+pointing at a node the trace has killed. `world_tick` runs every node's tick
+concurrently so that the ten seconds is paid once per tick rather than once per
+node; the timeout was not weakened, the guest count stayed at four and the step
+count stayed at 60. The hunting profile is budgeted against the same number: 45
+steps at N=3 measured 1801 s and 35 steps at N=4 measured 1110 s (M3/U12).)*
+
 *(And per D-147: only a run that reached a VERDICT nominates a seed. `run.sh`
 exits 0 for a pass, 1 for a firing, 2 when the driver could not start and 3
 when it was KILLED before it could decide — an interrupted battery used to exit

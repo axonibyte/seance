@@ -886,6 +886,29 @@ _conf_check_node_carp()
 
     conf_has "node_${_n}_auto_promote" || return 0
 
+    # A NODE ARMED TO SUCCEED SOMEBODY NEEDS AN INTERFACE TO HEAR IT ON, and
+    # this is the only rule here that fires for a node with no vhid of its own.
+    # The alias that carries a corpse's vhid is rendered onto THIS node's
+    # carp_interface (carp_render_rc), so without one there is nowhere to put
+    # it: no advertisement is received, nothing here ever becomes MASTER for
+    # that vhid, and the automation an operator switched on is deaf. Asked once
+    # per node rather than once per name, because it is one fault however long
+    # the list is.
+    #
+    # It is the same failure as D-116's -- everything reads correct until a
+    # death nobody detects -- and it is visible in the file, which is
+    # byte-identical across the mesh (handoff §2.2), so the check an operator
+    # runs before deploying can say so rather than leaving it to `verify` on
+    # the one node that will need it.
+    _w=$( conf_get "node_${_n}_auto_promote" "" )
+    if [ -n "${_w}" ] &&
+       ! conf_has "node_${_n}_carp_interface" && ! conf_has carp_interface; then
+        _conf_problem "node ${_n}: auto_promote names ${_w}, and ${_n} resolves no" \
+            "carp_interface (neither node_${_n}_carp_interface nor the fleet key):" \
+            "the alias for that vhid has no interface to live on, so no transition" \
+            "can ever wake this node"
+    fi
+
     for _w in $( conf_get "node_${_n}_auto_promote" "" ); do
         if ! _conf_in_list "${_w}" "${CONF_NODE_ORDER}"; then
             _conf_problem "node ${_n}: auto_promote names \"${_w}\", which is not a configured node"

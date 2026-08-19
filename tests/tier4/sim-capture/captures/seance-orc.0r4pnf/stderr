@@ -1,0 +1,8 @@
+cannot unmount '/seance/mail01': pool or dataset is busy
+err: promote mail01: cannot set mountpoint=/seance/mail01 on tank/state/seance/bravo/standby/alpha/mail01
+crit: NOTIFY: seance: automatic promotion of alpha stopped (abort)
+notify: | An automatic promotion of alpha stopped: disposition abort, 0 of 2 guest(s) promoted.
+notify: | Per-guest: mail01=abort web01=deferred
+notify: | DEFERRED -- no automation will promote these; a human must run the command shown, on the node shown:
+notify: |   web01: seance promote alpha --guest web01   (on charlie)
+notify: | Nothing further will happen without a human.

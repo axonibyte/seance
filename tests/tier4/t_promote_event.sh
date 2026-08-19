@@ -88,6 +88,14 @@ WORK=$( t_tmpdir )
 SHIM="${WORK}/bin"
 mkdir -p "${SHIM}"
 
+# Where the locks live (D-3). The detach runs the promotion under lockf(1) so
+# that two devd events for one vhid cannot start two ladders, and a node that
+# cannot say where its run directory is pages rather than promoting without
+# that promise -- so the fixture has to name one, as a node's cbsdsh wrapper
+# does (SEANCE_CBSD_WORKDIR).
+SEANCE_RUN_DIR="${WORK}/run"
+export SEANCE_RUN_DIR
+
 # The shim that matters. It records its argv and then starts something that
 # OUTLIVES IT, which is what daemon(8) does and what makes the wall-clock
 # assertion below able to fail.
@@ -214,8 +222,8 @@ t_like "${RUN_OUT}" '^promote-event: CARP MASTER for alpha \(vhid 1 on vtnet0\)'
     "it names the node the vhid stands for"
 t_like "${RUN_OUT}" 'running detached' "and says it detached the promotion"
 t_like "$( cat "${WORK}/daemon.log" )" \
-    "^-f -S -T seance -l daemon -s notice ${SHIM}/pretend-platform seance promote alpha --auto\$" \
-    "daemon(8) was given the platform's own verb, the dead node and --auto, and told to log to syslog"
+    "^-f -S -T seance -l daemon -s notice lockf -s -t 0 ${SEANCE_RUN_DIR}/lock/promote.alpha ${SHIM}/pretend-platform seance promote alpha --auto\$" \
+    "daemon(8) was given the platform's own verb, the dead node and --auto, under the per-corpse lock, and told to log to syslog"
 
 # THE ROW THIS FILE EXISTS FOR. The shim leaves a child running for 25 s. A
 # bound that reaps descendants -- which timeout(1) does unless --foreground --
@@ -231,6 +239,10 @@ t_rc 0 "promote-event RETURNS AT ONCE, rather than waiting for what it detached"
 
 conf 0 alpha || t_diag "the auto=0 configuration failed to load"
 run "1@vtnet0"
+# The notification is sent by a child this verb does not wait for -- devd waits
+# for the verb, so the verb waits for no site's notify_cmd -- so what it told
+# syslog is read after giving that child a moment.
+sleep 2
 t_is "${RUN_RC}" "0" "with the fleet key auto at 0 the event still exits 0"
 t_is "$( cat "${WORK}/daemon.log" )" "" "and detaches nothing"
 t_like "$( cat "${WORK}/logger.log" )" \

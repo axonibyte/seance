@@ -36,14 +36,20 @@ not answer, and there is no human on the automatic path.
 The shipped `drivers/fence_ipmi` driver against real hardware is M4's, and
 seance still never writes a line of host network configuration.
 
-M2 is complete and tagged **v0.2.0**. What that means, precisely: the ladder,
-the failback, the gate and the records are implemented and tested at every tier
-the harness has — including tier 5, where `lib/adapter.subr` is run against a
-real CBSD 15.0.9 node and a real jail, and tier 6, where three vnet jails, real
-ZFS lineage, real ssh and a fence driver that really stops a node walk the whole
-succession. `sh tools/lint.sh` is the workstation half and `reaper test` the
-rest; both are green. What is NOT proven is anything that needs hardware: the
-fencing drills against a real BMC and a real two-node failover are
+M3 is complete and tagged **v0.3.0**; M2's gate closed at **v0.2.0**. What that
+means, precisely: replication, the ladder, the failback, the gate, the records,
+CARP detection, the devd hook and the automatic path are implemented and tested
+at every tier the harness has — tier 5, where `lib/adapter.subr` is run against
+a real CBSD 15.0.9 node and a real jail; tier 6, where three vnet jails, real
+ZFS lineage, real ssh, real CARP vhids and a fence driver that really stops a
+node walk the whole succession; tier 7, where a seeded generator deals weighted
+events at that cluster and five invariants are diffed after every one of them;
+and the rediscovery battery of `TESTING.md` §8, which reverts each protection
+this project has already paid for once and requires the harness to notice.
+`sh tools/lint.sh` is the workstation half and `reaper test` the rest; both are
+green. What is NOT proven is anything that needs hardware: a real `devd(8)`
+firing a rendered rule on a physical segment (it does not run in a vnet jail),
+the fencing drills against a real BMC, and a real two-node failover are
 `docs/DRILLS.md`'s, and they stay there until somebody runs them.
 
 What is here:

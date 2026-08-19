@@ -1,0 +1,15 @@
+info: repl db01->charlie: 3 stream(s), newest common 20260101T000500Z, rc 0
+ssh: connect to host 192.0.2.11 port 22: Operation timed out
+err: repl db01->alpha: cannot assert the standby parent tank/state/seance/alpha/standby
+notice: repl mail01->charlie: no snapshot in common for tank/state/seance/bravo/standby/alpha/mail01; sending it in full
+notice: repl mail01->charlie: no snapshot in common for tank/state/seance/bravo/standby/alpha/mail01/data; sending it in full
+notice: repl mail01->charlie: no snapshot in common for tank/state/seance/bravo/standby/alpha/mail01/sys; sending it in full
+info: repl charlie: enforced canmount on tank/state/seance/charlie/standby/bravo/mail01
+info: repl charlie: enforced canmount on tank/state/seance/charlie/standby/bravo/mail01/data
+info: repl charlie: enforced canmount on tank/state/seance/charlie/standby/bravo/mail01/sys
+info: repl mail01->charlie: 3 stream(s), newest common 20260101T000500Z, rc 0
+ssh: connect to host 192.0.2.11 port 22: Operation timed out
+err: repl mail01->alpha: cannot assert the standby parent tank/state/seance/alpha/standby
+info: repl seance-sys->charlie: 1 stream(s), newest common 20260101T000500Z, rc 0
+ssh: connect to host 192.0.2.11 port 22: Operation timed out
+err: repl seance-sys->alpha: cannot assert the standby parent tank/state/seance/alpha/standby

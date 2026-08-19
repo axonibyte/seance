@@ -652,6 +652,31 @@ done
 # last event and the end of the run for a further check to be about.
 
 if [ "${sim_rc}" -eq 0 ]; then
+    # A PASSING RUN LEAVES ITS LAST STATE BEHIND TOO, and this is not
+    # symmetry for its own sake. The state files are the observed world in the
+    # format invariants.subr pins, they are a few kilobytes, and they are the
+    # only thing a run produces that can be fed to the checker afterwards --
+    # which is how a state that no invariant fires on gets proved to be a
+    # state the checker could READ, rather than one it silently made nothing
+    # of. Only the failure path kept them before, so the one kind of state
+    # nobody could ever check the checker against was a correct one.
+    # THE BUFFERS HAVE ALREADY ROTATED. The loop swaps SIM_CUR and SIM_PREV at
+    # the end of every step, for the step that -- here -- never came: so after
+    # a completed run SIM_PREV holds the LAST observation and SIM_CUR is the
+    # stale buffer the next step would have overwritten. Copying them by their
+    # names would label the older state "observed" and the newer one
+    # "observed-prev", and a checker fed that pair reports every replica as
+    # regressed and every dataset the last step created as destroyed. The
+    # failure path below is not affected: it breaks out of the loop BEFORE the
+    # swap, where the names mean what they say.
+    if [ -n "${SIM_OUT}" ]; then
+        cp -R "${SIM_MODEL}" "${SIM_OUT}/model" 2>/dev/null || true
+        [ -d "${SIM_PREV}" ] &&
+            cp -R "${SIM_PREV}" "${SIM_OUT}/observed" 2>/dev/null
+        [ -d "${SIM_CUR}" ] &&
+            cp -R "${SIM_CUR}" "${SIM_OUT}/observed-prev" 2>/dev/null
+    fi
+
     printf 'sim: PASS %s step(s), seed %s\n' "${SIM_STEPS}" "${SIM_SEED}"
     exit 0
 fi

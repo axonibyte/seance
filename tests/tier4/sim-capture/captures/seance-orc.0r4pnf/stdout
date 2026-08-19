@@ -1,0 +1,19 @@
+rung 0 arming: pass — auto=1 and node_bravo_auto_promote names alpha
+rung 1 debounce: pass — waited 2s and this node is still MASTER for vhid 1, which is alpha's: the transition that woke this run still holds
+rung 2 quorum: pass — 1 + 1 reachable of N=3 is a majority (reachable: charlie)
+rung 3 probes: pass — alpha (192.0.2.11) answered neither ping nor ssh
+rung 4 fence: pass — fence_jail off alpha verified alpha is off: [fence_jail: alpha off verified: sn-alpha is gone from jls -d]. Split brain is now impossible, not merely unlikely.
+rung 5 lineage: pass — estate of alpha under tank/state/seance/bravo/standby/alpha: mail01 web01  (kernel homogeneity: same -- every living peer runs 15.1-RELEASE-p2; placements read from charlie)
+  mail01: lineage proceed -- newest replica 20260101T000200Z, inside staleness_max 180s
+  web01: deferred -- succession is charlie bravo, and this node is not the actor for it. CARP woke this node alone, so charlie will not hear about alpha's death: run "seance promote alpha --guest web01" on charlie
+rung 6 promotion: pass — promoting, alphabetically:  mail01 
+  mail01: jail, replica tank/state/seance/bravo/standby/alpha/mail01, promotion point 20260101T000200Z, mounting at /seance/mail01
+  undo: zfs unmount tank/state/seance/bravo/standby/alpha/mail01; zfs inherit mountpoint tank/state/seance/bravo/standby/alpha/mail01
+  undo: zfs unmount tank/state/seance/bravo/standby/alpha/mail01/data; zfs inherit mountpoint tank/state/seance/bravo/standby/alpha/mail01/data
+  tank/state/seance/bravo/standby/alpha/mail01/data is already mounted at /seance/mail01/data
+  undo: zfs unmount tank/state/seance/bravo/standby/alpha/mail01/sys; zfs inherit mountpoint tank/state/seance/bravo/standby/alpha/mail01/sys
+  tank/state/seance/bravo/standby/alpha/mail01/sys is already mounted at /seance/mail01/sys
+rung 7 post: n/a (nothing to configure) — the next repl tick on this node snapshots every guest it hosts as @seance-bravo-* and sends to that guest's heirs (charlie alpha ); alpha is one of them again the moment it returns, and until then that pair is logged as failed, not fatal
+deferred — no automation will promote these; run each command on the node named:
+  web01: seance promote alpha --guest web01   (on charlie)
+promote: 0 of 2 guest(s) promoted from alpha — evidence fence:jail, disposition abort

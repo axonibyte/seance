@@ -135,3 +135,7 @@ auto-lineage-stale	auto=1 lineage=stale	-	force-only	fence:mock	-	1
 # --- a per-guest override the automatic path cannot act on (D-129, D-130) ----
 override-manual	override=charlie	-	stand-down	fence:mock	-	0
 auto-override-deferred	auto=1 override=charlie notify=ok	-	deferred	fence:mock	-	1
+# --- what the automatic path tells a human, and when (D-122) -----------------
+auto-happy-notify	auto=1 notify=ok	-	proceed	fence:mock	-	0
+auto-not-armed-notify	auto=1 armed=no notify=ok	-	abort	-	0 arming	1
+auto-fence-unknown-notify	auto=1 fence=unknown notify=ok	-	notify	-	4 fence	1

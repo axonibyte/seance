@@ -15,7 +15,7 @@ checkable claim rather than a recollection.
 | drill-replication | M1 | **documented below; fleet execution pending** |
 | drill-guest | M2 | **documented below; fleet execution pending** |
 | drill-failback | M2 | **the second half of drill-guest; runnable alone** |
-| drill-node | M3 | **documented below; fleet execution pending** |
+| drill-node | M3 | **documented below; timings measured in shape A; fleet execution pending** |
 | drill-fence | M4 | **documented below; the driver it fences with (`drivers/fence_ipmi`) ships at M4 — fleet execution pending both** |
 
 Config keys `node_<key>_fence_driver` and `node_<key>_fence_target` are
@@ -601,6 +601,47 @@ The debounce is the one row that is a decision rather than a measurement:
 45 seconds of the budget is spent on purpose, buying immunity to a flapping
 link. If T0→T6 misses the target by less than the debounce, the finding is
 about the debounce and not about seance.
+
+#### Measured, so that the targets above are not guesses
+
+Nobody has run this drill on hardware yet, and the numbers a drill is judged
+against should not be estimates. `tests/tier6/drill-timing.sh` runs the same
+sequence in the pseudo-cluster — the same seance, the same configuration, the
+shipped `debounce` of 45 s rather than a fixture's — and reports what each
+interval cost. Measured on 2026-08-19, in the reaper guest
+(`freebsd-15.1`, three vnet jails, and the pseudo-cluster's own jail fence
+driver):
+
+| Interval | Measured | The target above |
+| --- | --- | --- |
+| T0→T1 victim gone to the heir holding its vhid | 64 s | < 10 s |
+| T1→T2 `promote-event` returns, devd's loop released | 0 s | < 2 s |
+| T2→T5 debounce, quorum, probes, fence, mount, register, start | 60 s | ~ 90 s + debounce |
+| **T0→T5** | **124 s** | **< 5 min** |
+
+Read those three limits with the numbers, because a measurement quoted without
+them is a measurement misquoted:
+
+- **T0→T1 is the fixture's, not CARP's.** Shape A's "power cut" stops the
+  victim's jail through `tests/cluster/lib/cluster.subr`, which unmounts its
+  delegated dataset and waits for a vnet jail to die before the vhid can be
+  taken over; on hardware the
+  advertisement simply stops and the heir preempts within three advertisement
+  intervals. The 64 s is an upper bound with a fixture in it, and the drill's
+  < 10 s target is the one to measure against real power.
+- **T1→T2 is measured without devd**, which is `KEYWORD: nojail` and does not
+  run in a vnet jail (D-128): the script invokes `promote-event` itself, as
+  every tier-6 stage does. What is measured is the verb, which is the half
+  seance owns — it returned inside the second it was called in, with the
+  ladder detached behind it.
+- **T5→T6 is not measured at all.** The pseudo-cluster's guests are records
+  rather than processes, so "the service answers" has no meaning there. On
+  hardware it is the guest's own boot time and it is the operator's to budget.
+
+The useful part is what is left when those three are set aside: everything
+seance does between hearing about a death and having the estate running cost
+**60 seconds**, of which **45 were the debounce spent on purpose**. The
+five-minute target is not tight for seance; it is tight for the guests.
 
 ### Evidence a passing drill leaves
 
