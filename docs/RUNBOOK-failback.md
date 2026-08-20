@@ -82,7 +82,18 @@ started by hand), hold the estate now:
 service seance_gate onestart
 ```
 
-and find out why it did not run before the next reboot.
+and find out why it did not run before the next reboot. **One reason is worth
+checking first on a node whose module was upgraded rather than installed**: the
+rc(8) unit is a COPY of the module's, so a node that pulled the checkout still
+has whatever unit it had before. Every unit older than v0.5.0 ran the module's
+`bin/seance`, which rc(8) cannot run, and said so only in the log:
+
+```
+seance_gate: exit 2; the estate has NOT been gated
+```
+
+Re-copy `rc.d/seance_gate` from the module directory (`docs/INSTALL.md` §2) and
+run `onestart` again.
 
 ## Step 2 — decide, per guest, whether to bring it home
 
@@ -108,17 +119,23 @@ seance failback <guest>
 
 What it does, in order, printing the undo beside each step:
 
+0. **before anything is stopped**, it syncs this node's pool and measures what
+   has been written to this node's copy since the incremental base — and
+   refuses here if there is anything, which is why a refusal normally leaves
+   the guest running on the interim (see below);
 1. stops the guest on the interim host;
-2. takes a final snapshot there;
-3. **measures** what has been written to this node's copy since the incremental
-   base, and either proceeds or refuses (see below);
-4. pulls the reverse incremental into this node's **live** dataset;
-5. unregisters and unmounts the guest on the interim, putting its replica
+2. takes a final snapshot there — and measures again, authoritatively, against
+   the base the interim has just named;
+3. pulls the reverse incremental into this node's **live** dataset;
+4. unregisters and unmounts the guest on the interim, putting its replica
    datasets back to `mountpoint=none`;
-6. releases the guest here and starts it;
-7. clears the interim's claim and appends a `failback` succession record;
-8. prunes the interim's lineage from this node's datasets;
-9. says which heirs the next replication tick will send to.
+5. releases the guest here and starts it;
+6. clears the interim's claim and appends a `failback` succession record;
+7. prunes the interim's lineage from this node's datasets;
+8. says which heirs the next replication tick will send to.
+
+Steps 1–8 are the numbering `lib/failback.subr`'s own header uses, so a step
+named in a log line is the step named here.
 
 The last line is the verdict, and it is the one to read:
 
@@ -273,8 +290,11 @@ the outage in the first place.
 
 ## Mesh prerequisites this runbook assumes
 
-- `seance placement` runs as the ssh user on every node — a link to
-  `bin/seance` somewhere on that user's `PATH`. The platform's own `PATH`
+- `seance placement` runs as the ssh user on every node — a link to the
+  module's **verb wrapper** (the `seance` file at the module root) somewhere on
+  that user's `PATH`, never to `bin/seance` under it: the plain dispatcher is
+  not told which node it is on and answers `no config file`, which reads to the
+  asking node as a peer that could not report. The platform's own `PATH`
   belongs to its shell, not to an ssh session, so this is a deliberate step at
   install time. `ssh <peer> seance placement` is the test.
 - The configuration file is byte-identical on every node. `seance verify` says

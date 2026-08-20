@@ -163,7 +163,7 @@ CRON1=$( node_seance alpha verify --render cron )
 CRON2=$( node_seance alpha verify --render cron )
 t_is "${CRON1}" "${CRON2}" \
     "verify --render cron is byte-stable across two runs"
-t_like "${CRON1}" '^\*/1 \* \* \* \* root /usr/local/seance/bin/seance repl$' \
+t_like "${CRON1}" '^\*/1 \* \* \* \* root /usr/local/bin/seance repl$' \
     "and is the crontab(5) system line it claims to be"
 t_rc 2 "verify --render of a subject it does not know is a contract error" \
     -- node_seance alpha verify --render nonsense

@@ -1357,9 +1357,28 @@ repl_due()
 # configuration: the shortest cadence in the fleet, in whole minutes, never
 # less than one. `verify` prints this and diffs it against reality; nothing in
 # seance ever writes it.
+#
+# THE COMMAND IS THE PLATFORM'S VERB, and it is the whole point of this
+# function being able to fail. cron(8) runs a job with an environment of its
+# own -- PATH, HOME, LOGNAME, SHELL and nothing else -- and the dispatcher
+# under bin/ learns which node it is on only from the variables the module's
+# own verb wrapper exports (D-2). A line naming bin/seance therefore exits 2
+# with "no config file" every time cron fires it, for ever, while `verify`
+# reports the line as correctly installed: measured in the guest, a fresh
+# install replicated nothing and said nothing. `adapter_fact verb` is the one
+# answer to "how does this platform run a seance verb" (D-49, D-117), it is
+# what `verify --render devd` already renders for exactly this reason, and it
+# is what a pseudo-cluster node answers with too -- which a hard-coded
+# ${SEANCE_ROOT}/seance could not.
+#
+# rc 1 when the platform cannot say: a crontab line nobody can run is not a
+# rendering to print and redirect into place.
 repl_cron_line()
 {
-    local _g _c _min _mins
+    local _g _c _min _mins _verb
+
+    _verb=$( adapter_fact verb ) || return 1
+    [ -n "${_verb}" ] || return 1
 
     _min=$( conf_effective cadence ) || _min=900
     for _g in $( conf_guests ); do
@@ -1373,7 +1392,7 @@ repl_cron_line()
     _mins=$(( _min / 60 ))
     [ "${_mins}" -lt 1 ] && _mins=1
 
-    printf '*/%d * * * * root %s repl\n' "${_mins}" "${SEANCE_ROOT}/bin/seance"
+    printf '*/%d * * * * root %s repl\n' "${_mins}" "${_verb}"
 }
 
 # repl_run_pair <guest> <peer> <home> <now> <dry 0|1> <locked 0|1>

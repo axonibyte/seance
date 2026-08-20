@@ -311,7 +311,7 @@ while IFS= read -r row; do
     esac
 done < "${WORK}/sample.rows"
 
-t_plan 30
+t_plan 35
 
 # --- the guard is scanning something ---------------------------------------
 
@@ -453,5 +453,48 @@ t_is "$( unknown_doc_keys "${WORK}/allow.md" \
 
 t_isnt "${DOC_FOREIGN_VARS}" "" \
     "the foreign-variable allowance is a list, and it is written down here"
+
+# ---------------------------------------------------------------------------
+# The README's configuration reference is COMPLETE
+# ---------------------------------------------------------------------------
+#
+# The doc-liveness scan above asks whether every key a document NAMES exists.
+# This asks the other direction of the one document that claims to be a
+# reference: README carries a table of every fleet key, every per-node field
+# and every per-guest field, and a key that seance implements and README does
+# not list is a key an operator cannot find. The sample has the same promise
+# and is checked for it at the top of this file; README is where somebody
+# looks first.
+#
+# The tokens are harvested WITHOUT the underscore requirement the liveness scan
+# uses, because a node field is a bare word (`nodename`, `mgmt`, `heir`) and
+# would otherwise be invisible to the harvest that finds `retention_recent`.
+
+readme_tokens()
+{
+    awk '
+        {
+            line = $0
+            while (match(line, /`[^`]*`/)) {
+                print substr(line, RSTART + 1, RLENGTH - 2)
+                line = substr(line, RSTART + RLENGTH)
+            }
+        }
+    ' "$1" | grep -E '^[a-z][a-z0-9_]*$' | LC_ALL=C sort -u | tr '\n' ' '
+}
+
+RTOK=$( readme_tokens "${T_ROOT}/README.md" )
+t_isnt "${RTOK}" "" "README.md names configuration keys in backticks"
+
+t_is "$( missing_from "${FLEET}" "${RTOK}" )" "" \
+    "README.md's reference lists every fleet key"
+t_is "$( missing_from "${NODEK}" "${RTOK}" )" "" \
+    "and every per-node field"
+t_is "$( missing_from "${GUESTK}" "${RTOK}" )" "" \
+    "and every per-guest-overridable key"
+
+# The mutation: a key seance implements and README does not mention.
+t_is "$( missing_from "${FLEET} brandnewkey" "${RTOK}" )" " brandnewkey" \
+    "mutation: a key README does not list is caught"
 
 t_done

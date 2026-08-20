@@ -60,15 +60,22 @@ list_from_source()
 
 # call_site_tags <file>
 #
-# One line per `bsddialog --stdout` call site, in file order: the text of the
+# One line per `setup_dialog` call site, in file order: the text of the
 # tag comment immediately above it (leading '#' and whitespace stripped), or
 # an EMPTY line if there is none. A comment line does not itself count as a
-# call site -- this file's own header talks about bsddialog invocations in
+# call site -- this file's own header talks about setup_dialog invocations in
 # prose, inside backticks, and must not be mistaken for one.
+#
+# `setup_dialog` and not `bsddialog --stdout`, which is what this scanned until
+# M5: bsddialog draws on stdout and prints the user's answer on stderr by
+# default (bsddialog(1)), so `_v=$( bsddialog --stdout ... )` captured the
+# SCREEN and the wizard had never worked. setup_dialog is the one place that
+# now gets the two streams right, and the guard follows the seam.
 call_site_tags()
 {
     awk '
-        /bsddialog --stdout/ && !/^[ \t]*#/ {
+        /^setup_dialog\(\)/ { incomment = 0; blockfirst = ""; next }
+        /setup_dialog[ \t]/ && !/^[ \t]*#/ {
             t = blockfirst
             sub(/^[ \t]*#[ \t]*/, "", t)
             print t
@@ -201,7 +208,7 @@ t_plan 13
 
 SITES=$( call_site_tags "${SETUP_SRC}" )
 SITE_COUNT=$( printf '%s\n' "${SITES}" | grep -c . )
-t_isnt "${SITE_COUNT}" "0" "lib/setup.subr has bsddialog call sites to check"
+t_isnt "${SITE_COUNT}" "0" "lib/setup.subr has setup_dialog call sites to check"
 if [ "${SITE_COUNT}" -ge 30 ]; then
     t_ok "and there are at least 30 of them (one per fleet/node/guest field, plus flow)"
 else
@@ -215,7 +222,7 @@ t_isnt "${GUESTK}" "" "CONF_GUEST_KEYS was found in lib/conf.subr"
 # --- every call site is tagged, and with one of the two recognised shapes --
 
 t_is "$( untagged_sites "${SETUP_SRC}" )" "" \
-    "every bsddialog call site has a 'setup-answer:' or 'setup-nodata:' tag"
+    "every setup_dialog call site has a 'setup-answer:' or 'setup-nodata:' tag"
 
 # --- every setup-answer: tag names a key setup could actually write --------
 
@@ -243,16 +250,16 @@ cp "${SETUP_SRC}" "${SCRATCH}"
 # shellcheck disable=SC2016
 #   The single quotes are the point: this is source text being appended to a
 #   scratch copy of lib/setup.subr, not a command substitution to expand here.
-printf '\nsetup_ask_exorcise()\n{\n    local _v\n    _v=$( bsddialog --stdout --title "x" --inputbox "x" 0 0 "" )\n}\n' \
+printf '\nsetup_ask_exorcise()\n{\n    local _v\n    _v=$( setup_dialog --title "x" --inputbox "x" 0 0 "" )\n}\n' \
     >> "${SCRATCH}"
 t_isnt "$( untagged_sites "${SCRATCH}" )" "" \
-    "mutation: an untagged bsddialog call site is caught"
+    "mutation: an untagged setup_dialog call site is caught"
 
 # (b) a setup-answer: tag naming a key that does not exist.
 cp "${SETUP_SRC}" "${SCRATCH}"
 # shellcheck disable=SC2016
 #   As above: source text being appended, not an expansion.
-printf '\nsetup_ask_exorcise()\n{\n    local _v\n    # setup-answer: brandnewkey\n    _v=$( bsddialog --stdout --title "x" --inputbox "x" 0 0 "" )\n}\n' \
+printf '\nsetup_ask_exorcise()\n{\n    local _v\n    # setup-answer: brandnewkey\n    _v=$( setup_dialog --title "x" --inputbox "x" 0 0 "" )\n}\n' \
     >> "${SCRATCH}"
 t_is "$( unknown_answer_keys "${SCRATCH}" "${FLEET}" "${NODEK}" "${GUESTK}" | tr '\n' ' ' )" \
     "brandnewkey " \

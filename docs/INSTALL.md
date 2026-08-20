@@ -109,6 +109,73 @@ enabled: it is what stage 9 uses to reconcile `ObsoleteFiles` (see below) and
 what re-links the verb if the wrapper's path ever changed. `cbsd seance
 version` is the check that the upgrade actually took.
 
+### Run `config --check` on every node, before and after
+
+```sh
+seance config --check          # before the pull, and again after it
+```
+
+**The validator is allowed to grow rules, and every rule it grows is a
+migration.** `seance_load_conf` runs `config --check` before *every* verb, so a
+configuration that a previous release accepted and this one does not stops
+`repl`, `status`, `verify`, `gate` and `promote` on that node the moment the
+checkout moves — on a running fleet, with the automation the operator believed
+was armed. Checking before the pull tells you the file was clean; checking
+after tells you whether it still is.
+
+**What has changed since v0.2.0 — one rule, and this is all of it.** A node
+whose `auto_promote` names a peer must now resolve a `carp_interface`, either
+its own (`node_<key>_carp_interface`) or the fleet key. Before, a node with no
+vhid of its own could be armed with neither, and nothing could ever make it
+CARP MASTER for the corpse's vhid: the automation was switched on and deaf, and
+every other check was green (decision D-156, the same failure shape as D-116).
+The refusal names the node and the missing key, and the migration is to add the
+key:
+
+```
+problem: node bravo: auto_promote names alpha, and bravo resolves no
+carp_interface (neither node_bravo_carp_interface nor the fleet key): the alias
+for that vhid has no interface to live on, so no transition can ever wake this
+node
+```
+
+Nothing else changed verdict, and no configuration key has been removed:
+`tests/tier1/t_conf_upgrade.sh` holds both halves of that promise against the
+previous release's own shipped sample, so a future release that adds another
+rule has to write the note here before its own suite will pass. The state a
+node has already accumulated — `succession.log`, `placement`, the lag records
+under `${workdir}/var/db/seance` — is read unchanged and needs no migration at
+all; the same test pins each format.
+
+### Re-install the two files the clone does not own
+
+A `git pull` moves the checkout. It does **not** move the copies of the
+checkout's files that §5 and §6 told you to put elsewhere, and at v0.5.0 both
+of them changed:
+
+```sh
+cp /usr/local/cbsd/modules/seance.d/rc.d/seance_gate /usr/local/etc/rc.d/
+service seance_gate onestart          # and read what it says
+
+mkdir -p /usr/local/etc/cron.d
+seance verify --render cron > /usr/local/etc/cron.d/seance
+```
+
+- **`rc.d/seance_gate`.** Before v0.5.0 the unit ran the module's `bin/seance`,
+  which rc(8) cannot run at all — so an upgraded node that keeps its old copy
+  keeps a boot gate that exits 2 and gates nothing, and says so only in
+  `/var/log/messages`. `service seance_gate onestart` after the copy is how you
+  see which one you have: `nothing withheld` or a `HELD` line is the new unit
+  working; `WARNING: … THE ESTATE HAS NOT BEEN GATED` is the old one.
+- **the crontab line.** It named `bin/seance` too, for the same reason and with
+  the same result — a node that has been replicating nothing since it was
+  installed. `seance verify` reports the stale line as `WARN cron: … does not
+  carry the expected line` and prints the one to install, so this is the one
+  migration step `verify` will keep reminding you about.
+
+The `devd(8)` rules are unchanged and do not need re-rendering; `seance verify`
+says so either way.
+
 **`ObsoleteFiles`** is the convention a module uses to retire a file a
 previous version shipped — seance carries one in the module root for the same
 reason `metadata.conf` stays in the standard shape: the convention is free and
@@ -142,7 +209,7 @@ the way an absent module should.
 because nothing here was installed automatically either:
 
 ```sh
-rm -f /usr/local/bin/seance                      # the PATH link, §5 below
+rm -f /usr/local/bin/seance                      # the PATH link, §4 above
 sysrc seance_gate_enable=NO
 service seance_gate stop 2>/dev/null || true
 rm -f /usr/local/etc/rc.d/seance_gate
@@ -156,20 +223,27 @@ as unreachable or configuration-diverged — that is correct, not a bug in
 `verify`; finish the removal on every node the fleet still expects to hear
 from, or take the node out of every peer's configuration too.
 
-## 4. Put the dispatcher on the mesh's `PATH`
+## 4. Put the module's verb on the mesh's `PATH`
 
 One node runs `seance placement` on another over ssh, and an ssh session gets
-the *login* `PATH`, not `cbsdsh`'s:
+the *login* `PATH`, not `cbsdsh`'s. **Link the module's verb wrapper — the
+`seance` file at the module root — and not `bin/seance` under it:**
 
 ```sh
-ln -s /usr/local/cbsd/modules/seance.d/bin/seance /usr/local/bin/seance
+ln -s /usr/local/cbsd/modules/seance.d/seance /usr/local/bin/seance
 ssh <peer> seance placement            # the test that it worked
 ```
 
-Without this link every peer reads as silent to the node asking, and the
-resurrection gate treats "nobody answered" as "withhold the whole estate" —
-correct behaviour, arriving for the wrong reason. Do this on every node before
-trusting `gate` or `promote` on any of them.
+The distinction is not cosmetic and it is the one this document got wrong
+until M5. `bin/seance` is the plain dispatcher, and it learns which node it is
+on — where the configuration is, where the state directory is — only from the
+variables the wrapper exports (`docs/cbsd-module-notes.md` §2, decision D-2).
+Linked that way, `ssh <peer> seance placement` answers `no config file: set
+SEANCE_CONF, or run under CBSD` and exits 2. Every peer then reads as **silent**
+to the node asking — which is not "no claim" but "cannot tell", so the gate
+withholds whole estates, `promote` aborts and `failback` refuses, fleet-wide,
+from the install instructions alone. Do this on every node before trusting
+`gate` or `promote` on any of them, and run the `ssh` line above as the proof.
 
 ## 5. Install the boot gate
 
@@ -188,6 +262,15 @@ estate coming up (the autostart is not its own rc(8) unit; it starts inside
 `cbsdd`'s prestart). `docs/RUNBOOK-failback.md` is what to read the first time
 it actually withholds something.
 
+**`service seance_gate onestart` is not an optional flourish**, and this is
+what it is for: the unit finds seance through `${workdir}/modules/seance`, the
+verb symlink §1's `initenv` planted, and until M5 it walked past that symlink
+to `bin/seance` underneath — which, run from rc(8) with no environment, exits 2
+and gates nothing. `onestart` is where an operator sees that in one line
+instead of at the first reboot after a real death. Expect it to print either
+`nothing withheld` (exit 0) or a `HELD` line per guest (exit 1); a `WARNING:
+… THE ESTATE HAS NOT BEEN GATED` is the one answer to stop on.
+
 ## 6. Schedule replication: the cron line
 
 `seance repl` is a cron target, not a daemon. Render the line this node
@@ -196,8 +279,29 @@ ships from ports/packages territory, so `verify` names the third-party
 directory first and accepts either:
 
 ```sh
+mkdir -p /usr/local/etc/cron.d
 seance verify --render cron > /usr/local/etc/cron.d/seance
 ```
+
+**The `mkdir` is not tidiness.** `/usr/local/etc/cron.d` is a directory
+`cron(8)` reads and nothing on a stock FreeBSD node creates; without it the
+redirect fails with `No such file or directory`, nothing is installed, and the
+operator has no reason to think otherwise. (`/etc/cron.d` does exist, and
+`verify` accepts a fragment in either — but the third-party directory is the
+one seance ships into.)
+
+The rendered line names **the platform's own verb**, not `bin/seance`:
+
+```
+*/15 * * * * root /usr/local/bin/cbsd seance repl
+```
+
+which is the same distinction §4 makes about the mesh link, and it is here for
+the same reason — cron gives a job `PATH`, `HOME`, `LOGNAME` and `SHELL` and
+nothing else, and the plain dispatcher cannot find its configuration in that.
+Until M5 the rendering named `bin/seance`, so a freshly installed node
+replicated nothing, for ever, while `verify` reported the crontab line as
+correctly installed.
 
 `seance verify` (no arguments) checks this on every subsequent run — one of
 its seven checks is exactly "does a crontab fragment cron actually reads carry

@@ -6,7 +6,7 @@
 # KEYWORD: nojail
 #
 # seance_gate_enable="YES"
-# seance_gate_program="/path/to/modules/seance.d/bin/seance"
+# seance_gate_program="/path/to/modules/seance.d/seance"
 #
 # The resurrection gate (design §8, decision D-21). Before the platform's
 # autostart runs, this asks every LIVING peer whether it already claims one of
@@ -72,14 +72,23 @@ stop_cmd=":"
 
 # seance_gate_find_program
 #
-# Where the dispatcher is, when rc.conf did not say. The module directory is
-# resolved through the verb symlink the platform's own initialisation plants in
-# ${workdir}/modules/ -- so this unit learns the path from the same place the
-# operator installed it, rather than carrying a compiled-in guess that would be
-# wrong on any node with a different workdir.
+# Where seance is, when rc.conf did not say: the verb symlink the platform's
+# own initialisation plants in ${workdir}/modules/ -- so this unit learns the
+# path from the same place the operator installed it, rather than carrying a
+# compiled-in guess that would be wrong on any node with a different workdir.
+#
+# IT IS THE SYMLINK ITSELF, AND NOT ${module}/bin/seance BEHIND IT. That is the
+# whole of the M5 finding: this unit used to resolve the link, walk past it to
+# the plain dispatcher, and run that -- and the plain dispatcher learns which
+# node it is on only from the variables the module's verb wrapper exports
+# (D-2). Run from rc(8) it therefore printed "no config file: set SEANCE_CONF,
+# or run under CBSD" and exited 2, so THE ESTATE WAS NEVER GATED on any node
+# this unit was installed on. Measured in the guest, with cbsdd stopped the way
+# boot has not started it yet: the symlink works there and the dispatcher does
+# not.
 seance_gate_find_program()
 {
-    local _link _dir
+    local _link
 
     [ -n "${seance_gate_program}" ] && return 0
 
@@ -87,14 +96,9 @@ seance_gate_find_program()
     [ -n "${cbsd_workdir:-}" ] || return 1
 
     _link="${cbsd_workdir}/modules/seance"
-    [ -e "${_link}" ] || return 1
+    [ -x "${_link}" ] || return 1
 
-    _dir=$( realpath "${_link}" 2>/dev/null ) || return 1
-    _dir=${_dir%/*}
-
-    [ -x "${_dir}/bin/seance" ] || return 1
-
-    seance_gate_program="${_dir}/bin/seance"
+    seance_gate_program="${_link}"
     return 0
 }
 

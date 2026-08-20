@@ -112,7 +112,9 @@ usage: seance <verb> [args]
 
 Verbs:
   repl [--guest <g>] [--peer <p>] [--dry-run] [--now]
-                     run one replication tick: snapshot, send, prune, record
+                     run one replication tick: snapshot, send, prune, record.
+                     --locked is internal: it is how a tick re-enters itself
+                     under lockf(1) for one pair, and takes no snapshot
   status [--tsv]     the one screen: guests, replica freshness, mesh health
   verify [--render cron|carp|devd]
                      render the configuration seance expects and diff it
@@ -246,10 +248,13 @@ seance_status()
 
 # seance_verify [--render <what>]
 #
-# `--render cron` needs nothing but the configuration, and is answerable on a
-# workstation. `--render carp` and `--render devd` need this node's identity --
-# which vhids it carries depends on which node it IS -- and identity is the
-# adapter's fact, so those two bring the adapter up first.
+# EVERY rendering needs the adapter. `--render carp` and `--render devd` need
+# this node's identity -- which vhids it carries depends on which node it IS.
+# `--render cron` needs the platform's own verb: the line names the command
+# cron will run with no environment at all, and only the platform can say what
+# that command is (D-117; and repl_cron_line's header for the fresh install
+# this cost). It used to be answerable on a workstation, which is what let it
+# render a command that cannot run.
 seance_verify()
 {
     local _render
@@ -274,7 +279,7 @@ seance_verify()
 
     if [ -n "${_render}" ]; then
         case "${_render}" in
-            carp|devd)
+            cron|carp|devd)
                 seance_adapter_init
                 seance_tmp_init
                 ;;

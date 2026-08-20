@@ -797,7 +797,28 @@ and every claim below is now an assertion in `tests/tier5/` rather than a note:
   snapshot (`tests/tier5/t_promote_real.sh`);
 - three upstream defects that were invisible from the source alone: `cbsd
   emulator` (§8.7), jls's unfiltered unregistered area (§8.8) and CBSD's
-  refusals arriving on stdout (§8.9).
+  refusals arriving on stdout (§8.9);
+- **and, from M5, the whole of §1's and §2's install story, run rather than
+  read** (`tests/tier5/t_install_real.sh`). On a node this file's §1 describes:
+  the unattended form `env NOINTER=1 ALWAYS_YES=1 sudoexec/initenv`, with no
+  preseed and no `workdir=`, exits 0 on a node that has already been
+  initialised and prints `Installing module seance.d cmd: seance` at stage 8;
+  stage 8 plants `${workdir}/modules/seance` as a symlink to the module's
+  ROOT VERB WRAPPER and not to anything under `bin/`, which is the fact three
+  of seance's own call sites had got wrong; `cbsd help` lists the verb;
+  `cbsd seance <verb>` answers; and removing the `modules.conf` line and
+  re-running the same initenv form removes the symlink, sets
+  `mod_seance_enabled="NO"` in `nc.inventory`, and leaves the module's own
+  configuration and state where they were.
+
+**One platform fact this settled that is not CBSD's**, recorded here because it
+is where an installer will look: **`/usr/local/etc/cron.d` does not exist on a
+stock FreeBSD node.** `cron(8)` reads it and `crontab(5)` documents it, and
+nothing creates it — so the `verify --render cron > /usr/local/etc/cron.d/seance`
+this project's own documents printed failed with "No such file or directory"
+and installed nothing. `/etc/cron.d` does exist. Both are accepted by
+`seance verify`; the third-party directory is the one seance ships into, and
+the documents now create it first.
 
 **Still not established, and why.**
 

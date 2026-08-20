@@ -128,7 +128,14 @@ t_like "$( seance promote-event 1@vtnet0 extra 2>&1 )" \
 # verify --render
 # ---------------------------------------------------------------------------
 
-t_rc 0 "verify --render cron still needs no adapter" -- seance verify --render cron
+# --render cron needs the adapter TOO, and that is an M5 change made because
+# the old contract was what let it render a command that cannot run: the line
+# names what cron will execute with an environment of its own, and only the
+# platform can say what runs a seance verb there (D-117). Rendered from
+# bin/seance the line exited 2 with "no config file" every time cron fired it,
+# on every freshly installed node, while `verify` called the line correct.
+t_like "$( seance verify --render cron 2>&1 )" 'no adapter at' \
+    "verify --render cron needs the adapter: the line names the platform's verb"
 t_rc 2 "verify --render with an unknown subject is a usage error" -- \
     seance verify --render exorcism
 t_like "$( seance verify --render exorcism 2>&1 )" 'known: cron carp devd' \

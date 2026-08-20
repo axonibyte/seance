@@ -39,7 +39,7 @@ directive()
     sed -n -e "s/^# *$2: *//p" "$1" | head -1
 }
 
-t_plan 16
+t_plan 20
 
 t_rc 0 "rc.d/seance_gate exists and is executable" -- test -x "${UNIT}"
 
@@ -64,9 +64,47 @@ t_like "$( cat "${UNIT}" )" 'seance_gate_enable:=NO' \
     "and it is disabled by default: a unit that withheld guests the day it landed would be a surprise"
 
 t_like "$( cat "${UNIT}" )" 'seance_gate_program' \
-    "the dispatcher's path can be overridden from rc.conf"
+    "the command's path can be overridden from rc.conf"
 t_like "$( cat "${UNIT}" )" 'modules/seance' \
     "and is otherwise derived from the verb symlink the platform's own initialisation plants"
+
+# ---------------------------------------------------------------------------
+# WHAT THE UNIT RUNS, and the M5 defect that makes it worth a guard
+#
+# The unit resolved that verb symlink and then walked PAST it to bin/seance
+# underneath. bin/seance is the plain dispatcher, and it learns which node it
+# is on only from what the module's verb wrapper exports (D-2) -- so run from
+# rc(8), with no environment at all, it printed
+#
+#     err: no config file: set SEANCE_CONF, or run under CBSD
+#
+# and exited 2, and the unit's own diagnostic said THE ESTATE HAS NOT BEEN
+# GATED. Every node this unit was installed on booted ungated. Measured in the
+# guest, with cbsdd stopped the way boot has not started it yet: the symlink
+# answers and the dispatcher does not.
+#
+# The code line is what is asserted, not the prose: this file's own header and
+# the unit's now both NAME bin/seance in comments, in order to say why it is
+# not the thing to run.
+# ---------------------------------------------------------------------------
+
+CODE=$( grep -v '^[[:space:]]*#' "${UNIT}" )
+
+t_unlike "${CODE}" 'bin/seance' \
+    "no code line in the unit names bin/seance: rc(8) cannot run the plain dispatcher"
+t_like "${CODE}" 'seance_gate_program="\$\{_link\}"' \
+    "what it runs IS the platform's verb symlink, which carries this node's facts"
+
+t_like "${CODE}" '\[ -x "\$\{_link\}" \]' \
+    "and it checks the symlink is executable before it believes in it"
+
+# The mutation, which is the defect itself: a unit that resolves the link and
+# then runs the dispatcher behind it.
+MUT=$( t_tmpdir )/walked-past
+sed -e 's|seance_gate_program="${_link}"|seance_gate_program="${_link%/*}/bin/seance"|' \
+    "${UNIT}" > "${MUT}"
+t_like "$( grep -v '^[[:space:]]*#' "${MUT}" )" 'bin/seance' \
+    "a unit that walks past the symlink to bin/seance is caught"
 
 # Mutation checks, permanent: a guard never observed failing has unmeasured
 # value, and the ordering is the thing that rots silently.
