@@ -10,19 +10,29 @@ are not test-suite stages and nothing in `tests/` runs them. What each drill
 produces — the evidence — is written down here so that "the drill passed" is a
 checkable claim rather than a recollection.
 
-| Drill | Gates | Status |
+| Drill | Gates | Status at v0.5.0 |
 | --- | --- | --- |
 | drill-replication | M1 | **documented below; fleet execution pending** |
 | drill-guest | M2 | **documented below; fleet execution pending** |
-| drill-failback | M2 | **the second half of drill-guest; runnable alone** |
+| drill-failback | M2 | **the second half of drill-guest; runnable alone; fleet execution pending** |
 | drill-node | M3 | **documented below; timings measured in shape A; fleet execution pending** |
-| drill-fence | M4 | **documented below; the driver it fences with (`drivers/fence_ipmi`) ships at M4 — fleet execution pending both** |
+| drill-fence | M4 | **documented below; `drivers/fence_ipmi` has shipped and has never powered off a machine; fleet execution pending** |
+
+**All five are pending on a fleet, and that is the whole of what this product
+has not proven.** README's status section says the same thing in the same
+words: the harness proves mechanisms at tiers 1–7, and every claim about real
+hardware — a real BMC, a real power cut, a real `devd(8)` rule firing on a
+physical segment, a bhyve guest that has ever booted — is one of these drills
+and nothing else.
 
 Config keys `node_<key>_fence_driver` and `node_<key>_fence_target` are
 already parsed, shape-checked and exercised against the mock/jail drivers from
-M2 onward (`tests/tier4/t_fence_contract.sh`) — what M4 adds is the one real
-driver these config keys are for, `drivers/fence_ipmi`, and the credentials it
-reads from `docs/fence-drivers.md`'s file, never from `seance.conf` itself.
+M2 onward (`tests/tier4/t_fence_contract.sh`), and the one real driver they are
+for — `drivers/fence_ipmi`, with the credentials it reads from
+`docs/fence-drivers.md`'s file and never from `seance.conf` itself — shipped at
+M4 and carries a 177-assertion tier-1 battery against a scripted `ipmitool`.
+What none of that is, is a machine that has been powered off: that is this
+drill, and it has not been run.
 
 ---
 
@@ -214,8 +224,10 @@ it that is.
   replica **fresh** on the heir. Note the heir; call it `<heir>`.
 - The heir has room: the guest's estate fits, and `zfs list` on the heir says
   so rather than somebody's memory.
-- `seance placement` is runnable as the ssh user on every node (a link to
-  `bin/seance` on that user's PATH). Test it: `ssh <heir> seance placement`.
+- `seance placement` is runnable as the ssh user on every node (a link to the
+  module's verb wrapper — the `seance` file at the module root — on that user's
+  PATH; `bin/seance` is not it, see `docs/INSTALL.md` §4). Test it:
+  `ssh <heir> seance placement`.
 - `rc.d/seance_gate` is installed and `seance_gate_enable="YES"` on the home
   node. Confirm with `service seance_gate status` or by reading rc.conf; a
   drill that skips the gate is not testing the half that matters most.
