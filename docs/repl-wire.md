@@ -250,7 +250,15 @@ The crontab line fires at the shortest cadence in the fleet, and each guest
 decides for itself whether it is due, from its own lag records (D-61). One
 entry, whatever the spread of per-guest cadences:
 
-    */1 * * * * root /usr/local/cbsd/modules/seance.d/bin/seance repl
+    */1 * * * * root /usr/local/bin/cbsd seance repl
+
+The command is the PLATFORM'S verb, which `adapter_fact verb` answers with
+(D-117), and not the dispatcher under `bin/`. cron(8) gives a job `PATH`,
+`HOME`, `LOGNAME` and `SHELL` and nothing else, and the dispatcher learns which
+node it is on only from what the module's verb wrapper exports (D-2) -- so a
+line naming `bin/seance` exits 2 with "no config file" every time cron fires
+it, for ever, while `verify` reports the line as correctly installed. Measured
+in the guest at M5.
 
 The comparison runs in BOTH directions (D-141, ruled on in D-152). A lag
 record more than `skew_tolerance` in the FUTURE is a clock that moved, not a

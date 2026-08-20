@@ -99,7 +99,17 @@ verify_render()
 
     case "${1:-}" in
         cron)
-            repl_cron_line
+            # NOT `repl_cron_line; return 0`. A rendering that exits 0 having
+            # printed nothing is the empty-output-with-success class this
+            # repository keeps finding (TESTING.md §5), and here it would be
+            # redirected straight into a crontab file by the very command the
+            # WARN below prints.
+            repl_cron_line || {
+                seance_log err "verify --render cron: this platform cannot say" \
+                    "how it runs a seance verb, so there is no command to put" \
+                    "in a crontab line"
+                return 1
+            }
             return 0
             ;;
         carp|devd)
@@ -181,7 +191,13 @@ verify_cron()
     if [ -z "${_found}" ]; then
         verify_warn "cron: no crontab fragment at ${VERIFY_CRON_PREFERRED} or ${VERIFY_CRON_ALSO};" \
             "replication is not scheduled"
-        printf '     install it with:  seance verify --render cron > %s\n' \
+        # The mkdir is not decoration. /usr/local/etc/cron.d is a directory
+        # cron(8) reads and nothing creates: on a stock FreeBSD node with CBSD
+        # installed it does not exist, so the one-line form of this hint fails
+        # with "No such file or directory" and leaves the operator believing
+        # replication is scheduled. Measured in the guest.
+        printf '     install it with:  mkdir -p %s\n' "${VERIFY_CRON_PREFERRED%/*}"
+        printf '                       seance verify --render cron > %s\n' \
             "${VERIFY_CRON_PREFERRED}"
         return 0
     fi

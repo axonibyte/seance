@@ -57,7 +57,7 @@ doc_force_names()
         sed -e 's/^--force=//' | grep . | LC_ALL=C sort -u
 }
 
-t_plan 13
+t_plan 16
 
 # ---------------------------------------------------------------------------
 # --force's vocabulary
@@ -179,6 +179,70 @@ if [ "${CHECKED}" -ge 10 ]; then
 else
     t_not_ok "and there were ${CHECKED} of them to check: the guard is not scanning an empty set"
 fi
+
+# ---------------------------------------------------------------------------
+# The mesh link, which is a command every install document tells an operator
+# to type and which named the wrong file until M5
+# ---------------------------------------------------------------------------
+#
+# `seance placement` is what one node runs on another over ssh, and it is
+# reached through a link on the ssh user's PATH. The link has to be the
+# module's VERB WRAPPER -- the `seance` file at the module root -- because the
+# dispatcher under bin/ is not told which node it is on (D-2). Linked to
+# bin/seance it answers `no config file` and exits 2, which every reader of a
+# placement query treats as a peer that COULD NOT REPORT (D-96): the gate then
+# withholds whole estates, `promote` aborts and `failback` refuses, fleet-wide,
+# because of an install instruction. Measured in the guest at M5; both forms
+# were run, and only the wrapper answered.
+#
+# The check is over CODE CONTEXT only, like every other guard here: prose that
+# says "not bin/seance" is the documentation doing its job.
+
+LINKDOCS="${T_ROOT}/README.md ${T_ROOT}/docs/INSTALL.md ${T_ROOT}/docs/RUNBOOK-failback.md ${T_ROOT}/docs/DRILLS.md"
+
+# ln_targets <doc>  -- the source path of every `ln -s <src> <dst>` a document
+# shows in a fenced block or a backtick span.
+ln_targets()
+{
+    awk '
+        /^```/ { fence = 1 - fence; next }
+        fence  { print; next }
+        {
+            line = $0
+            while (match(line, /`[^`]*`/)) {
+                print substr(line, RSTART + 1, RLENGTH - 2)
+                line = substr(line, RSTART + RLENGTH)
+            }
+        }
+    ' "$1" | awk '$1 == "ln" { for (i = 2; i <= NF; i++) if ($i !~ /^-/) { print $i; break } }'
+}
+
+BADLINK=""
+LINKS=0
+for d in ${LINKDOCS}; do
+    for tgt in $( ln_targets "${d}" ); do
+        LINKS=$(( LINKS + 1 ))
+        case "${tgt}" in
+            */bin/seance) BADLINK="${BADLINK} ${d##*/}:${tgt}" ;;
+        esac
+    done
+done
+
+t_is "${BADLINK}" "" \
+    "no document tells an operator to link bin/seance onto the mesh's PATH"
+if [ "${LINKS}" -ge 1 ]; then
+    t_ok "and there were ${LINKS} 'ln' command(s) to check: the guard is not scanning an empty set"
+else
+    t_not_ok "and there were ${LINKS} 'ln' command(s) to check: the guard is not scanning an empty set"
+fi
+
+# The mutation: the instruction as it was written before M5.
+# shellcheck disable=SC2016
+#   The single quotes are the point: this is Markdown source being written.
+printf '```sh\nln -s /usr/local/cbsd/modules/seance.d/bin/seance /usr/local/bin/seance\n```\n' \
+    > "${SCRATCH}/link.md"
+t_isnt "$( ln_targets "${SCRATCH}/link.md" | grep -c '/bin/seance$' )" "0" \
+    "a document that links bin/seance is caught"
 
 # The mutation: a runbook that quotes a message nobody prints any more.
 # shellcheck disable=SC2016

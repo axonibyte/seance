@@ -1,0 +1,246 @@
+# seance.conf -- sample site configuration.
+#
+# Install as ${workdir}/etc/seance.conf on EVERY node, identical on all of
+# them, 0600 root:wheel once it names fence credentials. seance never copies
+# this file between nodes and never will: automatic propagation of a file that
+# names how to power a machine off is a footgun, so distribution is the
+# administrator's job and `seance verify` diffs the file across the mesh and
+# complains loudly when it differs.
+#
+# Grammar: one key=value per line; leading whitespace is ignored; a line whose
+# first non-blank character is '#' is a comment; there is no quoting, so the
+# value is the rest of the line with trailing whitespace removed -- including
+# any '#', which is part of the value and not a comment. Keys are [a-z0-9_]+.
+# A key seance does not know, a duplicate key, and a CRLF line ending are all
+# errors, reported by `seance config --check` with file and line.
+#
+# Everything below that is commented out shows the built-in default. Uncomment
+# only what this site actually changes: the shortest config that works is the
+# one an operator can still read at 03:00.
+#
+# The site in this sample is fictional -- three nodes named alpha, bravo and
+# charlie in a succession ring. Real site facts do not live in this repository.
+
+# ---------------------------------------------------------------------------
+# Fleet defaults
+#
+# Every key here can be overridden per guest (where marked) with
+# guest_<guest>_<key>.
+# ---------------------------------------------------------------------------
+
+# How often `seance repl` takes and ships a snapshot, in seconds. Per-guest
+# overridable. The floor is 60: below a minute the send has not finished
+# before the next tick fires, and the schedule becomes a queue.
+#cadence=900
+
+# Retention, in seconds of age. Everything younger than retention_recent is
+# kept; between retention_recent and retention_hourly the newest snapshot of
+# each UTC hour survives; older than retention_hourly is pruned. Pruned
+# identically on the source and on every replica. Defaults: 4 hours and 48
+# hours.
+#retention_recent=14400
+#retention_hourly=172800
+
+# How old a replica may be before promotion calls it stale and demands
+# --force, in seconds. Per-guest overridable. Unset means three times the
+# cadence THAT GUEST gets, so tightening a guest's cadence tightens its
+# staleness window with it. At exactly staleness_max a replica is still fresh.
+#staleness_max=2700
+
+# How far into the future a timestamp may be before it is treated as clock
+# skew rather than as a fresh snapshot, in seconds. This is a tolerance, not a
+# substitute for NTP; `seance verify` measures the real pairwise clock delta.
+#skew_tolerance=120
+
+# How long an automatic promotion waits, in seconds, before re-checking that
+# the CARP transition that woke it is still true. Flapping links produce
+# transient masters.
+#debounce=45
+
+# How long a fence driver has to prove a node is powered off, in seconds.
+# "Command accepted" is not "off"; the driver must verify within this budget
+# or the ladder stops at notify.
+#fence_timeout=60
+
+# Node-to-node ssh. The port is 22 because that is ssh's port; a site that
+# moves it says so here rather than in seance's source.
+#ssh_user=root
+#ssh_port=22
+
+# Extra options passed to every ssh and every zfs send/recv transport, verbatim
+# and unquoted. Intended for the options a site cannot express any other way
+# -- a jump host, a shorter ConnectTimeout, a non-default known-hosts file.
+# Unset by default.
+#ssh_extra_opts=-o ConnectTimeout=5
+
+# Where replicas land: <standby_root>/<home-node-key>/<dataset tail>. Unset
+# means seance derives it at run time from the pool that carries this node's
+# guest data, which is why no pool name is written down anywhere in seance.
+#standby_root=mypool/standby
+
+# A command run for every notification: the subject arrives as $1 and the body
+# on stdin. Its exit status is logged and is never fatal -- a promotion must
+# not die because mail did. Unset means syslog only, which is the default and
+# is the whole notification feature.
+#notify_cmd=/usr/local/bin/seance-notify
+
+# A tiebreaker host making the voting population odd. Documented for even-N
+# sites and NOT implemented at v1: with N=2, quorum is unformable the moment
+# the peer dies and seance degrades to notify plus a human running --force.
+#witness=witness.example.net
+
+# ---------------------------------------------------------------------------
+# CARP: how a node learns that another one has died
+#
+# One vhid per NODE IDENTITY (not per guest), carrying an address that is a
+# heartbeat token and nothing else -- guests keep their own addresses wherever
+# they run. Each node holds its own vhid at advskew 0, its heir's at 100 and
+# its second heir's at 200, so the survivor CARP promotes is the survivor the
+# succession map already named.
+#
+# seance PRESCRIBES this and never writes it: `seance verify --render carp`
+# prints the rc.conf lines this node should carry and diffs them against
+# sysrc(8) and against live ifconfig(8). Applying them is the administrator's.
+# ---------------------------------------------------------------------------
+
+# The interface the vhids run on. Required as soon as any node has a vhid;
+# there is no default, because guessing which interface carries a cluster's
+# heartbeat is not a guess seance is entitled to make.
+#carp_interface=vtnet0
+
+# The shared secret that authenticates CARP advertisements (carp(4), "pass").
+# One word. It is rendered into rc.conf, so the file that carries it should be
+# mode 0600 -- `verify` says so when it is not. Unset means unauthenticated
+# advertisements, which `verify` warns about and does not refuse.
+#carp_pass=changeme
+
+# Whether this fleet may promote without a human at all. 0 (the default) makes
+# every devd event notify-only whatever else is configured; 1 arms the nodes
+# that also name a peer in their own auto_promote list. Two switches rather
+# than one on purpose: the fleet-wide one is the thing an operator turns off in
+# a hurry.
+#auto=0
+
+# ---------------------------------------------------------------------------
+# Nodes
+#
+# One block per node, keyed by a short name of [a-z0-9]+ -- that key is what
+# appears in snapshot names (@seance-<key>-<timestamp>), which is why it is
+# dash-free and lowercase while the real hostname need not be.
+#
+#   node_<key>_nodename       this node's CBSD node name. Required. It is how
+#                             a running node recognises itself in this file.
+#   node_<key>_mgmt           the address peers reach it on. Required, and it
+#                             must be that node's alone: everything that counts
+#                             nodes counts KEYS and probes their addresses one
+#                             at a time, so two keys sharing an address make
+#                             one living host answer twice and a quorum
+#                             arithmetic that is not the fleet's. `config
+#                             --check` refuses it.
+#   node_<key>_heir           the node that inherits its guests.
+#   node_<key>_heir2          the node that inherits them if the first heir is
+#                             itself unreachable.
+#   node_<key>_fence_driver   the fence driver to use against this node.
+#   node_<key>_fence_target   the name of an ENTRY the driver looks up, not an
+#                             address -- for fence_ipmi, a token of [a-z0-9]+
+#                             naming a target_<name>_* block in
+#                             ${workdir}/etc/seance-fence-ipmi.conf (host,
+#                             user and passfile live there, never here; see
+#                             docs/fence-drivers.md). Other drivers may define
+#                             their own lookup file with the same convention.
+#   node_<key>_standby_root   overrides the fleet standby_root (above) for
+#                             replicas landing on THIS node -- this node's own
+#                             opinion of its layout, and it beats the fleet
+#                             setting and the %n substitution both. Optional;
+#                             unset means the fleet standby_root (with its %n
+#                             substituted for this node's key) applies, and
+#                             failing that, the derived default.
+#   node_<key>_vhid           the CARP virtual host ID that stands for this
+#                             node's identity, 1-255 and unique across the
+#                             fleet. Every node runs every vhid; whose it is
+#                             decides the advskew (0 here, 100 on its heir,
+#                             200 on its second heir).
+#   node_<key>_vhid_ip        the address that vhid carries, with a prefix
+#                             length -- <dotted-quad>/<prefix-length>. A
+#                             heartbeat token, not a service address: nothing
+#                             connects to it, and /32 is the usual answer.
+#                             Written as <addr> below rather than as an example
+#                             address, because no shipped seance file may carry
+#                             an IPv4 literal (TESTING.md §4, the tenant
+#                             guard); the real file has a real address there.
+#   node_<key>_carp_interface overrides the fleet carp_interface (above) for
+#                             THIS node. Optional; a fleet of identical
+#                             hardware never needs it, and a fleet whose nodes
+#                             name their interfaces differently can only say so
+#                             here, because this file is byte-identical across
+#                             the mesh.
+#   node_<key>_auto_promote   the dead-node keys THIS node may promote without
+#                             a human when devd reports it has become CARP
+#                             MASTER for their vhid. Space separated; empty
+#                             (the default) is notify-only. Each name must be a
+#                             node whose heir or heir2 this node is, and the
+#                             fleet key `auto` must be 1 as well -- either
+#                             switch alone leaves automation disarmed.
+#
+# Fencing keys are parsed and shape-checked from v1 but are not used until the
+# fencing milestone. A display name for a node whose real name is not
+# [a-z0-9]+ goes in names_<key>.
+#
+# The succession here is a ring: alpha's estate goes to bravo, bravo's to
+# charlie, charlie's back to alpha, each with the third node as second heir.
+# A ring keeps the mental model to one sentence, which matters more at 03:00
+# than any cleverer arrangement.
+# ---------------------------------------------------------------------------
+
+node_alpha_nodename=alpha.example.net
+node_alpha_mgmt=alpha-mgmt.example.net
+node_alpha_heir=bravo
+node_alpha_heir2=charlie
+#node_alpha_fence_driver=ipmi
+#node_alpha_fence_target=alpha
+#node_alpha_standby_root=mypool/standby
+#node_alpha_vhid=1
+#node_alpha_vhid_ip=<addr>/32
+#node_alpha_carp_interface=vtnet1
+# bravo is alpha's heir, so bravo is the node that may act on alpha's death:
+#node_bravo_auto_promote=alpha
+
+node_bravo_nodename=bravo.example.net
+node_bravo_mgmt=bravo-mgmt.example.net
+node_bravo_heir=charlie
+node_bravo_heir2=alpha
+#node_bravo_fence_driver=ipmi
+#node_bravo_fence_target=bravo
+#node_bravo_vhid=2
+#node_bravo_vhid_ip=<addr>/32
+
+node_charlie_nodename=charlie.example.net
+node_charlie_mgmt=charlie-mgmt.example.net
+node_charlie_heir=alpha
+node_charlie_heir2=bravo
+#node_charlie_fence_driver=ipmi
+#node_charlie_fence_target=charlie
+#node_charlie_vhid=3
+#node_charlie_vhid_ip=<addr>/32
+
+# Display names, for a node or guest whose real name is not [a-z0-9]+.
+#names_alpha=alpha.example.net
+
+# ---------------------------------------------------------------------------
+# Per-guest overrides
+#
+# Only these four keys may be overridden per guest, and only for guests that
+# want something different from the fleet. A guest with no block here inherits
+# everything, which is the arrangement to aim for.
+#
+# A guest that names its own heir replaces its home node's succession
+# ENTIRELY: naming a first heir means the succession has been thought about,
+# and quietly appending the node's second heir behind it would restore the
+# arrangement the override was written to escape. guest_<g>_heir2 without
+# guest_<g>_heir is therefore an error, not a half-override.
+# ---------------------------------------------------------------------------
+
+#guest_db01_cadence=300
+#guest_db01_staleness_max=900
+#guest_db01_heir=charlie
+#guest_db01_heir2=bravo

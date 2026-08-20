@@ -33,10 +33,14 @@
 # written to permit.
 #
 # THE REMOTE COMMAND. `seance placement` must be runnable as ssh_user on every
-# peer -- on a CBSD node that means a link to the module's dispatcher somewhere
-# on root's PATH, because CBSD's own PATH (cbsd.conf:119) belongs to cbsdsh and
-# not to an ssh session. It is documented as a mesh prerequisite in README and
-# in docs/RUNBOOK-failback.md rather than guessed at here.
+# peer -- on a CBSD node that means a link to the module's VERB WRAPPER (the
+# `seance` file at the module root) somewhere on root's PATH, because CBSD's
+# own PATH (cbsd.conf:119) belongs to cbsdsh and not to an ssh session. Not to
+# bin/seance: the dispatcher under bin/ is not told which node it is on and
+# answers `no config file` over ssh, which every caller here reads as a peer
+# that could not report -- the fail-safe firing on an install instruction. It
+# is documented as a mesh prerequisite in README, docs/INSTALL.md §4 and
+# docs/RUNBOOK-failback.md rather than guessed at here.
 #
 # shellcheck shell=sh
 # shellcheck disable=SC3043

@@ -459,7 +459,7 @@ t_rc 2 "repl --peer naming a node nothing replicates to is a contract error" \
 # ---------------------------------------------------------------------------
 
 CRON=$( node_seance alpha verify --render cron )
-t_like "${CRON}" '^\*/1 \* \* \* \* root /usr/local/seance/bin/seance repl$' \
+t_like "${CRON}" '^\*/1 \* \* \* \* root /usr/local/bin/seance repl$' \
     "verify --render cron renders a crontab(5) system line at the shortest cadence"
 
 t_rc 2 "verify --render of a subject it does not know is a contract error" \
