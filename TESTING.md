@@ -20,6 +20,22 @@ to pass: **the defect catalog already exists.** The August 2026 migration
 produced real failures with known mechanisms; the harness must rediscover
 them when their protections are reverted (§8 below).
 
+**A tier tests the caller's environment, not the harness's** (owner's rule,
+2026-08-22; the M5 lesson, D-163/D-166/D-169). Every entry point ships with
+a caller — cron(8) with its five-variable environment, devd(8) forking
+`sh -c` as root, rc(8) before anything else is up, an operator's ssh with no
+CBSD context, a terminal for the wizard — and a test that invokes the entry
+point with an environment richer than its real caller provides has tested a
+configuration that does not exist. Before M5, every tier did exactly that,
+and three shipped call sites were dead in production shape while their
+milestones read green: the boot gate exited 2 at every real boot, a fresh
+install's crontab line could never run, and the documented mesh prerequisite
+made every peer unable to report. The rule: for each entry point, at least
+one test constructs the real caller's environment from scratch — empty env,
+the caller's own PATH, the caller's own stdin/stdout — and the fresh-eyes
+install stage (tier 5 `install`) follows the install document literally on a
+clean guest, because the document is an entry point too.
+
 ## 1. Where tests run
 
 Workstation — the owner's FreeBSD desktop, where Claude Code and reaper both
