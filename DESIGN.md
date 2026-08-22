@@ -4,13 +4,13 @@
 
 *Design document v0.2 — 2026-08-16. Status: FOR TEARDOWN. No code exists; nothing here is settled until it survives review. Open decisions are marked ⟡. v0.2 adds: the decoupling/open-source contract (§14), configuration UX (§15), and the reaper-hosted testing strategy (§16 + TESTING.md), following review of the reaper framework and the proven freebsd-15.1 guest template.*
 
-*Naming: the project and module are `seance` — the mechanism literally raises a dead node's guests to run through a living host. ("vigil" is reserved for a future AxB security product and is not used anywhere in this project.)*
+*Naming: the project and module are `seance` — the mechanism literally raises a dead node's guests to run through a living host. ("vigil" is reserved for a future security product and is not used anywhere in this project.)*
 
 ---
 
 ## 1. Purpose and non-goals
 
-seance gives the axb-okc-hyp cluster what GlusterFS promised and never delivered: when a node dies, its guests come back on a survivor in minutes, automatically where that is provably safe and manually everywhere else. It is built AxB-first and site-specific, but designed for extraction: the CBSD-facing surface is isolated behind an adapter so the module can eventually ship through CBSD's external-module ecosystem (`cbsd seance <verb>`) without a rewrite.
+seance gives tenant zero's three-node bhyve/jail cluster what GlusterFS promised and never delivered: when a node dies, its guests come back on a survivor in minutes, automatically where that is provably safe and manually everywhere else. It is built tenant-first and site-specific, but designed for extraction: the CBSD-facing surface is isolated behind an adapter so the module can eventually ship through CBSD's external-module ecosystem (`cbsd seance <verb>`) without a rewrite.
 
 Non-goals, stated so they stay dead: no shared storage of any kind (the gluster lesson is load-bearing); no live migration (planned evacuation uses CBSD's own tooling); no synchronous replication (this is crash-consistent, minutes-stale failover, not zero-RPO HA); no support for hypervisors other than bhyve and no container runtimes other than CBSD jails; no rewriting of host network configuration (seance verifies CARP, it does not own it).
 
@@ -25,13 +25,13 @@ Two components, one hard boundary:
 Adapter interface (the contract, first cut — teardown target):
 
     node_self                       -> nodename
-    node_peers                      -> list of (nodename, mgmt_ip, idrac_ip)
+    node_peers                      -> list of (nodename, mgmt_ip, bmc_ip)
     guest_list [node]               -> list of (name, type, home_node, ram, autostart)
     guest_type <name>               -> bhyve | jail
     guest_start <name>              -> rc            # dispatches bstart/jstart by type
     guest_stop <name>               -> rc            # bstop/jstop, ACPI-graceful where possible
     guest_running <name>            -> boolean       # pgrep bhyve / jls, by type
-    guest_datasets <name>           -> list of datasets under zroot/cbsd
+    guest_datasets <name>           -> list of datasets under <pool>/cbsd
     guest_register <name> <node>    -> rc            # make guest startable here (pre-registration model)
     kernel_version                  -> freebsd-version -k   # homogeneity precondition
     carp_state <vhid>               -> MASTER | BACKUP | absent
@@ -44,7 +44,7 @@ Guests carry a `type` (bhyve today; jail supported in the contract from day one,
 
 ## 4. Layer 1 — replication (`seance repl`)
 
-Bespoke, in-module, sh. ⟡ *Decision made in discussion (bespoke over zrepl) — confirm at teardown.* The engine per tick, per guest, per peer: snapshot the guest's dataset tree atomically (`zfs snapshot -r`), incremental send from the last peer-acknowledged snapshot to the peer's `zroot/standby/<home>-cbsd/...`, prune both ends per retention, record lag. Non-negotiables encoded from history: every receive is `-u -x mountpoint -x canmount` (the shadow-mount law); standby parents stay `canmount=noauto, mountpoint=none` forever; a per-guest-per-peer lockfile so runs never overlap; resumable sends via `-s` and receive tokens so a fat interrupted delta continues instead of restarting.
+Bespoke, in-module, sh. ⟡ *Decision made in discussion (bespoke over zrepl) — confirm at teardown.* The engine per tick, per guest, per peer: snapshot the guest's dataset tree atomically (`zfs snapshot -r`), incremental send from the last peer-acknowledged snapshot to the peer's `<pool>/standby/<home>-cbsd/...`, prune both ends per retention, record lag. Non-negotiables encoded from history: every receive is `-u -x mountpoint -x canmount` (the shadow-mount law); standby parents stay `canmount=noauto, mountpoint=none` forever; a per-guest-per-peer lockfile so runs never overlap; resumable sends via `-s` and receive tokens so a fat interrupted delta continues instead of restarting.
 
 **Snapshot naming is the wire protocol** (per the state-model principle, a survivor must determine lineage and staleness from names alone):
 
@@ -52,7 +52,7 @@ Bespoke, in-module, sh. ⟡ *Decision made in discussion (bespoke over zrepl) �
 
 UTC always. The newest common `@seance-*` snapshot between a replica and its source defines the incremental base; the newest replica snapshot's timestamp *is* the staleness. No database, no queries to the possibly-dead.
 
-Cadence and retention are per-guest config with a fleet default: ⟡ default 15 min; proposed overrides webdb01=5 min, crowdeasedev01=60 min; artifact01 gets a `pause`/`resume` hook (or an accepted fat delta) around poudriere bulks. Retention: keep all of the last 4 hours, hourly to 48 hours, then gone — pruned identically on source and replica. Crash-consistency is the stated model (a promoted webdb01 boots as from power loss; InnoDB replays); a pre-snapshot hook point exists per guest for future quiesce ceremony, unused at v1.
+Cadence and retention are per-guest config with a fleet default: ⟡ default 15 min; proposed overrides db01=5 min, dev01=60 min; build01 gets a `pause`/`resume` hook (or an accepted fat delta) around poudriere bulks. Retention: keep all of the last 4 hours, hourly to 48 hours, then gone — pruned identically on source and replica. Crash-consistency is the stated model (a promoted db01 boots as from power loss; InnoDB replays); a pre-snapshot hook point exists per guest for future quiesce ceremony, unused at v1.
 
 `seance repl` runs from cron (the module installs the crontab line); it is not a daemon. Lag surfaces in `status` and trips a warning threshold (default: 3 missed intervals).
 
@@ -65,13 +65,13 @@ The promotion decision consumes only locally observable facts (CARP transitions,
 The map is explicit config, not discovery — pre-agreed inheritance so exactly one survivor acts per failure:
 
     # guest-or-node -> heir -> second heir
-    2a: 2c 2b        ⟡ proposed ring: 2c←2a, 2a←2b, 2b←2c
-    2b: 2a 2c        #   alternative: 2b←2a (keeps repo + web stack on
-    2c: 2b 2a        #   separate survivors post-failover) — CHOOSE AT TEARDOWN
+    alpha:   charlie bravo   ⟡ proposed ring: charlie←alpha, alpha←bravo, bravo←charlie
+    bravo:   alpha charlie   #   alternative: bravo←alpha (keeps two heavy estates on
+    charlie: bravo alpha     #   separate survivors post-failover) — CHOOSE AT TEARDOWN
 
-Memory math holds in all arrangements (worst estate: 2a's 64G onto a 128G survivor). The ring proposal puts 2a's estate — the likeliest to move, given the H730 — on 2c, the drilled pilot. Per-guest heir overrides are supported but discouraged (whole-estate moves keep the mental model simple).
+Memory math holds in all arrangements (worst estate: alpha's 64G onto a 128G survivor). The ring proposal puts 2a's estate — the likeliest to move, given the suspect RAID controller — on charlie, the drilled pilot. Per-guest heir overrides are supported but discouraged (whole-estate moves keep the mental model simple).
 
-CARP: three vhids, one per node identity, advskew encoding the map (owner 0, heir 100, second heir 200). The vhid IPs are heartbeat tokens only — guests keep their own MACs and DHCP identities wherever they run. seance *prescribes* the CARP config (`seance verify` renders the expected rc.conf lines and diffs reality) but never writes host network config. Known caveat from this week, stated in verify's output: bridge-MAC behavior on 15 is settled via FortiGate reservations; CARP vhid MACs are derived from vhid numbers and are stable by construction.
+CARP: three vhids, one per node identity, advskew encoding the map (owner 0, heir 100, second heir 200). The vhid IPs are heartbeat tokens only — guests keep their own MACs and DHCP identities wherever they run. seance *prescribes* the CARP config (`seance verify` renders the expected rc.conf lines and diffs reality) but never writes host network config. Known caveat from this week, stated in verify's output: bridge-MAC behavior on 15 is settled via the site firewall's DHCP reservations; CARP vhid MACs are derived from vhid numbers and are stable by construction.
 
 ## 7. Detection and the decision tree (`seance promote`)
 
@@ -112,10 +112,10 @@ Failback itself: quiesce the promoted guest on the interim host, final reverse i
 A failover system that has never eaten a real death is a liability wearing a feature's name. `DRILLS.md` ships with the module and each milestone is gated on its drill passing, timed and logged:
 
 - **drill replication**: corrupt-free verification — restore a replica read-only on a peer, mount, diff critical paths against source snapshot.
-- **drill guest**: `seance promote` of crowdeasedev01's estate with 2c *administratively* killed (guests stopped, CARP demoted) — no fencing, no risk; proves the mount/register/start path and failback.
+- **drill guest**: `seance promote` of dev01's estate with charlie *administratively* killed (guests stopped, CARP demoted) — no fencing, no risk; proves the mount/register/start path and failback.
 - **drill fence**: fence a *powered-on but idle* node via the real iDRAC path and verify power-off (scheduled window; this is the rung nobody tests until it matters).
-- **drill node**: the real thing — pull power (or iDRAC power-off) on 2c with automation armed; measure detection→running. Target: guests up on the heir inside 5 minutes, zero human input.
-- **drill failback**: return 2c, run failback, verify lineage integrity end-to-end.
+- **drill node**: the real thing — pull power (or iDRAC power-off) on charlie with automation armed; measure detection→running. Target: guests up on the heir inside 5 minutes, zero human input.
+- **drill failback**: return charlie, run failback, verify lineage integrity end-to-end.
 
 ## 11. Security posture
 
@@ -125,13 +125,13 @@ Fence credentials live in a root-only (0600) config file inside the module direc
 
 **M1 — repl + status** (P5.1): engine live on the existing standby lineage, cron'd, a week of observed lag stats. Gate: drill-replication.
 **M2 — manual promote + failback** (P5.2): the ladder minus devd/fencing, human-invoked. Gate: drill-guest, both directions.
-**M3 — CARP + devd** (P5.3): detection wired, `--auto` armed on one heir relationship only (2c's). Gate: drill-node on 2c, automation live.
+**M3 — CARP + devd** (P5.3): detection wired, `--auto` armed on one heir relationship only (charlie's). Gate: drill-node on charlie, automation live.
 **M4 — fencing** (P5.4): ipmitool integrated, three-rung ladder complete, automation armed fleet-wide. Gate: drill-fence.
-**M5 — hardening + extraction prep** (P5.5): failback runbook, DRILLS.md complete, module packaging for CBSD's ecosystem, README with the scars in it. Then the queue it unblocks: 2a's HBA330 swap in a seance-evacuated window.
+**M5 — hardening + extraction prep** (P5.5): failback runbook, DRILLS.md complete, module packaging for CBSD's ecosystem, README with the scars in it. Then the queue it unblocks: tenant zero's HBA swap in a seance-evacuated window.
 
-## 13. The decoupling contract (open source; AxB is tenant zero)
+## 13. The decoupling contract (open source; the first deployment is tenant zero)
 
-seance ships with **no tenant knowledge in framework code** — no node names, addresses, counts, ports, hardware identifiers, or site vocabulary. Everything site-shaped lives in the site config: the node registry (name, mgmt address, fence endpoint + driver), the succession map, ssh port (2212 is an AxB fact, not a seance default), pool/dataset roots (derived from CBSD's workdir plus config, never a literal `zroot`), cadence/retention, notification channel. AxB's site file lives in AxB's infra repo, not in seance's. Enforced reaper-style, because good intentions do not: a **source-as-data lint guard** in the test suite fails the build if tenant strings (site names, site IPs, hardware serials) appear anywhere in module code. Generalizations this forces beyond mere config: N-node quorum semantics (§7 rung 2, including the documented N=2 degradation), the fence-driver seam (§7 rung 4), and zero assumptions about the host's firewall (seance never touches firewall config).
+seance ships with **no tenant knowledge in framework code** — no node names, addresses, counts, ports, hardware identifiers, or site vocabulary. Everything site-shaped lives in the site config: the node registry (name, mgmt address, fence endpoint + driver), the succession map, ssh port (a non-default port is a tenant fact, not a seance default), pool/dataset roots (derived from CBSD's workdir plus config, never a literal pool name), cadence/retention, notification channel. Tenant zero's site file lives in its own infra repo, not in seance's. Enforced reaper-style, because good intentions do not: a **source-as-data lint guard** in the test suite fails the build if tenant strings (site names, site IPs, hardware serials) appear anywhere in module code. Generalizations this forces beyond mere config: N-node quorum semantics (§7 rung 2, including the documented N=2 degradation), the fence-driver seam (§7 rung 4), and zero assumptions about the host's firewall (seance never touches firewall config).
 
 ## 14. Configuration UX: the file is the store, the TUI is an editor
 
@@ -145,7 +145,7 @@ Two session shapes carry the expensive tiers. **Shape A**: a pseudo-cluster of t
 
 ## 16. Open items ⟡ (teardown agenda)
 
-Succession map: ring (2c←2a) vs repo/web separation (2b←2a). Per-guest cadence defaults, and artifact01's bulk-window policy (pause hook vs fat deltas). CBSD module scaffolding mechanics — directory layout, verb registration, whether modules get sqlite access — to be verified against CBSD 15.0.9's module docs *before* M1, not asserted from memory. Whether `status` warns or hard-fails on kernel heterogeneity. Notification channel for the notify rung (mail? Slack webhook? both?). Name of the devd-facing shim if any (the daemonless design may need none). And the standing question every design must answer at teardown: which rung of which ladder would have failed to save us during one of this week's real incidents — walk each incident through the tree and check.
+Succession map: ring (charlie←alpha) vs service-separation (bravo←alpha). Per-guest cadence defaults, and build01's bulk-window policy (pause hook vs fat deltas). CBSD module scaffolding mechanics — directory layout, verb registration, whether modules get sqlite access — to be verified against CBSD 15.0.9's module docs *before* M1, not asserted from memory. Whether `status` warns or hard-fails on kernel heterogeneity. Notification channel for the notify rung (mail? Slack webhook? both?). Name of the devd-facing shim if any (the daemonless design may need none). And the standing question every design must answer at teardown: which rung of which ladder would have failed to save us during one of this week's real incidents — walk each incident through the tree and check.
 
 ---
 

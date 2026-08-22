@@ -131,6 +131,68 @@ guard()
     ( cd "${_root}" && awk -f "${PROG}" ${_files} )
 }
 
+# The DOCUMENT scan (D-169). D-11 kept tenant nicknames in DESIGN.md and
+# HANDOFF.md deliberately while the project was private-in-effect; the owner
+# ordered them deidentified on 2026-08-22, and a deidentification not held by
+# a test is one `git revert` from undone. Same list as the code scan, with
+# exactly two allowances, each covering exactly what it allows:
+#   - `idrac`: in code, naming a BMC product is a tenant assumption; in the
+#     fence documentation it is the generic example the driver contract is
+#     written against ("iDRAC and kin"), like naming FreeBSD.
+#   - `axonibyte`: the public repository's own owner, printed in LICENSE and
+#     the copyright line anyway; forbidding the repo URL in HANDOFF would
+#     redact a fact the remote already publishes. The short form `axb` stays
+#     forbidden -- it is site vocabulary, not attribution.
+DOC_SCAN_PATHS="DESIGN.md HANDOFF.md TESTING.md README.md docs"
+
+DOCPROG=$( t_tmpdir )/tenant-docs.awk
+cat > "${DOCPROG}" <<'AWK'
+BEGIN {
+    n = 0
+    n++; pat[n] = "hyp2[abc]";                        tok[n] = "site-node"
+    n++; pat[n] = "(^|[^a-z0-9])axb([^a-z0-9]|$)";    tok[n] = "site-org"
+    n++; pat[n] = "(^|[^a-z0-9])okc([^a-z0-9]|$)";    tok[n] = "site-location"
+    n++; pat[n] = "webdb01";                          tok[n] = "site-guest"
+    n++; pat[n] = "crowdeasedev01";                   tok[n] = "site-guest"
+    n++; pat[n] = "artifact01";                       tok[n] = "site-guest"
+    n++; pat[n] = "bbrunner01";                       tok[n] = "site-guest"
+    n++; pat[n] = "2212";                             tok[n] = "site-port"
+    n++; pat[n] = "zroot";                            tok[n] = "site-pool"
+    n++; pat[n] = "h730";                             tok[n] = "site-hardware"
+    n++; pat[n] = "hba330";                           tok[n] = "site-hardware"
+    n++; pat[n] = "fortigate";                        tok[n] = "site-hardware"
+}
+{
+    low = tolower($0)
+    for (i = 1; i <= n; i++) {
+        if (low ~ pat[i]) {
+            printf "%s:%d: %s: %s\n", FILENAME, FNR, tok[i], $0
+        }
+    }
+}
+AWK
+
+# doc_guard <root>  -- one line per violation in the document set.
+doc_guard()
+{
+    local _root _p _targets _files
+
+    _root=$1
+    _targets=""
+    for _p in ${DOC_SCAN_PATHS}; do
+        [ -e "${_root}/${_p}" ] && _targets="${_targets} ${_p}"
+    done
+    [ -n "${_targets}" ] || return 1
+
+    # shellcheck disable=SC2086
+    #   Deliberate word splitting: ${_targets} is a list of paths for find.
+    _files=$( cd "${_root}" && find ${_targets} -type f | sort )
+
+    # shellcheck disable=SC2086
+    #   Deliberate word splitting: one awk argument per file.
+    ( cd "${_root}" && awk -f "${DOCPROG}" ${_files} )
+}
+
 # probe <line>  -- run the guard over a scratch tree holding just that line.
 probe()
 {
@@ -142,7 +204,7 @@ probe()
     guard "${_dir}"
 }
 
-t_plan 17
+t_plan 21
 
 scanned=$( guard_files "${T_ROOT}" | wc -l | tr -d ' ' )
 t_isnt "${scanned}" "0" "the tenant guard scans a non-empty file list"
@@ -172,6 +234,23 @@ t_like "${planted}" '^lib/common\.subr:[0-9]+: site-node: ' \
     "a planted site node name is caught"
 t_like "${planted}" '^metadata\.conf:[0-9]+: site-location: ' \
     "a planted site string in a module marker is caught"
+
+# The document scan (D-169): the deidentified documents stay deidentified.
+t_is "$( doc_guard "${T_ROOT}" )" "" "no tenant strings in the documents"
+
+docscratch=$( t_tmpdir )/docs
+mkdir -p "${docscratch}/docs"
+printf 'The ring puts hyp2a first.\n' > "${docscratch}/DESIGN.md"
+printf 'iDRAC and kin answer chassis power status.\n' \
+    > "${docscratch}/docs/fence-drivers.md"
+docplanted=$( doc_guard "${docscratch}" )
+t_like "${docplanted}" '^DESIGN\.md:1: site-node: ' \
+    "a site node name planted in a document is caught"
+t_unlike "${docplanted}" 'fence-drivers' \
+    "the iDRAC allowance is an allowance: naming the example BMC in the fence docs is not a violation"
+printf 'ssh runs on port 2212 at the site.\n' >> "${docscratch}/docs/fence-drivers.md"
+t_like "$( doc_guard "${docscratch}" )" '^docs/fence-drivers\.md:2: site-port: ' \
+    "and the allowance does not blanket the file: a site port beside the allowed mention is still caught"
 
 # Each class of the forbidden list, caught.
 t_like "$( probe 'ssh_port=2212' )" '^lib/probe\.subr:1: site-port: ' \

@@ -63,13 +63,13 @@ exists and the hello verb runs; the notes then bind M1's structure.
   beyond trailing-whitespace trim. **Parsed, never sourced** — parsing is
   what makes `config --check` and hostile-input testing possible.
 - Keys: lowercase `[a-z0-9_]`. Per-node: `node_<name>_<key>` (e.g.
-  `node_hyp2c_mgmt`, `node_hyp2c_fence_driver`, `node_hyp2c_fence_target`).
-  Per-guest overrides: `guest_<name>_<key>` (e.g. `guest_webdb01_cadence`).
+  `node_charlie_mgmt`, `node_charlie_fence_driver`, `node_charlie_fence_target`).
+  Per-guest overrides: `guest_<name>_<key>` (e.g. `guest_db01_cadence`).
   Node/guest names in keys use `[a-z0-9]` only — a `names` key maps them to
   display names if they differ (avoids the dash problem in keys).
 - Fleet defaults: `cadence` (seconds, default 900), `retention_recent`
   (default 4h), `retention_hourly` (default 48h), `ssh_port` (default 22 —
-  22, not 2212; 2212 is tenant config), `ssh_user` (default root),
+  22; a non-default port is tenant config), `ssh_user` (default root),
   `skew_tolerance`, `debounce` (default 45), `staleness_max` (default
   3×cadence), `notify_cmd`, `witness` (optional, N=2 only).
 - **Distribution is administrative, never automatic** (decided): seance never
@@ -195,10 +195,10 @@ exists and the hello verb runs; the notes then bind M1's structure.
   (§2.5). Nothing richer in v1.
 - **Shape B CBSD pin**: version string pinned in the manifest run command;
   the suite records `cbsd version` in its output so drift is visible.
-- **Tenant zero site facts** (live in AxB's infra repo, NOT in this repo
-  except deidentified): succession ring 2c←2a, 2a←2b, 2b←2c; cadence
-  defaults 15m with webdb01=5m, crowdeasedev01=60m, bbrunner01=60m,
-  artifact01=15m accepting fat bulk deltas (no pause hook until it hurts).
+- **Tenant zero site facts** (live in the tenant's infra repo, NOT in this repo
+  except deidentified): succession ring charlie←alpha, alpha←bravo, bravo←charlie; cadence
+  defaults 15m with db01=5m, dev01=60m, ci01=60m,
+  build01=15m accepting fat bulk deltas (no pause hook until it hurts).
 
 ## 6. Questions the agent must NOT resolve by assumption
 
