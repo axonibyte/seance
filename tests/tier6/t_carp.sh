@@ -92,14 +92,21 @@ t_isnt "${RENDER_A}" "${RENDER_B}" \
 ALPHA_IF=$( estate_carp_if alpha )
 BRAVO_IF=$( estate_carp_if bravo )
 
-t_like "${RENDER_A}" "^ifconfig_${ALPHA_IF}_alias0=\"inet $( estate_vhid_ip alpha ) vhid 1 advskew 0 " \
-    "alpha renders its own vhid at advskew 0"
+# The FIRST rendered assignment, not alias0: the verb observes the indices a
+# node's rc.conf already occupies and renders after them (D-179), and this
+# render runs AFTER the cluster build installed the first three -- so the base
+# has legitimately moved. What is pinned is the ordering (the node's own vhid
+# first, carp_participation's contract), not the absolute index.
+t_like "$( printf '%s\n' "${RENDER_A}" | grep '^ifconfig_' | head -1 )" \
+    "^ifconfig_${ALPHA_IF}_alias[0-9]+=\"inet $( estate_vhid_ip alpha ) vhid 1 advskew 0 " \
+    "alpha renders its own vhid first, at advskew 0"
 t_like "${RENDER_A}" "vhid 2 advskew 200 " \
     "bravo's vhid at 200, because alpha is bravo's SECOND heir"
 t_like "${RENDER_A}" "vhid 3 advskew 100 " \
     "and charlie's at 100, because alpha is charlie's heir"
-t_like "${RENDER_B}" "^ifconfig_${BRAVO_IF}_alias0=\"inet $( estate_vhid_ip bravo ) vhid 2 advskew 0 " \
-    "bravo renders its own vhid at advskew 0, on ITS OWN interface"
+t_like "$( printf '%s\n' "${RENDER_B}" | grep '^ifconfig_' | head -1 )" \
+    "^ifconfig_${BRAVO_IF}_alias[0-9]+=\"inet $( estate_vhid_ip bravo ) vhid 2 advskew 0 " \
+    "bravo renders its own vhid first, at advskew 0, on ITS OWN interface"
 t_like "${RENDER_B}" "vhid 1 advskew 100 " \
     "and alpha's at 100, because bravo is alpha's heir"
 

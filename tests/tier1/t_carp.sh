@@ -84,7 +84,7 @@ node_charlie_heir2=bravo
 node_charlie_vhid=3
 node_charlie_vhid_ip=192.0.2.103/32"
 
-t_plan 53
+t_plan 54
 
 printf '%s\n' "${RING}" > "${DIR}/ring.conf"
 t_rc 0 "the ring fixture parses" -- conf_load "${DIR}/ring.conf"
@@ -135,7 +135,15 @@ t_like "${RC}" '^ifconfig_vtnet0_alias1="inet 192\.0\.2\.101/32 vhid 1 advskew 1
     "alias1 is the vhid of the node it is heir to, at 100"
 t_like "${RC}" '^ifconfig_vtnet0_alias2="inet 192\.0\.2\.103/32 vhid 3 advskew 200 pass notthepassword"' \
     "alias2 is the vhid of the node it is second heir to, at 200"
-t_like "${RC}" '^kld_list="carp"' "the module is arranged to load"
+# D-179: the rendering may not assign kld_list -- its documented use is
+# appending to rc.conf, rc.conf is shell, and an appended assignment would
+# REPLACE the node's module list at the next boot. The module's loading is the
+# operator's sysrc += (which the rendering's own comment now prescribes) and
+# the check's WARN.
+t_unlike "${RC}" '^kld_list=' \
+    "the rendering does not assign kld_list -- appended, that would replace the node's list"
+t_like "${RC}" 'sysrc kld_list\+="carp"' \
+    "and its comment prescribes the append that cannot clobber"
 t_like "${RC}" 'CONTIGUOUS FROM 0' \
     "and the rendering says the indices must be contiguous, which rc.conf(5) requires"
 t_like "${RC}" 'THE CARP PASSWORD IS IN THE TEXT BELOW' \

@@ -365,13 +365,32 @@ carp_devd_pattern()
 
 # carp_render_rc <selfkey>
 #
+# carp_render_rc <selfkey> [first-alias-index]
+#
 # The rc.conf(5) this node should carry. rc 1 when CARP is not configured for
 # this node, with the reason on stderr.
+#
+# THE INDEX BASE IS THE CALLER'S FACT, NOT THIS FILE'S (D-179). This file's
+# header promises that nothing here asks the host anything -- that purity is
+# what lets tier 1 drive the whole rendering with no adapter and no root --
+# and which alias indices a node's rc.conf already occupies is a fact about
+# the host. So the verb that renders for a real node OBSERVES the occupied
+# indices (verify_render, lib/verify.subr, through the same verify_rcvars the
+# checker reads) and passes the first free one here; a caller with no host to
+# ask -- tier 1, a documentation example -- omits it and gets 0.
+
 carp_render_rc()
 {
-    local _self _if _vif _row _n _owner _v _ip _s
+    local _self _base _if _vif _row _n _owner _v _ip _s
 
     _self=${1:?}
+    _base=${2:-0}
+    case "${_base}" in
+        ''|*[!0123456789]*)
+            seance_log err "render carp: the first alias index must be a number, not [${_base}]"
+            return 2
+            ;;
+    esac
 
     if ! _if=$( carp_interface "${_self}" ); then
         seance_log err "verify --render carp: no carp_interface for node ${_self};" \
@@ -397,15 +416,20 @@ carp_render_rc()
 #
 # THE INDICES MUST BE CONTIGUOUS FROM 0. rc.conf(5): "Execution stops at the
 # first unsuccessful access", so an ifconfig_<if>_alias<n> with a gap below it
-# is never applied. If ${_if} already carries aliases of this node's own,
-# RENUMBER these to follow them -- \`verify\` reads every
-# ifconfig_${_vif}_alias* variable and does not mind which index carries which
-# vhid.
+# is never applied. The indices below were chosen by READING this node's
+# existing ifconfig_${_vif}_alias* variables and numbering after them, so
+# appending this rendering redefines nothing -- \`verify\` reads every index
+# and does not mind which one carries which vhid.
 #
-# kld_list is a whitespace-separated list: if this node already loads modules
-# through it, APPEND carp to the existing value rather than replacing it. The
-# equivalent is carp_load="YES" in ${CARP_LOADER_CONF}, and a kernel with carp
-# compiled in needs neither; \`verify\` accepts all three.
+# kld_list IS DELIBERATELY NOT RENDERED. rc.conf(5) is shell and the last
+# assignment wins, so a rendered kld_list="carp" line, appended, would REPLACE
+# this node's list and silently drop every module in it at the next boot.
+# Load carp with the append that cannot clobber:
+#
+#     sysrc kld_list+="carp"
+#
+# The equivalent is carp_load="YES" in ${CARP_LOADER_CONF}, and a kernel with
+# carp compiled in needs neither; \`verify\` accepts all three.
 #
 # AND ONE SETTING THAT IS NOT AN rc.conf(5) VARIABLE. Put this in
 # ${CARP_SYSCTL_CONF}, and set it now with sysctl(8):
@@ -426,9 +450,8 @@ EOF
     fi
 
     printf '\n'
-    printf 'kld_list="carp"\n'
 
-    _n=0
+    _n=${_base}
     carp_participation "${_self}" |
     while read -r _owner _v _ip _s; do
         [ -n "${_owner}" ] || continue
