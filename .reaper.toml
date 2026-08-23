@@ -40,6 +40,13 @@ ram_gb = 16
 ttl = "6h"
 env = { SEANCE_HUNT = "1" }
 
+# The same hunt WITHOUT the 2 h 45 m committed battery in front of it (D-162).
+# The oracle self-test still runs; the stage says loudly that the battery did
+# not, so a green run here is never an acceptance run.
+[profiles.huntonly]
+ttl = "6h"
+env = { SEANCE_HUNT = "1", SEANCE_HUNT_ONLY = "1", SEANCE_TIERS = "7" }
+
 # The even-N profile. TESTING.md §2 makes the even-N freeze a boundary the
 # suite has to exercise, and tier 7's default fleet is three nodes; this is the
 # same battery against four, where a clean half-split is expressible.

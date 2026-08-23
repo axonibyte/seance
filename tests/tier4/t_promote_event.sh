@@ -222,8 +222,19 @@ t_like "${RUN_OUT}" '^promote-event: CARP MASTER for alpha \(vhid 1 on vtnet0\)'
     "it names the node the vhid stands for"
 t_like "${RUN_OUT}" 'running detached' "and says it detached the promotion"
 t_like "$( cat "${WORK}/daemon.log" )" \
-    "^-f -S -T seance -l daemon -s notice lockf -s -t 0 ${SEANCE_RUN_DIR}/lock/promote.alpha ${SHIM}/pretend-platform seance promote alpha --auto\$" \
+    "^-f -S -T seance -l daemon -s notice lockf -s -t 0 -p ${SEANCE_RUN_DIR}/lock/promote.alpha ${SHIM}/pretend-platform seance promote alpha --auto --locked\$" \
     "daemon(8) was given the platform's own verb, the dead node and --auto, under the per-corpse lock, and told to log to syslog"
+# THE TWO TOKENS THIS ROW GREW WHEN THE MANUAL VERB TOOK THE SAME LOCK.
+#
+# -p writes the pid of the ladder into the lock file, which is the only way the
+# OTHER path -- a human typing `seance promote` at this node -- can name what is
+# holding it rather than merely refusing.
+#
+# --locked tells the child that its own wrapper already holds the lock. Without
+# it the child would ask flock(2) for the same file through a second open file
+# description, be refused, and exit 75 having promoted nothing -- every time,
+# on every automatic promotion. It is asserted here because the tier that would
+# otherwise catch it is a reaper session away.
 
 # THE ROW THIS FILE EXISTS FOR. The shim leaves a child running for 25 s. A
 # bound that reaps descendants -- which timeout(1) does unless --foreground --

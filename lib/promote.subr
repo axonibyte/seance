@@ -139,6 +139,14 @@ PROMOTE_AUTO_VHID=""            # the vhid whose MASTER transition must still ho
 # Measured in the guest; lib/transport.subr carries the citation.
 PROMOTE_EVENT_DETACH_TIMEOUT=10
 
+# lockf(1) exits EX_TEMPFAIL when -t 0 could not take the lock (sysexits(3):
+# EX_TEMPFAIL is 75; lockf(1) EXIT STATUS names it, and it was observed to be
+# exactly this on FreeBSD 15). It is what "another one owns this" already means
+# in this codebase -- lib/repl.subr says the same thing with the same number
+# for a pair another tick is replicating -- and the promotion ladder speaks it
+# for a corpse another ladder is already succeeding.
+PROMOTE_RC_LOCKED=75
+
 # status_age_human (lib/status.subr) is used to print the RPO. It is a
 # formatting helper rather than a status concept -- an age read at three in the
 # morning by somebody who has just been paged -- and duplicating it here to
@@ -237,6 +245,113 @@ promote_operator()
     [ -n "${_o}" ] || _o="unknown"
 
     printf '%s\n' "${_o}"
+}
+
+# promote_lock_path <deadnode>
+#
+# The ONE lock that says "one ladder per corpse, on this node" -- taken by the
+# devd path (promote_event, below) and by the manual verb (bin/seance,
+# seance_promote), which is why the name is built here and nowhere else: two
+# paths that spelled the lock's name in two places would serialise against
+# nothing the day one of them was edited, and the failure would be silent.
+#
+# rc 1 when this node cannot say where its locks live (seance_run_dir: D-3),
+# or cannot create the directory. Both callers refuse to promote in that case:
+# an automatic promotion made without the promise this lock exists to keep is
+# exactly the one it would have prevented.
+promote_lock_path()
+{
+    local _dead _rundir
+
+    _dead=${1:?}
+
+    _rundir=$( seance_run_dir ) || return 1
+    mkdir -p "${_rundir}/lock" 2>/dev/null || return 1
+
+    printf '%s/lock/promote.%s\n' "${_rundir}" "${_dead}"
+}
+
+# promote_lock_holder <lockfile>
+#
+# What is known about the process that holds <lockfile>, as one line, or
+# nothing at all. Called ONLY after an acquisition has just failed: lockf(1)
+# locks with flock(2), so the refusal -- and not the file's existence -- is the
+# evidence that a holder is alive (D-105's reasoning, and lockf(1): "the mere
+# existence of the file is not considered to constitute a lock").
+#
+# Both paths take the lock with `lockf -p`, which writes the pid of the command
+# it is holding the lock for into the file; a holder that has not got that far
+# yet leaves it empty, and this says nothing rather than guessing.
+promote_lock_holder()
+{
+    local _lock _pid _cmd
+
+    _lock=${1:?}
+
+    [ -r "${_lock}" ] || return 1
+
+    _pid=""
+    read -r _pid < "${_lock}" 2>/dev/null || _pid=""
+
+    case "${_pid}" in
+        ''|*[!0123456789]*) return 1 ;;
+    esac
+
+    _cmd=$( ps -p "${_pid}" -o command= 2>/dev/null ) || _cmd=""
+
+    if [ -n "${_cmd}" ]; then
+        printf 'pid %s: %s\n' "${_pid}" "${_cmd}"
+    else
+        printf 'pid %s (no longer in the process table; the lock is held by its wrapper)\n' \
+            "${_pid}"
+    fi
+}
+
+# promote_lock_run <deadnode> <lockfile> <command> [args...]
+#
+# Run <command> while holding <lockfile>, or -- if something else holds it --
+# say so and return PROMOTE_RC_LOCKED, having run nothing.
+#
+# `-t 0` because a promotion that would have to WAIT for another promotion of
+# the same corpse has nothing left to do by the time it gets there: the estate
+# it was going to move has been moved. `-p` writes the pid of the command into
+# the lock file, which is what lets the loser name the winner.
+#
+# The refusal is the evidence, and the file is not: lockf(1) locks with
+# flock(2) and says so itself -- "the mere existence of the file is not
+# considered to constitute a lock" -- so a lock file left behind by a killed
+# promotion is taken, not honoured, and what is reported below is a holder that
+# was alive a moment ago rather than a file that exists.
+promote_lock_run()
+{
+    local _dead _lock _rc _holder
+
+    _dead=$1
+    _lock=$2
+    shift 2
+
+    lockf -s -t 0 -p "${_lock}" "$@"
+    _rc=$?
+
+    [ "${_rc}" -eq "${PROMOTE_RC_LOCKED}" ] || return "${_rc}"
+
+    printf 'promote: another promotion of %s is running on this node and holds %s.\n' \
+        "${_dead}" "${_lock}"
+    promote_note "This is not a stale lock file: lockf(1) locks with flock(2) -- \"the mere existence of the file is not considered to constitute a lock\" -- and the lock dies with whoever holds it. The refusal is evidence of a LIVE holder."
+
+    if _holder=$( promote_lock_holder "${_lock}" ); then
+        promote_note "The holder is ${_holder}"
+    else
+        promote_note "The holder has not recorded its pid yet: lockf(1) -p writes it a moment after taking the lock, so this one had only just started."
+    fi
+
+    promote_note "Wait for it and read its verdict. If it is devd's own ladder, its output is in syslog under the tag seance."
+    promote_note "This lock is per node and per dead node: another NODE promoting the same corpse is not visible from here, and never was -- that is what rung 2 and rung 4 are for (D-155)."
+
+    printf 'promote: NOTHING WAS PROMOTED: this node already has a ladder running for %s\n' \
+        "${_dead}"
+
+    return "${PROMOTE_RC_LOCKED}"
 }
 
 # promote_parse_force <value>
@@ -695,6 +810,18 @@ promote_event()
         # (75) inside the detached child, which is the same "another one owns
         # this" repl(1) already speaks (repl.subr).
         #
+        # `-p` writes the pid of the command lockf is holding the lock for into
+        # the lock file, so that the OTHER path -- a human typing `seance
+        # promote` while this ladder runs -- can name what is holding it rather
+        # than only refusing (bin/seance, seance_promote).
+        #
+        # `--locked` is how the detached child is told that its own wrapper
+        # already holds this lock. Without it the child would take the same
+        # lock again, against a different open file description of the same
+        # file, and flock(2) would refuse it: the automatic promotion would
+        # exit 75 having done nothing, every time. The flag is the same one
+        # `repl` uses for the same reason (D-62).
+        #
         # PER CORPSE and not per node: two deaths are two estates, and the
         # second one must not be held by the first one's ladder.
         #
@@ -702,8 +829,8 @@ promote_event()
         # promise, and an automatic promotion made without it is the one this
         # would have prevented -- so it pages instead, exactly as it does when
         # the adapter cannot say how to invoke a verb.
-        if ! _rundir=$( seance_run_dir ) ||
-           ! mkdir -p "${_rundir}/lock" 2>/dev/null; then
+        if ! _lock=$( promote_lock_path "${_dead}" ); then
+            _rundir=$( seance_run_dir 2>/dev/null ) || _rundir=""
             printf 'promote-event: %s is armed here, but there is no run directory to serialise promotions in (%s); NOTHING WAS PROMOTED\n' \
                 "${_dead}" "${_rundir:-unset}"
             printf 'CARP MASTER for %s observed on %s. This node is armed to succeed it and has nowhere to take the lock that keeps two devd events from running two ladders; nothing was promoted.\n' \
@@ -711,8 +838,6 @@ promote_event()
                 promote_event_notify crit "seance: cannot start the automatic promotion of ${_dead}"
             return 0
         fi
-
-        _lock="${_rundir}/lock/promote.${_dead}"
 
         # Detached, so that devd's event loop is released now rather than in
         # several minutes, and logged to syslog because a detached process has
@@ -726,8 +851,8 @@ promote_event()
         #   separate words.
         seance_run_timeout_detach "${PROMOTE_EVENT_DETACH_TIMEOUT}" \
             daemon -f -S -T seance -l daemon -s notice \
-            lockf -s -t 0 "${_lock}" \
-            ${_verb} promote "${_dead}" --auto < /dev/null > /dev/null 2>&1
+            lockf -s -t 0 -p "${_lock}" \
+            ${_verb} promote "${_dead}" --auto --locked < /dev/null > /dev/null 2>&1
         _rc=$?
 
         if [ "${_rc}" -ne 0 ]; then

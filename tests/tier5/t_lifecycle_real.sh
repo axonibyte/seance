@@ -61,7 +61,7 @@ RCFILE="${SYSDIR}/rc.conf_${J}"
 POOL=$( zfs list -H -o name "${WD}/jails-data" )
 DATAPATH="${WD}/jails-data/${J}-data"
 
-t_plan 54
+t_plan 56
 
 # ---------------------------------------------------------------------------
 # Start, and what CBSD says about a guest that exists
@@ -313,12 +313,30 @@ t_stdout_is "${HOME_DS}" \
     "and with the home dataset back, the resolution names it again" \
     -- adapter_guest_datasets "${J}"
 
-# The fallback proper: unmount the home dataset too, so NOTHING is mounted at
-# the path, and check the answer is still the guest's own dataset.
+# THE FALLBACK THAT USED TO BE HERE, AND WHY IT IS GONE (D-178). Unmount the
+# home dataset too, so NOTHING is mounted at the data path. The resolution used
+# to answer <pool>/<name> -- a dataset name computed from CBSD's creation
+# convention and checked against nothing. On the first real fleet the
+# convention and the layout disagreed (datasets named <parent>/jails-data/
+# <name>-data), the computed name existed nowhere, and every discovery failed
+# for guests sitting right there on disk. A path can be checked against the
+# mount table before it names anything; a computed name cannot, so it is a
+# refusal now.
+#
+# The guard's own value is asserted in the same breath: what is NOT returned is
+# the containing dataset, which on this node is CBSD's whole workdir.
 zfs unmount "${HOME_DS}" 2>/dev/null
-t_stdout_is "${HOME_DS}" \
-    "unmounted, it falls back to <pool>/<name> and not to the workdir dataset" \
+
+t_rc 1 "with nothing mounted at the data path, the resolution REFUSES rather than computing a name" \
     -- adapter_guest_datasets "${J}"
+
+t_stdout_is "" "and names no dataset at all on stdout" \
+    -- adapter_guest_datasets "${J}"
+
+UNMOUNTED_ERR=$( t_tmpdir )/unmounted.err
+adapter_guest_datasets "${J}" 2> "${UNMOUNTED_ERR}" > /dev/null
+t_like "$( cat "${UNMOUNTED_ERR}" )" "is inside ${POOL}, which is mounted at" \
+    "and the refusal names the path and the dataset CONTAINING it -- the workdir dataset it must never return"
 
 zfs mount "${HOME_DS}" 2>/dev/null
 zfs destroy -r "${STANDBY}" 2>/dev/null

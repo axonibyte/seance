@@ -70,6 +70,39 @@ REPL_DS_SAFE='abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.:/
 REPL_TAB=$( printf '\t.' )
 REPL_TAB=${REPL_TAB%.}
 
+# ONE LIVENESS PROBE PER PEER PER TICK (D-142's product observation, measured).
+#
+# A tick runs every guest-peer pair, and each pair re-executes the dispatcher
+# under lockf(1) in a process of its own (D-62). Every one of those pairs opens
+# its own ssh, so every pair pointing at a node that is DOWN pays
+# TRANSPORT_CONNECT_TIMEOUT before it finds out what the pair before it already
+# knew: four guests plus the configuration mirror is fifty seconds of a tick
+# spent waiting for one dead peer, and D-142 measured that as roughly 40% of
+# the tier-7 battery's 2 h 45 m. On a real fleet of thirty guests it is five
+# minutes of every tick, on every surviving node, for as long as the node is
+# down.
+#
+# So a peer is asked ONCE per tick whether it is there, with the transport's
+# own cheap probe -- the same seance_ssh_probe that `verify` and `status`
+# already call "reachable", not a second definition of the word -- and the
+# pairs pointing at a peer that did not answer FAIL IMMEDIATELY, with a verdict
+# naming the probe.
+#
+# THEY FAIL, THEY ARE NOT SKIPPED, and that distinction is the whole of D-141's
+# lesson: the guest was due, the peer was unreachable, and no replication
+# happened. "skipped" is what a tick says about a guest that was not due yet or
+# is held elsewhere -- a healthy-looking line -- and a stopped replication
+# hiding behind one is exactly the failure that cost a fleet three ticks and a
+# session to find. The counts in the verdict line keep their meanings.
+#
+# THESE TWO LISTS ARE THE TICK'S OWN, and are cleared at the top of every tick:
+# a peer that was down at 03:00 is not evidence about 03:05. Nothing is cached
+# across ticks, and nothing is written to disk -- a probe result that outlived
+# the process that measured it would be a liveness guess, which is the thing
+# this project keeps refusing to make (D-62, D-105).
+REPL_PROBE_UP=""
+REPL_PROBE_DOWN=""
+
 # seance_state_dir, seance_run_dir, seance_self_key and seance_peer_addr --
 # used throughout this file but not replication concepts (status and verify
 # use them too) -- live in lib/common.subr, sourced before this file.
@@ -500,6 +533,85 @@ repl_snapshot_complete()
     done < "${_file}"
 
     return 0
+}
+
+# repl_probe_reset  -- forget every liveness answer. Called once per tick.
+repl_probe_reset()
+{
+    REPL_PROBE_UP=""
+    REPL_PROBE_DOWN=""
+}
+
+# repl_peer_answers <peerkey>
+#
+# rc 0 if this peer answered THIS tick's liveness probe, rc 1 if it did not.
+# The probe happens at most once per peer per tick: the first pair that needs
+# the peer pays for it and every later pair -- and the configuration mirror --
+# reads the answer.
+#
+# THE FIRST PAIR PAYS, RATHER THAN THE TOP OF THE TICK. A tick fires at the
+# shortest cadence in the fleet and most guests are not due at most ticks
+# (D-61), so probing every configured peer up front would make a tick with
+# nothing to do the most expensive kind there is. Probing on first use asks
+# about exactly the peers this tick was going to talk to anyway, which is the
+# same set the old code paid the connect timeout for, once instead of once per
+# pair.
+#
+# A PEER WITH NO ADDRESS IS NOT PROBED AND NOT FAILED HERE. "There is no
+# node_<peer>_mgmt in the configuration" is a contract error about the
+# configuration, not a peer that is down, and repl_pair already reports it per
+# guest with the message an operator can act on. Answering "alive" here hands
+# it back to the code that says it properly.
+repl_peer_answers()
+{
+    local _peer _addr
+
+    _peer=${1:?}
+
+    case " ${REPL_PROBE_UP} " in
+        *" ${_peer} "*) return 0 ;;
+    esac
+    case " ${REPL_PROBE_DOWN} " in
+        *" ${_peer} "*) return 1 ;;
+    esac
+
+    if ! _addr=$( seance_peer_addr "${_peer}" ) || [ -z "${_addr}" ]; then
+        REPL_PROBE_UP="${REPL_PROBE_UP} ${_peer}"
+        return 0
+    fi
+
+    if seance_ssh_probe "${_addr}"; then
+        REPL_PROBE_UP="${REPL_PROBE_UP} ${_peer}"
+        return 0
+    fi
+
+    REPL_PROBE_DOWN="${REPL_PROBE_DOWN} ${_peer}"
+    seance_log err "repl: peer ${_peer} (${_addr}) did not answer this tick's" \
+        "liveness probe; every pair replicating to it fails now rather than" \
+        "waiting ${TRANSPORT_CONNECT_TIMEOUT}s each"
+
+    return 1
+}
+
+# repl_pair_unreachable <guest> <peerkey> <now-epoch>
+#
+# The whole of what a pair does when its peer did not answer the tick's probe:
+# say so in the pair's own voice, and move the lag record on WITHOUT losing the
+# timestamp the peer was last known to hold -- exactly what repl_pair does for
+# a peer that went away later in the same tick (repl_lag_fail's own reasoning).
+# A pair that fails early and leaves its record untouched is a pair `status`
+# goes on reporting as the last good tick.
+repl_pair_unreachable()
+{
+    local _guest _peer _now
+
+    _guest=$1
+    _peer=$2
+    _now=$3
+
+    seance_log err "repl ${_guest}->${_peer}: peer ${_peer} did not answer the" \
+        "tick's liveness probe; nothing was replicated to it"
+    repl_lag_fail "${_guest}" "${_peer}" "${_now}" 1
 }
 
 # repl_lock_file <guest> <peerkey>
@@ -1513,6 +1625,12 @@ repl_tick()
 
     _tmp=$( seance_tmpdir ) || return 1
 
+    # This tick's liveness answers are this tick's. Cleared here rather than
+    # left to fall out of process lifetime, so that a caller driving several
+    # ticks in one process (the simulator's world driver, a test) gets the same
+    # per-tick probe a cron line gets.
+    repl_probe_reset
+
     # A locked sub-invocation for the configuration mirror does exactly its one
     # pair: the mirror is not a guest, so none of the enumeration below applies
     # to it, and falling through would end in "no guest called seance-sys".
@@ -1652,6 +1770,26 @@ repl_tick()
             [ -n "${_pf}" ] && [ "${_pf}" != "${_peer}" ] && continue
             _pairs=$(( _pairs + 1 ))
 
+            # The peer, once per tick. Not in a dry run, which contacts nobody
+            # and says only what it would send; and not in a locked
+            # sub-invocation, whose parent has already asked and whose answer
+            # this process could not see anyway.
+            if [ "${_locked}" -eq 0 ] && [ "${_dry}" -eq 0 ] &&
+               ! repl_peer_answers "${_peer}"; then
+                repl_pair_unreachable "${_guest}" "${_peer}" "${_now}"
+                _failed=$(( _failed + 1 ))
+
+                # It still counts as a peer this node replicates to, so the
+                # configuration mirror still owes it a copy and still reports
+                # that it could not make one. Dropping it here would quietly
+                # shrink the mirror's own pair count on the day a node is down.
+                case " ${_syspeers} " in
+                    *" ${_peer} "*) ;;
+                    *) _syspeers="${_syspeers} ${_peer}" ;;
+                esac
+                continue
+            fi
+
             repl_run_pair "${_guest}" "${_peer}" "${_home}" "${_now}" \
                 "${_dry}" "${_locked}"
             _rc=$?
@@ -1698,6 +1836,15 @@ repl_tick()
         else
             for _peer in ${_syspeers}; do
                 _syspairs=$(( _syspairs + 1 ))
+
+                # The same answer the guests' pairs got, from the same probe:
+                # the mirror is the fifth pair that used to pay the connect
+                # timeout all over again for a peer already known to be gone.
+                if ! repl_peer_answers "${_peer}"; then
+                    repl_pair_unreachable "${REPL_SYS_GUEST}" "${_peer}" "${_now}"
+                    _sysfailed=$(( _sysfailed + 1 ))
+                    continue
+                fi
 
                 repl_run_pair "${REPL_SYS_GUEST}" "${_peer}" "${_home}" \
                     "${_now}" 0 0

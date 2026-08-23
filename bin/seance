@@ -8,11 +8,80 @@
 #   0  ok
 #   1  operation failed
 #   2  usage or contract error
+#  75  EX_TEMPFAIL: another process owns what this one was asked to do.
+#      `promote` only -- another ladder holds the dead node's lock (D-155).
 #
 # shellcheck disable=SC3043
 #   'local' is not in POSIX sh but is implemented by FreeBSD /bin/sh (sh(1),
 #   "local"); seance targets FreeBSD sh and nothing else (handoff §5).
 set -u
+
+# ---------------------------------------------------------------------------
+# THE PATH, PINNED BEFORE ANYTHING EXTERNAL RUNS (D-171)
+#
+# THE DEFECT, measured on a real three-node cluster with truss(1). The module's
+# CBSD verb wrapper runs under cbsdsh, and CBSD puts ${workdir}/modules FIRST
+# in PATH -- that directory IS its dispatch mechanism (cbsd.conf:119), and it
+# plants a verb there for every module the node has enabled. One of them is
+# named `ssh`. So every bare `ssh` this dispatcher issued from wrapper context
+# execve'd ${workdir}/modules/ssh, CBSD's verb, and not ssh(1): `seance verify`
+# FAILED every mesh probe while the identical command typed by hand succeeded.
+#
+# THE CLASS, not the instance. `ssh` is the name that bit, and nothing makes it
+# special: seance also runs zfs, zpool, timeout, daemon, lockf, logger, ping,
+# awk, sed, cut, cat, cp, rm, mkdir, find, realpath, ps, id, mktemp, patch,
+# printf and column, and a platform that front-loads a dispatch directory can
+# shadow any of them at any release. The fix is therefore not "call ssh by
+# absolute path" but "nothing may precede the base system in seance's PATH".
+#
+# THE VALUE, argued. The six directories below are FreeBSD's own base and
+# package binary directories in the order the system itself uses them
+# (hier(7); /etc/login.conf's default path is the same list). Every command
+# seance runs bare lives in one of them: base utilities in /sbin /bin
+# /usr/sbin /usr/bin, and the packages a node must have for seance to work --
+# ssh(1) is base, and the rest arrive with CBSD -- in /usr/local/sbin and
+# /usr/local/bin.
+#
+# THE CALLER'S PATH IS KEPT, AFTER THEM, and that is deliberate rather than
+# lazy. Two things seance runs are the SITE's and are documented to be found on
+# PATH: a fence driver it does not ship (`fence_<driver>`, lib/promote.subr,
+# promote_fence_exe -- the module's own drivers/ directory is searched first, so
+# a shipped driver still cannot be shadowed) and `notify_cmd`. A site that
+# installs those in a directory of its own is not this dispatcher's to break.
+# Putting the base directories in front is the whole fix: after it, no earlier
+# directory exists to shadow anything, and the tail can only answer for names
+# the base system does not have.
+#
+# DEDUPLICATED, so that re-entry is idempotent: `repl` re-executes this
+# dispatcher once per guest-peer pair and `promote` re-enters it once under
+# lockf(1), and a pin that prepended six directories at every level would grow
+# the environment for as long as the recursion lasted.
+#
+# FIRST, before `realpath` below: this file's very first external command is
+# itself a name that can be shadowed.
+#
+# The platform verb is NOT found through PATH and is unaffected: `adapter_fact
+# verb` answers with an absolute command (D-117, D-163), which is what cron,
+# devd and the detached promotion are all given.
+_seance_path="/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin"
+_seance_rest=${PATH:-}
+while [ -n "${_seance_rest}" ]; do
+    _seance_dir=${_seance_rest%%:*}
+    case "${_seance_rest}" in
+        *:*) _seance_rest=${_seance_rest#*:} ;;
+        *)   _seance_rest="" ;;
+    esac
+
+    [ -n "${_seance_dir}" ] || continue
+    case ":${_seance_path}:" in
+        *":${_seance_dir}:"*) continue ;;
+    esac
+
+    _seance_path="${_seance_path}:${_seance_dir}"
+done
+PATH=${_seance_path}
+export PATH
+unset _seance_path _seance_rest _seance_dir
 
 # Resolve through symlinks: ${workdir}/modules/seance points at the module
 # directory, and lib/ and VERSION are siblings of bin/.
@@ -124,6 +193,10 @@ Verbs:
                      Forceable rungs: quorum, fence, lineage, kernel.
                      --auto is the devd path: rungs 1-4 must all be green,
                      and --force may not be combined with it.
+                     One ladder per dead node per host: a promotion runs under
+                     lockf(1) and a second one exits 75 saying who holds it,
+                     --force included. --locked is internal: it is how the
+                     devd path says its own lockf(1) already holds that lock
   promote-event <vhid>@<ifname>
                      internal: what a devd(8) CARP rule runs. Maps the vhid
                      to a node and either detaches "promote <node> --auto"
@@ -153,7 +226,8 @@ Verbs:
 The configuration file is \$SEANCE_CONF if set, otherwise
 \$SEANCE_CBSD_WORKDIR/etc/seance.conf, otherwise --file must say.
 
-Exit codes: 0 ok, 1 operation failed, 2 usage or contract error.
+Exit codes: 0 ok, 1 operation failed, 2 usage or contract error. \`promote\`
+adds 75 (EX_TEMPFAIL): another promotion of that node owns this host's lock.
 EOF
 }
 
@@ -294,24 +368,32 @@ seance_verify()
     verify_report
 }
 
-# seance_promote <deadnode> [--force[=rung,...]] [--guest <g>]
+# seance_promote <deadnode> [--auto] [--force[=rung,...]] [--guest <g>]
+#                [--locked]
 #
 # The succession ladder (lib/promote.subr). --force names the rungs it skips
 # and every skipped rung says so in its own line, so "force skips exactly the
 # rungs it names" is readable in the log rather than promised in a comment.
+#
+# --locked  internal: this invocation's caller already holds the corpse's lock
+#           and this one must not take it again. It is how the devd path's own
+#           lockf(1) wrapper says so (lib/promote.subr, promote_event), and it
+#           is the same flag `repl` uses for the same reason (D-62).
 seance_promote()
 {
-    local _dead _guest _forced
+    local _dead _guest _forced _locked _lock _rundir
 
     _dead=""
     _guest=""
     _forced=0
+    _locked=0
     PROMOTE_FORCE=""
     PROMOTE_AUTO=0
 
     while [ $# -gt 0 ]; do
         case "$1" in
             --auto) PROMOTE_AUTO=1 ;;
+            --locked) _locked=1 ;;
             --force)
                 promote_parse_force "" || exit 2
                 _forced=1
@@ -346,6 +428,54 @@ seance_promote()
         seance_die 2 "promote: --force may not be combined with --auto:" \
             "a force is a human accepting a rung that could not answer, and --auto" \
             "is a run with no human in it"
+    fi
+
+    # ONE LADDER PER CORPSE, ON THIS NODE, WHOEVER STARTED IT (D-155 completed).
+    #
+    # The devd path has run its detached ladder under
+    # `lockf -s -t 0 -p <run-dir>/lock/promote.<dead>` since D-155, and the
+    # manual verb did not, which left two ladders one typed command apart: a
+    # human promoting a node devd is already promoting, or two humans on one
+    # node's two terminals. Both walk the same estate, both mount, register and
+    # start it, and neither notices the other -- the hazard D-155 measured for
+    # devd's own flapping events, reached by hand instead.
+    #
+    # It is taken by re-entering the dispatcher under lockf(1) rather than by
+    # writing a marker: that is repl's discipline for its per-pair locks (D-62)
+    # and D-105's reasoning for this one -- the lock is released when its
+    # holder dies, which is the property no marker file has.
+    #
+    # --force DOES NOT BYPASS IT. A force is a human accepting a rung that
+    # could not answer; it is not a licence to run a second ladder over the top
+    # of one that is already mounting an estate.
+    #
+    # AND THE LOCK IS THIS NODE'S. Two nodes promoting one corpse is what rung
+    # 2's quorum and rung 4's fence are for; a file lock cannot say anything
+    # about another machine, and this one does not pretend to -- exactly as the
+    # devd path's lock does not (D-155).
+    if [ "${_locked}" -eq 0 ]; then
+        if ! _lock=$( promote_lock_path "${_dead}" ); then
+            _rundir=$( seance_run_dir 2>/dev/null ) || _rundir=""
+            printf 'promote: this node cannot say where its locks live (run directory: %s), so it cannot promise that only one ladder is walking %s'"'"'s estate.\n' \
+                "${_rundir:-unset}" "${_dead}"
+            promote_note "Set SEANCE_RUN_DIR, or run this verb through the platform's own seance verb, which exports the workdir (D-3)."
+            printf 'promote: NOTHING WAS PROMOTED: there is nowhere to take the lock that keeps two promotions of %s apart\n' \
+                "${_dead}"
+            exit 1
+        fi
+
+        # Rebuilt rather than forwarded: the parsed state IS the argument
+        # vector, and --force= naming every rung it parsed says the same thing
+        # as the bare --force that produced it (promote_parse_force). The child
+        # validates it all again, from scratch.
+        set -- promote "${_dead}" --locked
+        [ "${PROMOTE_AUTO}" -eq 1 ] && set -- "$@" --auto
+        [ "${_forced}" -eq 1 ] &&
+            set -- "$@" "--force=$( printf '%s\n' "${PROMOTE_FORCE}" | tr ' ' ',' )"
+        [ -n "${_guest}" ] && set -- "$@" --guest "${_guest}"
+
+        promote_lock_run "${_dead}" "${_lock}" "${SEANCE_ROOT}/bin/seance" "$@"
+        exit $?
     fi
 
     seance_load_conf

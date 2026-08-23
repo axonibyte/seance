@@ -254,6 +254,12 @@ inside the guest (the `repl` tick dominates; keep guests tiny). Hunting:
 ever finds a defect is appended to `seeds.txt` permanently**, with the
 commit that fixed the defect referenced in a comment.
 
+*(And a bounded hunt does not pay for the battery first, per D-162:
+`SEANCE_HUNT_ONLY=1` beside `SEANCE_HUNT=1` skips the battery and hunts, while
+the oracle self-test — the check that makes the tier mean anything — still runs
+first. The switch changes nothing about nominations, and every run says whether
+the battery ran.)*
+
 *(As built, per D-137: `t_sim.sh` REPORTS a failing seed to
 `$REAPER_OUT/sim/seeds-to-promote.txt` and does not edit `seeds.txt` itself.
 This same runner is what the rediscovery battery drives with a protection

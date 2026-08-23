@@ -1,5 +1,5 @@
 #!/usr/local/bin/cbsd
-#v0.5.0
+#v0.5.1
 # seance -- CBSD verb wrapper (decision D-2).
 #
 # This is the only file in the project that runs under cbsdsh. It does no
@@ -29,6 +29,8 @@ ${H3_COLOR}Description${N0_COLOR}:
  seance gives a CBSD cluster crash-consistent guest succession. This node's
  CBSD facts are passed to the dispatcher in the environment; every verb prints
  a verdict line and exits 0 (ok), 1 (operation failed) or 2 (usage error).
+ 'promote' adds one more: 75, another promotion of that node already owns
+ this host's lock.
 
 ${H3_COLOR}Options${N0_COLOR}:
 
@@ -63,7 +65,11 @@ ${H3_COLOR}Options${N0_COLOR}:
              the corpse, rung 1 waits and then re-reads CARP, and rungs
              1-4 must all be green. '--force' may NOT be combined with
              it -- a force is a human accepting a rung that could not
-             answer, and there is no human on that path;
+             answer, and there is no human on that path.
+             ONE LADDER PER DEAD NODE PER HOST: the promotion runs under
+             lockf(1), so a second one -- another operator, or devd's own
+             automatic run -- exits 75 and names what is holding it,
+             '--force' included;
    promote-event
            - INTERNAL: what a devd(8) CARP rule runs, once per MASTER
              transition, as 'promote-event <vhid>@<ifname>'. It maps the
