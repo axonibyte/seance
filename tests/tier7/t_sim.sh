@@ -20,6 +20,17 @@
 #      drawn from /dev/urandom and printed, for as long as SEANCE_HUNT_BUDGET
 #      seconds allow.
 #
+# AND A BOUNDED HUNT THAT DOES NOT PAY FOR THE BATTERY FIRST (D-162): with
+# SEANCE_HUNT_ONLY=1 beside SEANCE_HUNT=1, step 2 is skipped and step 1 is not.
+# The battery is 2 h 45 m (D-142), so a hunt behind it cannot be reached inside
+# a session that was meant for hunting; and the obvious shortening --
+# SEANCE_SIM_SEEDS with one seed -- switches the nominations off for the whole
+# run, so a hunt driven that way reports what it found in a diagnostic and
+# nowhere else. THE ORACLE SELF-TEST IS NEVER SKIPPED: a hunt with a broken
+# oracle is not a cheap hunt, it is noise. Every switch and every nomination
+# rule lives in tests/cluster/sim/hunt.subr, which a workstation can run --
+# tests/tier1/t_sim_hunt.sh does.
+#
 # WHAT HAPPENS TO A SEED THAT FINDS SOMETHING. It is written to
 # $REAPER_OUT/sim/seeds-to-promote.txt, and this file does NOT edit the
 # committed battery (D-137). The promotion rule -- any seed that ever finds a
@@ -42,6 +53,9 @@ set -u
 # shellcheck source-path=SCRIPTDIR
 # shellcheck source=../cluster/lib/stage.subr
 . "${T_ROOT}/tests/cluster/lib/stage.subr"
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=../cluster/sim/hunt.subr
+. "${T_ROOT}/tests/cluster/sim/hunt.subr"
 
 stage_begin sim
 
@@ -52,8 +66,17 @@ SIM_SEEDS="${T_ROOT}/tests/cluster/sim/seeds.txt"
 SIM_SELFTEST="${T_ROOT}/tests/tier4/t_sim_oracle_selftest.sh"
 
 STEPS=${SEANCE_SIM_STEPS:-60}
-HUNT=${SEANCE_HUNT:-0}
 HUNT_BUDGET=${SEANCE_HUNT_BUDGET:-3600}
+
+# What this run is for, decided before anything expensive starts. A
+# contradiction between the switches is a contract error and stops here rather
+# than three hours from here.
+if ! MODE=$( sim_hunt_mode ); then
+    t_plan 1
+    t_not_ok "the run's switches say what this run is for"
+    t_diag "SEANCE_HUNT=[${SEANCE_HUNT:-}] SEANCE_HUNT_ONLY=[${SEANCE_HUNT_ONLY:-}]"
+    t_done
+fi
 
 if [ "$( id -u )" -ne 0 ]; then
     t_diag "tier 7 builds jails and ZFS datasets; it needs root"
@@ -90,12 +113,11 @@ if [ "${NSEEDS}" -eq 0 ]; then
     t_done
 fi
 
-# One for the self-test, one per seed, and -- when hunting -- one for the hunt.
-if [ "${HUNT}" = "1" ]; then
-    t_plan $(( NSEEDS + 2 ))
-else
-    t_plan $(( NSEEDS + 1 ))
-fi
+t_plan "$( sim_plan "${MODE}" "${NSEEDS}" )"
+
+# SAID BEFORE ANYTHING RUNS AND AGAIN AT THE END, because this is the line that
+# stops a green hunt-only stage from being read as an acceptance run.
+t_diag "$( sim_battery_banner "${MODE}" )"
 
 if [ -n "${SEANCE_SIM_SEEDS:-}" ]; then
     t_diag "seeds from SEANCE_SIM_SEEDS, NOT the committed battery:" \
@@ -118,12 +140,7 @@ mkdir -p "${OUTDIR}/sim" 2>/dev/null || true
 # the permanent battery with seeds that found a hole somebody made on purpose
 # -- applied one file earlier than D-137 applied it, because the file is what a
 # person reads when deciding.
-PROMOTE="${OUTDIR}/sim/seeds-to-promote.txt"
-if [ -n "${SEANCE_SIM_SEEDS:-}" ]; then
-    PROMOTE=""
-else
-    : > "${PROMOTE}" 2>/dev/null || true
-fi
+PROMOTE=$( sim_promote_file "${OUTDIR}/sim" )
 
 # ---------------------------------------------------------------------------
 # 1. The oracle self-test
@@ -173,7 +190,7 @@ run_seed()
     # facts about the session, not about the seed, and a seed nominated by one
     # of them sends the next person hunting a defect that was never there.
     # The assertion is unchanged: anything but 0 still fails the seed's row.
-    if [ "${_rc}" -eq 1 ]; then
+    if sim_nominates "${_rc}"; then
         [ -z "${PROMOTE}" ] ||
             printf '%s\t# found a defect on %s; naming it is the fixer'"'"'s job\n' \
                 "${_seed}" "$( date -u +%Y-%m-%d )" >> "${PROMOTE}" 2>/dev/null
@@ -185,25 +202,29 @@ run_seed()
     return "${_rc}"
 }
 
-BATTERY_T0=$( date +%s )
+if sim_runs_battery "${MODE}"; then
+    BATTERY_T0=$( date +%s )
 
-for seed in ${SEEDS}; do
-    if run_seed "${seed}"; then
-        t_ok "seed ${seed} survived ${STEPS} events with every invariant intact"
-    else
-        t_not_ok "seed ${seed} survived ${STEPS} events with every invariant intact"
-    fi
-done
+    for seed in ${SEEDS}; do
+        if run_seed "${seed}"; then
+            t_ok "seed ${seed} survived ${STEPS} events with every invariant intact"
+        else
+            t_not_ok "seed ${seed} survived ${STEPS} events with every invariant intact"
+        fi
+    done
 
-BATTERY_T1=$( date +%s )
-t_diag "the default battery took $(( BATTERY_T1 - BATTERY_T0 ))s" \
-    "(${NSEEDS} seeds x ${STEPS} steps)"
+    BATTERY_T1=$( date +%s )
+    t_diag "the default battery took $(( BATTERY_T1 - BATTERY_T0 ))s" \
+        "(${NSEEDS} seeds x ${STEPS} steps)"
+else
+    t_diag "the ${NSEEDS} committed seed(s) were NOT run: $( sim_battery_banner "${MODE}" )"
+fi
 
 # ---------------------------------------------------------------------------
 # 3. Hunting
 # ---------------------------------------------------------------------------
 
-if [ "${HUNT}" = "1" ]; then
+if sim_hunts "${MODE}"; then
     hunt_found=""
     hunt_seeds=0
     hunt_t0=$( date +%s )
@@ -224,13 +245,21 @@ if [ "${HUNT}" = "1" ]; then
 
     t_diag "hunted ${hunt_seeds} seed(s) in $(( $( date +%s ) - hunt_t0 ))s"
 
+    # The battery's fate is IN the hunt's assertion text, not only in a
+    # diagnostic beside it: this is the line a summary quotes.
     if [ -z "${hunt_found}" ]; then
-        t_ok "the hunt found no defect in ${hunt_seeds} seed(s)"
+        t_ok "$( sim_battery_banner "${MODE}" ) -- the hunt found no defect in ${hunt_seeds} seed(s)"
     else
-        t_not_ok "the hunt found no defect in ${hunt_seeds} seed(s)"
+        t_not_ok "$( sim_battery_banner "${MODE}" ) -- the hunt found no defect in ${hunt_seeds} seed(s)"
         t_diag "seeds that found something:${hunt_found}"
-        t_diag "they are in ${PROMOTE}; the fix commits them to seeds.txt"
+        if [ -n "${PROMOTE}" ]; then
+            t_diag "they are in ${PROMOTE}; the fix commits them to seeds.txt"
+        else
+            t_diag "this run was told which seeds to use, so it nominated nothing (D-137)"
+        fi
     fi
 fi
+
+t_diag "$( sim_battery_banner "${MODE}" )"
 
 t_done

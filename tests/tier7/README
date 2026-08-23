@@ -51,6 +51,21 @@ Environment:
                         that used it cannot be read as the battery.
     SEANCE_HUNT=1       draw fresh seeds until SEANCE_HUNT_BUDGET seconds are
                         gone (`reaper run --profile hunt`)
+    SEANCE_HUNT_ONLY=1  with SEANCE_HUNT=1: skip the committed battery and hunt
+                        straight away (`reaper run --profile huntonly`). The
+                        battery is 2 h 45 m, so a hunt behind it cannot be
+                        reached inside a session meant for hunting (D-162).
+                        The ORACLE SELF-TEST still runs -- a hunt with a broken
+                        oracle is noise -- and the output says in its own
+                        assertion text that the battery DID NOT RUN, so a green
+                        hunt-only stage can never be read as the battery.
+                        Nominations are unchanged: a hunted seed that fails
+                        with exit 1 is nominated, one that was killed (exit 3)
+                        is not, and a run driven by SEANCE_SIM_SEEDS nominates
+                        nothing. Without SEANCE_HUNT=1 it is a contract error,
+                        not a guess. Every one of these decisions lives in
+                        sim/hunt.subr and is tested by
+                        tests/tier1/t_sim_hunt.sh, on a workstation.
     SEANCE_SIM_DRY=1    run.sh only: draw and model a trace with NO cluster,
                         which is how the generator and the model's
                         applicability rules are exercised on a workstation

@@ -392,6 +392,8 @@ _adapter_status_int()
 #
 # Rows that are understood but out of scope are skipped with a diagnostic:
 #   * an emulator other than jail or bhyve (seance supports two, design §1);
+#   * a row whose emulator field is CBSD's "I could not fill this in" marker,
+#     which on a clustered node is every other node's guest (D-171);
 #   * an unregistered guest, which cannot be started or held until it has been
 #     through adapter_guest_register.
 # A row that is NOT understood -- too few fields, or a status word CBSD itself
@@ -415,6 +417,39 @@ _adapter_list_rows()
 
         case "${_emu}" in
             jail|bhyve) ;;
+            0|-)
+                # NOT AN UNSUPPORTED EMULATOR: A GUEST THAT IS NOT THIS NODE'S.
+                #
+                # CBSD prints a display field it could not fill as "0"
+                # (bhyvectl/bls:220-222) or as "-" (jailctl/jls:169-171), and on
+                # a CLUSTERED node that is what every other node's guest looks
+                # like here: cluster mode turns the foreign listing on by itself
+                # -- `is_cluster_mode` true means alljails=1 and shownode=1
+                # unless the caller says otherwise (jailctl/jls:70-77) -- and
+                # the remote rows are filled from the peer's replicated SQL,
+                # which does not carry the emulator (bhyvectl/bls:390-393, and
+                # its own "todo: remote sql fetch via retrinv" at 224).
+                #
+                # Skipping it is right and is unchanged: seance replicates and
+                # promotes what THIS node hosts, and the peer is doing the same
+                # for its own. What was wrong was the sentence -- "emulator 0 is
+                # not supported by seance" reads as a product that cannot
+                # handle the fleet's guests, on a node whose every peer's guest
+                # produces one, which is how an operator comes to believe the
+                # module is broken. Found on a real three-node cluster (D-171).
+                #
+                # The second reading is stated too, because this parser cannot
+                # tell the two apart from one row and must not pretend to: a
+                # LOCAL guest whose registration never set an emulator prints
+                # the same field.
+                _adapter_diag "skipping ${_name}: it is not local to this node." \
+                    "CBSD prints a listing field it could not fill as \"${_emu}\"," \
+                    "and on a clustered node that is how another node's guest appears" \
+                    "in this listing -- seance replicates and promotes what THIS node" \
+                    "hosts. (If ${_name} really does live here, its registration has no" \
+                    "emulator and \"cbsd jls jname=${_name}\" will show the same gap.)"
+                continue
+                ;;
             *)
                 _adapter_diag "skipping ${_name}: emulator ${_emu} is not supported by seance"
                 continue
@@ -1095,46 +1130,139 @@ adapter_guest_links()
     esac
 }
 
+# _adapter_data_field <name>
+#
+# Read a `header=0 display=jname,data` listing on stdin and print the DATA path
+# of <name>'s own row -- CBSD's answer to "where does this guest's data live",
+# recorded per guest at creation and carried in its rc.conf ever since:
+#
+#   jail   data="${jaildatadir}/${jname}-${jaildatapref}"
+#          (etc/defaults/jail-freebsd-default.conf:102, written into the
+#          guest's rcconf by sudoexec/jcreate:806-814)
+#   bhyve  data="${workdir}/vm/${jname}"  (sudoexec/bcreate:595)
+#
+# THE DEFAULTS ARE NOT THE CONTRACT, WHICH IS THE WHOLE POINT (D-171(b)). On a
+# real fleet every guest is a bhyve VM whose data lives at
+# ${jaildatadir}/<jname>-data -- the jail-shaped path -- and any code that
+# computed the VM path from the creation script's convention looked in the
+# wrong place. The field is READ instead.
+#
+# Only a row whose data field is an ABSOLUTE PATH answers. A clustered node's
+# listing carries a row per node and the remote ones cannot fill this field
+# (D-177): they print "0" or "-", and are passed over here rather than mistaken
+# for a path.
+_adapter_data_field()
+{
+    awk -v n="${1:?}" '$1 == n && $2 ~ /^\// { print $2; exit }'
+}
+
+# _adapter_guest_data_path <name>
+#
+# CBSD's own answer to where this guest's data is, or rc 1 and nothing.
+# Both listings are asked, for adapter_guest_list's reason: each shows only its
+# own emulators, so a VM is invisible to the first and a jail to the second.
+_adapter_guest_data_path()
+{
+    local _name _cmd _out _val
+
+    _name=$1
+
+    for _cmd in jls bls; do
+        _out=$( _adapter_cbsd "${_cmd}" header=0 display=jname,data \
+            jname="${_name}" ) || _out=""
+        [ -n "${_out}" ] || continue
+
+        _val=$( printf '%s\n' "${_out}" | _adapter_data_field "${_name}" )
+        [ -n "${_val}" ] || continue
+
+        printf '%s\n' "${_val}"
+        return 0
+    done
+
+    return 1
+}
+
+# _adapter_dataset_at <path>
+#
+# The dataset mounted EXACTLY at <path>, or rc 1 and a diagnostic naming both
+# the path and the question that was asked.
+#
+# THE GUARD IS LOAD-BEARING: `zfs list <path>` answers with the dataset
+# CONTAINING the path, not only with one mounted exactly there. Observed on the
+# workstation: `zfs list -H -o name,mountpoint /data/jails` prints `zdata
+# /data`, which is precisely why CBSD itself uses that form to find the POOL
+# from ${jaildatadir} (sudoexec/mkdatadir:20). Without the guard a guest whose
+# dataset is not mounted would resolve to the whole workdir dataset, and seance
+# would snapshot, send and -- at promotion -- remount CBSD's entire estate.
+_adapter_dataset_at()
+{
+    local _path _cand _mp
+
+    _path=${1:?}
+
+    _cand=$( zfs list -H -o name "${_path}" 2>/dev/null ) || _cand=""
+    if [ -z "${_cand}" ]; then
+        _adapter_diag "no ZFS dataset at ${_path}:" \
+            "\"zfs list -H -o name ${_path}\" answered nothing"
+        return 1
+    fi
+
+    _mp=$( zfs get -H -o value mountpoint "${_cand}" 2>/dev/null ) || _mp=""
+    if [ "${_mp}" != "${_path}" ]; then
+        _adapter_diag "${_path} is inside ${_cand}, which is mounted at" \
+            "${_mp:-<unreadable>} -- it is not a dataset of its own." \
+            "seance replicates datasets and will not guess one from a path"
+        return 1
+    fi
+
+    printf '%s\n' "${_cand}"
+    return 0
+}
+
 # contract: adapter_guest_datasets(name) -> dataset per line, root first [promises output]
 #
 # Every ZFS dataset belonging to the guest -- filesystems and volumes, the
 # root of the tree first, then its children in ZFS's own order.
 #
-# TWO RESOLUTIONS, IN THIS ORDER, and the order is the point.
+# OBSERVED, NEVER DERIVED, and D-171(b) is what that sentence cost. The old
+# resolution fell back to a COMPUTED DATASET NAME -- <parent>/<name>, where
+# <parent> is the dataset holding CBSD's jails-data directory, which is exactly
+# how CBSD derives it when it CREATES a guest (sudoexec/mkdatadir:14-23). On
+# the first real fleet every guest is a bhyve VM whose dataset is
+# <parent>/jails-data/<name>-data -- the "-data" is part of the DATASET name,
+# not only of the mountpoint -- and every discovery failed with "no dataset
+# <parent>/<name>", for a guest sitting right there on disk. A creation
+# convention is not a layout: seance may read where a guest lives, and may not
+# work it out.
 #
-#   1. THE MOUNTED PATH. `zfs list -H -o name <mountpoint>` names the dataset
-#      mounted where CBSD expects this guest's data to be -- the path its own
-#      `data=` field carries (sudoexec/bcreate:595-597). After a promotion in
-#      place that dataset is the REPLICA, living under
-#      <standby_root>/<deadkey>/<name> and mounted at CBSD's expected path
-#      (D-44 item 4), and no derivation from a pool name could ever name it.
-#      Asking the mount table is asking the same question CBSD asks.
+# So, in this order, and every step is something the platform or the mount
+# table SAID:
 #
-#      WITH ONE GUARD, and it is load-bearing: `zfs list <path>` answers with
-#      the dataset CONTAINING the path, not only with one mounted exactly
-#      there. Observed on the workstation: `zfs list -H -o name,mountpoint
-#      /data/jails` prints `zdata /data`, which is precisely why CBSD itself
-#      uses that form to find the POOL from ${jaildatadir} (mkdatadir:20). So
-#      the answer is accepted only when its own mountpoint is exactly the path
-#      asked about. Without this, a guest whose dataset happened to be
-#      unmounted would resolve to the whole workdir dataset, and seance would
-#      then snapshot, send and -- at promotion -- remount CBSD's entire estate.
-#   2. <parent>/<name>, where <parent> is the dataset holding CBSD's jails-data
-#      directory -- precisely how CBSD derives it when it CREATES a guest:
-#      `ZPOOL=$( zfs list -Ho name ${jaildatadir} )` then
-#      `zfs create -o mountpoint=${jaildatadir}/${jname}-data ${ZPOOL}/${jname}`
-#      (sudoexec/mkdatadir:14-23), and the same parent with
-#      `-o mountpoint=${workdir}/vm/${jname}` for a VM (sudoexec/bcreate:579).
-#      This is the answer for a guest at home, and for one whose dataset is not
-#      mounted at the moment. No pool name is written down either way, which is
-#      what the tenant guard requires (D-6).
+#   1. CBSD's own `data` field for this guest (_adapter_guest_data_path).
+#      It is recorded per guest at creation and travels in its rc.conf, so it
+#      is right for a guest CBSD made whatever convention it used, and right
+#      after a promotion in place -- where the dataset is the REPLICA under
+#      <standby_root>/<deadkey>/<name>, mounted at the path the guest's own
+#      configuration names (D-44 item 4), which no derivation could ever reach.
+#   2. Failing that, the path this platform's creation scripts put that TYPE's
+#      data at (adapter_guest_mountpoint, built from CBSD's own jaildatadir and
+#      workdir facts). This is a fallback for a guest whose `data` field is
+#      blank -- the schema's default is "0" (share/local-jails.schema:39) --
+#      and it is a PATH, which step 3 then checks against the mount table. It
+#      can therefore fail to find a dataset; it cannot name the wrong one.
+#   3. The dataset mounted exactly at whichever path answered
+#      (_adapter_dataset_at). Anything else is a refusal naming the path.
+#
+# No pool name is written down anywhere here, which is what the tenant guard
+# requires (D-6).
 #
 # rc 1 when the guest has no dataset at all -- a zfsfeat=0 node (mkdatadir:15-18
-# makes a plain directory instead), or a guest this node does not have. seance
-# requires ZFS-backed guests, and saying so loudly is the entire response.
+# makes a plain directory instead), a guest this node does not have, or a guest
+# whose data path has no dataset of its own. seance requires ZFS-backed guests,
+# and saying so loudly is the entire response.
 adapter_guest_datasets()
 {
-    local _name _parent _root _out _type _mp _cand
+    local _name _root _out _type _mp
 
     _adapter_ready || return 2
 
@@ -1144,33 +1272,32 @@ adapter_guest_datasets()
         return 2
     fi
 
-    # 1. the path CBSD's own data= field names.
-    _root=""
-    _type=$( adapter_guest_type "${_name}" 2>/dev/null ) || _type=""
-    if [ -n "${_type}" ]; then
-        _mp=$( adapter_guest_mountpoint "${_name}" "${_type}" 2>/dev/null ) || _mp=""
-        if [ -n "${_mp}" ]; then
-            _cand=$( zfs list -H -o name "${_mp}" 2>/dev/null ) || _cand=""
-            if [ -n "${_cand}" ] &&
-               [ "$( zfs get -H -o value mountpoint "${_cand}" 2>/dev/null )" = "${_mp}" ]
-            then
-                _root=${_cand}
-            fi
+    # 1. what CBSD says, and 2. what this platform's creation scripts would
+    #    have used for this type. Both are paths; neither is a dataset name.
+    _mp=$( _adapter_guest_data_path "${_name}" ) || _mp=""
+
+    if [ -z "${_mp}" ]; then
+        _type=$( adapter_guest_type "${_name}" 2>/dev/null ) || _type=""
+        if [ -n "${_type}" ]; then
+            _mp=$( adapter_guest_mountpoint "${_name}" "${_type}" 2>/dev/null ) ||
+                _mp=""
         fi
     fi
 
-    # 2. the pool CBSD would have created it in.
-    if [ -z "${_root}" ]; then
-        _parent=$( zfs list -H -o name "${ADAPTER_JAILDATADIR}" 2>/dev/null ) ||
-            _parent=""
-
-        if [ -z "${_parent}" ]; then
-            _adapter_diag "${ADAPTER_JAILDATADIR} is not on ZFS: this node cannot host seance guests"
-            return 1
-        fi
-
-        _root="${_parent}/${_name}"
+    if [ -z "${_mp}" ]; then
+        _adapter_diag "adapter_guest_datasets: ${_name}: CBSD does not say where" \
+            "its data lives (display=jname,data answered no path) and this node" \
+            "cannot say what type it is, so there is nothing to look up." \
+            "Nothing will be guessed"
+        return 1
     fi
+
+    # 3. the dataset mounted exactly there, or a refusal naming the path.
+    _root=$( _adapter_dataset_at "${_mp}" ) || {
+        _adapter_diag "adapter_guest_datasets: ${_name}: its data path ${_mp}" \
+            "has no dataset of its own; seance replicates datasets"
+        return 1
+    }
 
     _out=$( zfs list -H -r -o name -t filesystem,volume "${_root}" 2>/dev/null ) ||
         _out=""

@@ -43,7 +43,7 @@ rows()
     RRC=$?
 }
 
-t_plan 52
+t_plan 61
 
 # --- a listing of the shape CBSD prints --------------------------------------
 rows 'web01  jail   1  On
@@ -70,6 +70,42 @@ t_is "${ROWS}" "web01	jail	1	1" "an unsupported emulator is left out"
 t_is "${RRC}" "0" "an unsupported emulator does not fail the listing"
 t_like "$( cat "${DIR}/err" )" 'skipping qe01' \
     "an unsupported emulator is named on stderr, not passed over in silence"
+
+# A CLUSTERED NODE'S LISTING (D-171), which is what a real fleet produces and
+# what this file had never been shown. `cbsd jls`/`cbsd bls` turn the foreign
+# listing on by themselves in cluster mode (jailctl/jls:70-77), and the remote
+# rows arrive with fields CBSD could not fill -- printed as "0" by bls
+# (bhyvectl/bls:220-222) and as "-" by jls (jailctl/jls:169-171).
+#
+# THE ROW IS STILL SKIPPED, and the whole listing still succeeds. Both halves
+# matter: the emulator check comes before the status check, and a remote row's
+# status field is that same unfillable "0" -- a parser that reached it would
+# call the listing a contract error and this node would stop replicating
+# ANYTHING the moment a peer joined the cluster.
+rows 'web01  jail   1  On
+db01   bhyve  1  Off
+far01  0      0  0
+far02  -      0  -'
+
+t_is "${ROWS}" "web01	jail	1	1
+db01	bhyve	1	0" "another node's guests are left out of this node's roster"
+t_is "${RRC}" "0" \
+    "and a clustered listing is NOT a contract error, however many remote rows it carries"
+t_like "$( cat "${DIR}/err" )" 'skipping far01: it is not local to this node' \
+    "the skip says what it means -- not \"emulator 0 is not supported by seance\", which reads as a product gap on every clustered node"
+t_like "$( cat "${DIR}/err" )" 'skipping far02: it is not local to this node' \
+    "and jls's spelling of the same empty field is read the same way"
+t_unlike "$( cat "${DIR}/err" )" 'emulator 0 is not supported' \
+    "and the old sentence is gone, because it was never true of these rows"
+
+# A REAL unsupported emulator still says exactly that: the two cases are
+# different facts and the diagnostic may not blur them.
+rows 'web01  jail             1  On
+qe01   qemu-riscv64-static  1  Off'
+t_like "$( cat "${DIR}/err" )" 'emulator qemu-riscv64-static is not supported by seance' \
+    "an emulator seance really does not support is still named as one"
+t_unlike "$( cat "${DIR}/err" )" 'not local to this node' \
+    "and is not blamed on the cluster"
 
 rows 'web01  jail  1  On
 old01  jail  1  Unregister'
@@ -141,6 +177,8 @@ pool0/web01/data	/wd/jails-data/web01-data/data
 pool0/vmhost/db01	/wd/vm/db01
 pool0/vmhost/db01/dsk1.vhd	-
 pool0/standby/alpha/arc01	/wd/jails-data/arc01-data
+pool0/cbsd/jails-data	/wd/jails-data
+pool0/cbsd/jails-data/vm01-data	/wd/jails-data/vm01-data
 EOF
 
 ZBIN=$( t_tmpdir )/bin
@@ -210,12 +248,45 @@ export PATH
 #   Called by lib/adapter.subr, which shellcheck checks as a separate file.
 _adapter_cbsd()
 {
-    local _jname
+    local _jname _display
 
     _jname=""
     for _a in "$@"; do
         case "${_a}" in jname=*) _jname=${_a#jname=} ;; esac
     done
+
+    _display=""
+    for _a in "$@"; do
+        case "${_a}" in display=*) _display=${_a#display=} ;; esac
+    done
+
+    # `display=jname,data` is a listing of its own shape, and the fixture
+    # answers it the way a real node does: the guest's OWN recorded data path,
+    # whatever convention made it (D-171(b)). vm01 is the fleet's shape
+    # verbatim -- a bhyve VM at the jail-shaped path -- and db01 is the shape
+    # sudoexec/bcreate:595 produces. off01's is a path with no dataset of its
+    # own, and old01's field was never filled, which CBSD prints as "0".
+    if [ "${_display}" = "jname,data" ]; then
+        case "$1" in
+            jls)
+                case "${_jname}" in
+                    web01) printf 'web01  /wd/jails-data/web01-data\n' ;;
+                    arc01) printf 'arc01  /wd/jails-data/arc01-data\n' ;;
+                    off01) printf 'off01  /wd/jails-data/off01-data\n' ;;
+                esac
+                printf 'old01  0\n'
+                ;;
+            bls)
+                case "${_jname}" in
+                    db01)  printf 'db01   /wd/vm/db01\n' ;;
+                    vm01)  printf 'vm01   /wd/jails-data/vm01-data\n' ;;
+                    far01) printf 'far01  0\n' ;;
+                esac
+                ;;
+            *) return 1 ;;
+        esac
+        return 0
+    fi
 
     case "$1" in
         jls)
@@ -230,6 +301,7 @@ _adapter_cbsd()
         bls)
             case "${_jname}" in
                 db01) printf 'db01   bhyve  1  Off\n' ;;
+                vm01) printf 'vm01   bhyve  1  Off\n' ;;
             esac
             ;;
         # CBSD's mutating verbs talk on STDOUT, refusals included -- `cbsd
@@ -257,7 +329,7 @@ mkdir -p "${ADAPTER_JAILRCCONFDIR}"
 # The fixture zfs answers the same way the real one does.
 t_is "$( zfs list -H -o name /wd/jails-data/web01-data )" "pool0/web01" \
     "the fixture resolves an exact mountpoint to its own dataset"
-t_is "$( zfs list -H -o name /wd/jails-data/off01-data )" "pool0/cbsd" \
+t_is "$( zfs list -H -o name /wd/jails-data/off01-data )" "pool0/cbsd/jails-data" \
     "and a path with no dataset of its own to the dataset CONTAINING it, as zfs does"
 
 # --- the guest's own listing row: type and held ------------------------------
@@ -385,8 +457,24 @@ t_is "$( adapter_guest_datasets db01 )" "pool0/vmhost/db01
 pool0/vmhost/db01/dsk1.vhd" \
     "a VM resolves through \${workdir}/vm/<name>, zvols included"
 
-t_is "$( adapter_guest_datasets off01 )" "pool0/cbsd/off01" \
-    "a guest whose dataset is not mounted falls back to the pool derivation rather than to the workdir dataset the path resolves to"
+# THE FLEET'S OWN SHAPE (D-171(b)), verbatim: a bhyve VM whose data lives at
+# the jail-shaped path, in a dataset whose NAME carries the "-data" suffix. The
+# derivation this resolver used to fall back to would have computed
+# pool0/cbsd/vm01 and refused with "no dataset" -- for a guest sitting right
+# there on disk, which is exactly what the fleet saw.
+t_is "$( adapter_guest_datasets vm01 )" "pool0/cbsd/jails-data/vm01-data" \
+    "a guest resolves through the data path CBSD RECORDED for it, whatever convention named the dataset"
+
+# And the case that used to be answered with a computed name is now a refusal.
+# A guest whose data path has no dataset of its own may not be replicated from
+# a guess: the old fallback named <parent>/<name> and checked it against
+# nothing, which is the shape of the fleet's failure and would be the shape of
+# a silent wrong answer on any other layout.
+t_rc 1 "a data path with no dataset of its own is a refusal, not a computed name" \
+    -- adapter_guest_datasets off01
+adapter_guest_datasets off01 2> "${DIR}/off01.err" > /dev/null
+t_like "$( cat "${DIR}/off01.err" )" '/wd/jails-data/off01-data is inside pool0/cbsd/jails-data' \
+    "and the refusal names the path, the dataset that contains it, and that seance will not guess"
 
 t_rc 1 "a guest this node does not have has no datasets" \
     -- adapter_guest_datasets gone01

@@ -77,7 +77,7 @@ if [ "${count}" -lt 3 ]; then
     t_done
 fi
 
-t_plan $(( count + 16 ))
+t_plan $(( count + 20 ))
 
 # ---------------------------------------------------------------------------
 # The contract, against CBSD
@@ -170,6 +170,24 @@ ${POOL}/${SHAPEB_VM}/dsk1.vhd" \
 t_is "$( zfs get -H -o value mountpoint "${POOL}/${SHAPEB_VM}" )" \
     "${WD}/vm/${SHAPEB_VM}" \
     "and CBSD mounted it at \${workdir}/vm/<name> (sudoexec/bcreate:579)"
+
+# WHERE THOSE ANSWERS CAME FROM (D-171(b)). Both resolutions above now go
+# through the guest's OWN recorded data path rather than through a dataset name
+# computed from a creation convention -- because on the first real fleet the
+# convention and the layout disagreed, and every discovery failed for guests
+# that were sitting there on disk. These rows are that resolution meeting real
+# CBSD: what the platform records, and that a dataset really is mounted exactly
+# there.
+t_is "$( _adapter_guest_data_path "${SHAPEB_JAIL}" )" \
+    "${WD}/jails-data/${SHAPEB_JAIL}-data" \
+    "CBSD records a jail's data path as \${jaildatadir}/<name>-data (etc/defaults/jail-freebsd-default.conf:102)"
+t_is "$( _adapter_guest_data_path "${SHAPEB_VM}" )" "${WD}/vm/${SHAPEB_VM}" \
+    "and a VM's as \${workdir}/vm/<name> (sudoexec/bcreate:595) -- read from the guest, not computed"
+t_is "$( _adapter_dataset_at "${WD}/jails-data/${SHAPEB_JAIL}-data" )" \
+    "${POOL}/${SHAPEB_JAIL}" \
+    "and the dataset mounted exactly there is the one the resolver returns"
+t_rc 1 "a path with no dataset of its own is a refusal, not a guess" \
+    -- _adapter_dataset_at "${WD}/jails-data"
 
 # The links a replicated VM needs, against the ones CBSD made itself.
 t_is "$( readlink "${WD}/jails-data/${SHAPEB_VM}-data" )" \

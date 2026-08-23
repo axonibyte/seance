@@ -1,0 +1,184 @@
+# seance -- what a tier-7 run is FOR, and what it may nominate.
+#
+# Sourced by tests/tier7/t_sim.sh, which needs root and builds a cluster; every
+# decision in here needs neither, and that is the whole reason the file exists.
+# D-162 recorded the shape of the problem: the switches that say "hunt" and the
+# rules that say "nominate" lived inside a file no workstation can run, so a
+# change to either could only be tested by spending a reaper session on it.
+#
+# THREE DECISIONS, AND THEY ARE INDEPENDENT:
+#
+#   1. WHAT THIS RUN IS FOR (sim_hunt_mode). The committed battery, the battery
+#      followed by a hunt, or a hunt with no battery at all.
+#   2. WHETHER IT MAY NOMINATE SEEDS (sim_promote_file). A run that was told
+#      which seeds to use nominates nothing -- D-137's rule, which exists
+#      because the rediscovery battery drives this same runner with a
+#      protection deliberately reverted.
+#   3. WHICH EXIT STATUS IS A FINDING (sim_nominates). Only 1. 2 is a driver
+#      that could not start and 3 is a run that was killed; both are facts
+#      about the session rather than about the seed (D-147).
+#
+# NONE OF THEM IS CHANGED BY THE HUNT-ONLY SWITCH. What that switch does is
+# skip the battery -- it does not make a hunt nominate more, or a
+# SEANCE_SIM_SEEDS run nominate at all.
+#
+# shellcheck shell=sh
+# shellcheck disable=SC3043
+#   'local' is not in POSIX sh but is implemented by FreeBSD /bin/sh (sh(1),
+#   "local"); seance targets FreeBSD sh and nothing else (handoff §5).
+
+# _sim_switch <name> <value>  -- 1, 0, or rc 2 with a diagnostic.
+#
+# An unset switch is off. A switch set to anything other than 0 or 1 is a
+# CONTRACT ERROR and not a quiet off: `SEANCE_HUNT=yes` reads as "hunt" to
+# everybody except the shell, and answering it with three hours of battery and
+# no hunt is the kind of mistake that is only discovered when the session ends.
+_sim_switch()
+{
+    local _name _value
+
+    _name=$1
+    _value=$2
+
+    case "${_value}" in
+        ''|0) printf '0\n' ;;
+        1)    printf '1\n' ;;
+        *)
+            printf 'sim: %s must be 0 or 1, not "%s"\n' "${_name}" "${_value}" >&2
+            return 2
+            ;;
+    esac
+
+    return 0
+}
+
+# sim_hunt_mode
+#
+# What this run is for, as one word:
+#
+#   battery       the committed battery (SEANCE_SIM_SEEDS replaces its list)
+#   battery-hunt  the battery, then hunt until the budget runs out
+#   hunt-only     the oracle self-test, then hunt; NO battery
+#
+# rc 2 -- a contract error, before anything expensive -- when the switches
+# contradict each other. SEANCE_HUNT_ONLY without SEANCE_HUNT is refused rather
+# than guessed: "hunt only" and "no hunt at all" are the two things it could
+# mean, they are three hours apart, and a wrong guess is discovered at the end
+# of a session rather than the beginning of one.
+sim_hunt_mode()
+{
+    local _hunt _only
+
+    _hunt=$( _sim_switch SEANCE_HUNT "${SEANCE_HUNT:-}" ) || return 2
+    _only=$( _sim_switch SEANCE_HUNT_ONLY "${SEANCE_HUNT_ONLY:-}" ) || return 2
+
+    if [ "${_only}" = "1" ] && [ "${_hunt}" != "1" ]; then
+        printf 'sim: SEANCE_HUNT_ONLY=1 needs SEANCE_HUNT=1 -- it says which part of a hunting run to skip, not that there is one\n' >&2
+        return 2
+    fi
+
+    [ "${_only}" = "1" ] && { printf 'hunt-only\n'; return 0; }
+    [ "${_hunt}" = "1" ] && { printf 'battery-hunt\n'; return 0; }
+
+    printf 'battery\n'
+    return 0
+}
+
+# sim_runs_battery <mode>  -- rc 0 when the committed battery is part of it.
+sim_runs_battery()
+{
+    [ "${1:?}" != "hunt-only" ]
+}
+
+# sim_hunts <mode>  -- rc 0 when this run draws seeds of its own.
+sim_hunts()
+{
+    [ "${1:?}" != "battery" ]
+}
+
+# sim_plan <mode> <seed count>  -- how many assertions the run will make.
+#
+# One for the oracle self-test, one per seed of the battery it runs, and one
+# for the hunt. Written here beside the mode rather than in the runner, because
+# a plan that does not match what ran is how a stage silently stops asserting
+# something.
+sim_plan()
+{
+    local _mode _nseeds _n
+
+    _mode=${1:?}
+    _nseeds=${2:?}
+
+    _n=1
+    sim_runs_battery "${_mode}" && _n=$(( _n + _nseeds ))
+    sim_hunts "${_mode}" && _n=$(( _n + 1 ))
+
+    printf '%d\n' "${_n}"
+}
+
+# sim_battery_banner <mode>
+#
+# The line that says whether the committed battery ran, printed by every run
+# whatever it did. A hunt-only pass is a green tier-7 stage that has NOT run
+# the battery, and the only thing standing between that and somebody reading it
+# as an acceptance run is this sentence.
+sim_battery_banner()
+{
+    case "${1:?}" in
+        hunt-only)
+            printf 'HUNT ONLY: the committed seed battery DID NOT RUN. This run proves nothing about the battery.\n'
+            ;;
+        battery-hunt)
+            printf 'the committed seed battery ran, and then this run hunted for new seeds\n'
+            ;;
+        *)
+            printf 'the committed seed battery ran\n'
+            ;;
+    esac
+}
+
+# sim_promote_file <directory>
+#
+# Where seeds that found something are nominated, TRUNCATED and ready to be
+# appended to -- or nothing at all, when this run may not nominate.
+#
+# A run driven by SEANCE_SIM_SEEDS may not: it was told which seeds to use, and
+# the four tier-7 rediscovery rows tell it exactly that while a protection is
+# deliberately reverted (D-137, applied to this file in D-147). The file is
+# truncated rather than appended to because it names the seeds THIS run found
+# something with; a session that left the last run's nine nominations in place
+# sent somebody hunting five defects that were never there.
+#
+# HUNT-ONLY CHANGES NOTHING HERE. A hunt draws its seeds from /dev/urandom, so
+# a hunt-only run has no SEANCE_SIM_SEEDS to be suppressed by in the first
+# place; if somebody sets both, the suppression stands, because the rule is
+# about a run that was told what to use and not about which phase used it.
+sim_promote_file()
+{
+    local _dir
+
+    _dir=${1:?}
+
+    [ -z "${SEANCE_SIM_SEEDS:-}" ] || return 0
+
+    mkdir -p "${_dir}" 2>/dev/null || true
+    : > "${_dir}/seeds-to-promote.txt" 2>/dev/null || return 0
+
+    printf '%s/seeds-to-promote.txt\n' "${_dir}"
+}
+
+# sim_nominates <exit status>
+#
+# rc 0 when this status means the SEED found something, which is the only
+# status that nominates it for the permanent battery.
+#
+# 1  an invariant fired: the seed found something.
+# 2  the driver could not start: a fact about the session.
+# 3  the run was killed before it reached a verdict (run.sh's own trap, D-147):
+#    a fact about the session, and the one that cost a session when it was read
+#    as five findings.
+# 0  nothing to nominate.
+sim_nominates()
+{
+    [ "${1:?}" = "1" ]
+}

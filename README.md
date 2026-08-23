@@ -14,7 +14,7 @@ the implementation brief is in `HANDOFF.md`. Installing it is
 `docs/INSTALL.md`, step by step, with the CBSD source citations behind each
 step.
 
-## Status: M5 — v0.5.0
+## Status: M5 — v0.5.1
 
 Everything the design describes is implemented and tested at every tier the
 harness has. Layer 1 is live: `repl` snapshots, sends and prunes; `status` is
@@ -210,6 +210,72 @@ outside the platform's own dispatch asks the adapter (`adapter_fact`) how this
 platform runs one — and the proof it was already known is that
 `verify --render devd` had always done exactly that, because a `devd(8)` action
 is executed with an environment nobody set. Three call sites had not.
+
+### The platform's own dispatch directory is first on `PATH`, and one of its verbs is called `ssh`
+
+First contact with a real three-node cluster, and it is the same family as the
+scar above: what runs a command, and in whose environment.
+
+`seance verify` FAILED every mesh probe on the fleet, while the identical `ssh`
+line typed by hand succeeded. `truss(1)` on the probe named the cause in one
+line: it had `execve`d `<workdir>/modules/ssh`. The module wrapper runs under
+the platform's own shell, which puts its module directory **first** on `PATH` —
+that directory *is* its dispatch mechanism — and the platform ships a verb of
+its own called `ssh`. Every bare external command seance issued from wrapper
+context was exposed to that; `ssh` is the one that bit.
+
+The fix is the class and not the instance: `bin/seance` pins the base system's
+directories in front of whatever `PATH` it was handed, before it runs anything
+at all — including its own first call to `realpath`. Everything seance runs
+bare is covered by it: `ssh`, `zfs`, `zpool`, `timeout`, `daemon`, `lockf`,
+`logger`, `ping` and the text tools. The caller's `PATH` is kept *after* the
+base directories rather than thrown away, because two things seance runs are
+the site's own and are documented to be found on it — a fence driver the module
+does not ship, and `notify_cmd` — and putting the base system in front is
+already the whole fix.
+
+No tier had caught it because every tier drove `bin/seance` with the harness's
+own `PATH`. That is the rule of §0 of `TESTING.md` — a tier tests the caller's
+environment — one level below where it was written: the caller here is the
+platform's shell, and its `PATH` is part of it. The test now builds that
+caller, with a directory of shadowing verbs in front, and requires that not one
+of them ever executes.
+
+### Another node's guests are not this node's, and the diagnosis says so
+
+Same fleet, same afternoon. On a clustered node the platform's guest listing
+shows **every** node's guests, not this one's — cluster mode turns that on by
+itself — and the remote rows arrive with the fields it could not fill printed
+as `0`. seance skipped them, correctly, and said `emulator 0 is not supported
+by seance`: on a node whose every peer's guest produces one of those lines, that
+reads as a module that cannot handle the fleet. The behaviour was right and the
+sentence was wrong. It now says the guest is not local to this node, and names
+the other reading too — a local guest whose registration carries no emulator
+looks identical from one row, and this parser cannot tell them apart without
+claiming more than it knows.
+
+### Where a guest's data lives is read from the platform, never computed from it
+
+The same fleet, the same afternoon, and the most expensive of the three because
+it looked like a missing feature. Every guest on it is a bhyve VM whose data
+lives in a dataset named `<pool>/cbsd/jails-data/<name>-data` — the `-data` is
+part of the DATASET name, not only of the mountpoint — mounted at the
+jail-shaped path. seance's dataset discovery had a fallback that computed
+`<parent>/<name>` from the directory holding CBSD's `jails-data`, which is
+exactly how CBSD derives it when it *creates* a guest. So discovery failed with
+`no dataset <parent>/<name>` for guests that were sitting right there on disk,
+and nothing else on the node could proceed: no replication, no promotion, no
+failback.
+
+A creation convention is not a layout. Discovery now reads the guest's own
+recorded data path — the field CBSD writes into its rc.conf at creation and
+carries ever since — and then asks the mount table which dataset is mounted
+exactly there. If the platform will not say, the type's documented data path is
+tried instead; if no dataset is mounted at the path that answered, that is a
+refusal naming the path, and never a name seance made up. The distinction that
+matters is not "observed versus derived paths" but that **a path can be checked
+against the mount table before it names anything, and a computed dataset name
+was checked against nothing.**
 
 ### `written@` is a lie until the pool has committed
 
@@ -446,9 +512,13 @@ inside the debounce the first event is still serving, and every armed event
 detached another promotion: measured, two events for one vhid started two
 ladders. Each was correct on its own, and each mounted, registered and started
 the same estate. The detached command now runs under a lock named after the
-dead node; the loser exits and no second ladder runs. The narrowing is stated:
-per corpse, and on the automatic path only — a human typing `seance promote`
-twice is not serialised by this.
+dead node; the loser exits and no second ladder runs. **And the manual verb
+takes the same lock**, which was this rule's stated narrowing until v0.5.1: a
+human promoting the node `devd` is already promoting — the likeliest second
+ladder there is, since the person typing it was paged by the same death — now
+exits 75 and is told which process holds it. Two *nodes* promoting one corpse
+is a different question, and it is what rungs 2 and 4 are for; a file lock
+cannot answer it and does not pretend to.
 
 *The notification is sent from a child the verb does not wait for.* A site's
 `notify_cmd` is bounded at 30 s, and the verb used to wait for it — blocking
@@ -538,6 +608,16 @@ Peers are the guest's succession — its heir and second heir, or the per-guest
 override, and never the guest's own home. Each pair runs under `lockf(1)`, so a
 tick that finds a pair already running logs it and moves on rather than
 overlapping.
+
+Each *peer* is asked once per tick whether it is there, before its pairs run.
+Without that, every pair pointing at a node that is down paid the transport's
+ten-second connect timeout again — four guests plus the configuration mirror is
+fifty seconds of every tick, on every survivor, for as long as the node is
+down. A peer that does not answer the probe fails its pairs immediately, and
+they are counted as **failed**, not skipped: the guest was due, the peer was
+unreachable, and nothing was replicated. `skipped` means "not due yet, or
+hosted elsewhere", and a stopped replication hiding behind a healthy-looking
+count is the failure this project keeps finding.
 
 Each tick also mirrors what the guests' own datasets do not carry. A jail's
 registerable configuration lives outside the guest's dataset, so `repl` copies
@@ -651,6 +731,18 @@ seance promote alpha --auto                # what devd runs; no human anywhere
 | 5 lineage | per guest: whose is it, does anybody already claim it, is the replica fresh, is the fleet kernel-homogeneous? | a stale replica is `force-only`; no replica at all aborts |
 | 6 promotion | mount in place, relink, register, start, verify, record | a guest that will not start fails alone; the others continue |
 | 7 post | what the next `repl` tick will do | nothing; there is nothing to configure |
+
+**One ladder per dead node per host.** The promotion runs under
+`lockf(1)` against `<run-dir>/lock/promote.<deadnode>`, so a second one — the
+operator whose pager just went off, typing at the node `devd` is already
+promoting from, or two people on two terminals — exits `75` (`EX_TEMPFAIL`),
+names what is holding the lock, and does nothing. `--force` does not bypass it:
+a force is a human accepting a rung that could not answer, not a licence to
+mount an estate that is already being mounted. The lock is this host's; two
+*nodes* promoting one corpse is what rungs 2 and 4 are for. And because
+`lockf(1)` locks with `flock(2)`, a lock file left behind by a killed promotion
+is taken rather than honoured — the refusal is evidence of a live holder, never
+of a file that exists.
 
 **`--force` names rungs, and skips exactly the ones it names** — every rung it
 overrides says `forced` in its own line. The forceable rungs are `quorum`,
@@ -980,10 +1072,10 @@ this tree.
 
 | Tier | Where | What it is | Count | How to run it |
 | --- | --- | --- | --- | --- |
-| 1 | workstation | pure units: the policy engine, the config parser, the dispatcher's own surface, the simulator's generator/model/shrinker, the fence driver, the setup wizard under a pty, the upgrade path | 1357 | `SEANCE_TIERS=1 sh tests/run.sh` |
+| 1 | workstation | pure units: the policy engine, the config parser, the dispatcher's own surface, the simulator's generator/model/shrinker, the fence driver, the setup wizard under a pty, the upgrade path | 1385 | `SEANCE_TIERS=1 sh tests/run.sh` |
 | 2 | workstation | golden vectors: snapshot names, timestamps, the config corpus — each run normally, under `LC_ALL=C`, and under a non-UTC `TZ` | 901 | `SEANCE_TIERS=2 sh tests/run.sh` |
-| 3 | workstation | source-as-data guards: the adapter seam, the tenant guard, config completeness both ways, verb completeness, doc liveness, the rc(8) unit, the rediscovery table | 160 | `SEANCE_TIERS=3 sh tests/run.sh` |
-| 4 | workstation | the ladder against a fault-injecting mock adapter — every rung × every outcome as a truth table — plus the records, the failback guard, the fence contract, the tier-7 oracle's self-test and two real captures | 806 | `SEANCE_TIERS=4 sh tests/run.sh` |
+| 3 | workstation | source-as-data guards: the adapter seam, the tenant guard, config completeness both ways, verb completeness, doc liveness, the rc(8) unit, the rediscovery table | 164 | `SEANCE_TIERS=3 sh tests/run.sh` |
+| 4 | workstation | the ladder against a fault-injecting mock adapter — every rung × every outcome as a truth table — plus the records, the failback guard, the fence contract, the tier-7 oracle's self-test and two real captures | 882 | `SEANCE_TIERS=4 sh tests/run.sh` |
 | 5 | reaper guest | shape B: `lib/adapter.subr` against a real CBSD 15.0.9 node and a real jail, the conformance vectors against three adapters, and `docs/INSTALL.md` followed literally on a clean node | 405 | `SEANCE_TIERS=5 sh tests/run.sh` |
 | 6 | reaper guest | shape A: eighteen named stages across three vnet jails — replication, interruption, promotion, quorum, concurrency, flap, failback, resurrection, hostility | 539 | `SEANCE_TIERS=6 sh tests/run.sh`, or one stage with `SEANCE_STAGES=repl` |
 | 7 | reaper guest | the seeded tier: five committed seeds × 60 steps against a shadow model, five invariants diffed after every event | 6 — the oracle self-test and one per seed; each seed is 60 events and five invariants deep | `SEANCE_TIERS=7 sh tests/run.sh` — about 2 h 45 m |
