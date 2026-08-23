@@ -94,12 +94,18 @@ below is read-only with respect to the running estate.
    done
    ```
 
-   Each line is `<dataset> <mountpoint> <source-of-mountpoint> <canmount>`, and
-   **every one of them must read `none inherited noauto`** after the dataset
-   name. A `local` or `received` in the third column is a drill failure and a
-   stop-everything finding: it is the August defect, live, and the replica is
-   one boot away from shadowing the guest's own mount. Save the listing —
-   step 5 compares against it byte for byte.
+   Each line is `<dataset> <mountpoint> <source-of-mountpoint> <canmount>`,
+   and the source column is MULTI-WORD: zfs prints the correct state as
+   `inherited from <ancestor>`, so a line reads
+   `<dataset> none inherited from <ancestor> noauto`. The pass criterion,
+   column by column: mountpoint `none`, canmount `noauto` (the LAST field),
+   and a source that begins `inherited from`, naming the standby root or an
+   ancestor under it — do not grep for a literal `none inherited noauto`
+   triple; it matches nothing and a checker built on it dies on the very
+   state it wants (D-180). A `local` or `received` source is a drill failure
+   and a stop-everything finding: it is the August defect, live, and the
+   replica is one boot away from shadowing the guest's own mount. Save the
+   listing — step 5 compares against it byte for byte.
 
 4. **Mount the replica read-only and diff it.** This is the part that cannot be
    skipped: the point of the drill is to read the bytes. On the heir, working
@@ -177,7 +183,7 @@ whether or not the drill passes.
 - `/tmp/drill-repl-before.tsv` and `/tmp/drill-repl-after.tsv`, both from a
   `status` that exited 0.
 - The step-3 property listing, before and after, identical, every line
-  `none inherited noauto`.
+  mountpoint `none`, source `inherited from <ancestor>`, canmount `noauto`.
 - The step-4 diff, empty.
 - A note of `TS`, the guest, the heir, and the timing table above filled in,
   including the step 2→6 total.

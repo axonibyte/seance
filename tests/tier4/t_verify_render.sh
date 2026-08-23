@@ -240,7 +240,7 @@ fails()
     printf '%s\n' "${CHECK_OUT}" | awk '/^FAIL /{ n++ } END { print n + 0 }'
 }
 
-t_plan 30
+t_plan 35
 
 # ---------------------------------------------------------------------------
 # 1. The rendering is a function of the configuration and nothing else
@@ -282,6 +282,35 @@ DEVDRENDER=$( verify_render devd )
 #   the rendered rule, not an expansion for this shell.
 t_like "${DEVDRENDER}" 'promote-event \$subsystem' \
     "and the devd rendering runs promote-event on the subsystem devd supplies"
+
+# THE RENDERING OWNS NOTHING BUT ITS ALIASES (D-179, the owner's finding on
+# the fleet). Its documented use is appending to rc.conf, rc.conf is shell,
+# and the last assignment wins -- so a rendered kld_list line, appended to a
+# node whose kld_list already loads vmm and if_bridge, would silently drop
+# both at the next boot. The rendering may assign ifconfig_<if>_alias<n>
+# variables and NOTHING else.
+t_unlike "${CARPRENDER}" '^kld_list=' \
+    "the carp rendering assigns no kld_list -- an appended assignment would replace the node's list"
+t_is "$( printf '%s\n' "${CARPRENDER}" | grep -c '^[A-Za-z_][A-Za-z0-9_]*=' | tr -d ' ' )" \
+    "$( printf '%s\n' "${CARPRENDER}" | grep -c '^ifconfig_' | tr -d ' ' )" \
+    "and every assignment it makes is an ifconfig_<if>_alias<n>"
+
+# AND ITS INDICES ARE OBSERVED, NOT ASSUMED. This world's rcvars carry no
+# aliases, so the rendering starts at alias0; give the node two existing
+# aliases of its own and the same rendering must start after them -- an index
+# that collided would redefine the node's alias with the same last-wins
+# semantics as the kld_list line above.
+t_like "${CARPRENDER}" 'ifconfig_vtnet0_alias0=' \
+    "with no existing aliases the rendering starts at alias0"
+cp "${WORK}/rcvars" "${WORK}/rcvars.drill"
+printf '/etc/rc.conf: ifconfig_vtnet0_alias0="inet 192.0.2.10/24"\n' >> "${WORK}/rcvars"
+printf '/etc/rc.conf: ifconfig_vtnet0_alias1="inet 192.0.2.11/24"\n' >> "${WORK}/rcvars"
+CARPRENDER2=$( verify_render carp )
+t_like "${CARPRENDER2}" 'ifconfig_vtnet0_alias2=' \
+    "two existing aliases move the rendering's first index to alias2"
+t_unlike "${CARPRENDER2}" 'ifconfig_vtnet0_alias[01]=' \
+    "and it assigns neither of the indices the node already owns"
+mv "${WORK}/rcvars.drill" "${WORK}/rcvars"
 t_unlike "${DEVDRENDER}" '"2@vtnet0"' \
     "and has no rule for this node's OWN vhid, which is what a boot looks like (D-121)"
 

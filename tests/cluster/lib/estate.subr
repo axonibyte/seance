@@ -335,6 +335,18 @@ estate_carp_apply()
     grep -v '^#' "${_render}" | grep '^[a-z]' >> "${_root}/etc/rc.conf" || return 1
     chmod 0600 "${_root}/etc/rc.conf" || return 1
 
+    # The module's boot arrangement is deliberately NOT in the rendering any
+    # more (D-179: an appended kld_list assignment would REPLACE the node's
+    # module list), so verify WARNs and names the remedy instead. The estate
+    # follows the remedy the way an operator would -- sysrc's += grammar,
+    # against this node's own rc.conf. The kldload above is the running
+    # system's half; this is the reboot's half, and it is what t_carp's
+    # "arranged to load" row reads back.
+    sysrc -R "${_root}" 'kld_list+=carp' > /dev/null || {
+        cluster_fail 1 "sysrc kld_list+=carp on ${_n}"
+        return 1
+    }
+
     # devd's rules. devd(8) is KEYWORD: nojail and cannot run in a vnet jail,
     # so what shape A can prove about them is that the file seance renders is
     # the file seance then recognises -- the firing itself is drill-node's.

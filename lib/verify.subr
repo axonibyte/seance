@@ -118,7 +118,15 @@ verify_render()
                     "configuration, so there is nothing to render for it"
                 return 2
             }
-            [ "${1}" = "carp" ] && { carp_render_rc "${_self}"; return $?; }
+            [ "${1}" = "carp" ] && {
+                # The alias base is OBSERVED here, in the verb, because the
+                # renderer is a pure function of the configuration and which
+                # indices this node's rc.conf already occupies is a host fact
+                # (D-179). Read through the same verify_rcvars the checker
+                # reads, so the rendering and the check share one view.
+                carp_render_rc "${_self}" "$( verify_alias_base "${_self}" )"
+                return $?
+            }
             carp_render_devd "${_self}"
             return $?
             ;;
@@ -228,6 +236,40 @@ verify_cron()
 # already had aliases of its own will legitimately carry seance's at other
 # indices, and a check that looked only where it rendered would fail a node
 # that is correctly configured.
+# verify_alias_base <selfkey>
+#
+# The first ifconfig_<if>_alias<n> index a rendering for this node may use:
+# one past the highest index the rc.conf(5) chain already defines for the
+# node's carp interface, or 0 when it defines none (D-179 — an index that
+# collided with an existing alias would silently redefine it, rc.conf being
+# shell where the last assignment wins). Prints 0 when the interface or the
+# rc variables cannot be read: the renderer's own header still states the
+# contiguity requirement, and a node whose rc.conf cannot be read is not a
+# node whose rc.conf this rendering is about to collide with.
+verify_alias_base()
+{
+    local _self _if _vif _idx
+
+    _self=${1:?}
+
+    _if=$( carp_interface "${_self}" 2>/dev/null ) || { printf '0\n'; return 0; }
+    _vif=$( carp_rcvar_if "${_if}" )
+
+    _idx=$( verify_rcvars "ifconfig_${_vif}_alias" 2>/dev/null |
+        awk -F'\t' -v pfx="ifconfig_${_vif}_alias" '
+        {
+            rest = substr($2, length(pfx) + 1)
+            if (rest ~ /^[0-9]+$/ && rest + 0 >= base) { base = rest + 1 }
+        }
+        END { print base + 0 }
+    ' )
+
+    case "${_idx}" in
+        ''|*[!0123456789]*) _idx=0 ;;
+    esac
+    printf '%s\n' "${_idx}"
+}
+
 verify_rcvars()
 {
     command -v sysrc > /dev/null 2>&1 || return 1
@@ -468,6 +510,9 @@ EOF
     else
         verify_warn "carp: neither kld_list nor ${CARP_LOADER_CONF} loads carp;" \
             "unless carp is compiled into this kernel, detection stops at the next reboot"
+        # sysrc += appends without clobbering the node's existing list; the
+        # rendering deliberately does not emit a kld_list assignment (D-179).
+        printf '     load it at boot with:  sysrc kld_list+="carp"\n'
     fi
 
     # --- the password, and the file it is written in -----------------------

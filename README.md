@@ -14,7 +14,7 @@ the implementation brief is in `HANDOFF.md`. Installing it is
 `docs/INSTALL.md`, step by step, with the CBSD source citations behind each
 step.
 
-## Status: M5 — v0.5.1
+## Status: M5 — v0.5.2
 
 Everything the design describes is implemented and tested at every tier the
 harness has. Layer 1 is live: `repl` snapshots, sends and prunes; `status` is
