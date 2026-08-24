@@ -131,6 +131,8 @@ PROMOTE_KERNEL=""           # same | differs | unknown
 PROMOTE_KERNEL_DETAIL=""
 PROMOTE_GUESTS_PROMOTED=0
 PROMOTE_GUESTS_SEEN=0
+PROMOTE_UNNAMED=""              # replicas carrying no seance:guest (D-183),
+                                # space separated; refused by dataset
 PROMOTE_GUEST_DISPOSITIONS=""   # "<guest>=<disposition>" per guest, space sep
 PROMOTE_DEFERRED=""             # one line per deferred guest: the command, and
                                 # the node that has to run it (D-130)
@@ -1302,6 +1304,22 @@ promote_standby_root()
 # an estate, and a replica with no lineage is not promotable -- the disposition
 # rung would abort on it anyway, and discovering it here keeps that abort
 # attached to a named guest rather than to an empty list.
+#
+# THE GUEST'S NAME IS READ, NEVER DERIVED (D-183). It comes out of
+# `seance:guest` on the replica root, which the dead node's own repl wrote there
+# every tick (repl_remote_enforce_law). What this replaced was the replica
+# dataset's BASENAME -- and a basename is the name the PLATFORM gave the source
+# dataset when it created the guest, not the guest's name: on the first real
+# fleet every guest's data lives in `<jname>-data`, so the estate named guests
+# that do not exist and a correct promotion was refused as "no guest called
+# <name>" with the home node already down. It is the D-178 mistake one seam
+# over, and the same answer: a creation convention is not a contract.
+#
+# A replica carrying no recorded name is printed with `-` in the guest field --
+# never skipped, and never promoted under a guessed name. The caller refuses it
+# BY DATASET (the only name it truthfully has) and says what to run; a replica
+# quietly left out of this listing is one an operator reads as "seance holds
+# nothing for it", which is the reading D-44 item 3 exists to prevent.
 promote_estate()
 {
     local _sroot _dead _base _kids _ds _guest _ts
@@ -1313,12 +1331,17 @@ promote_estate()
     _kids=$( zfs_children "${_base}" ) || return 1
 
     for _ds in ${_kids}; do
-        _guest=${_ds##*/}
-
         # The configuration mirror lives beside the guests and is not one
         # (D-82). It is what rung 6 reads a jail's rc.conf out of; promoting it
-        # would be promoting seance's own bookkeeping.
-        [ "${_guest}" = "${REPL_SYS_GUEST}" ] && continue
+        # would be promoting seance's own bookkeeping. It is recognised by its
+        # dataset name because seance chose that name itself -- the one basename
+        # under this root that IS a contract.
+        [ "${_ds##*/}" = "${REPL_SYS_GUEST}" ] && continue
+
+        _guest=$( zfs_get seance:guest "${_ds}" 2>/dev/null ) || _guest=""
+        case "${_guest}" in
+            ''|'-') _guest='-' ;;
+        esac
 
         # MEMBERSHIP is "carries at least one @seance-<dead>-* anywhere"
         # (D-44 item 3). THE PROMOTION POINT is the newest instant every
@@ -2447,6 +2470,7 @@ promote_run()
     PROMOTE_KERNEL_DETAIL=""
     PROMOTE_GUESTS_PROMOTED=0
     PROMOTE_GUESTS_SEEN=0
+    PROMOTE_UNNAMED=""
     PROMOTE_GUEST_DISPOSITIONS=""
     PROMOTE_DEFERRED=""
     PROMOTE_AUTO_VHID=""
@@ -2604,6 +2628,21 @@ promote_run()
         _ts=${_ds#*"${PROMOTE_TAB}"}
         _ds=${_ds%%"${PROMOTE_TAB}"*}
 
+        # A replica whose guest name was never recorded (D-183). Refused BY
+        # DATASET, because that is the only name this node truthfully has for
+        # it, and counted so that the two failure reports below can tell an
+        # operator the difference between "you asked for a guest that is not
+        # here" and "it may well be here, under a replica nothing can name".
+        if [ "${_guest}" = "-" ]; then
+            PROMOTE_UNNAMED="${PROMOTE_UNNAMED} ${_ds}"
+            seance_log err "promote: ${_ds} carries no seance:guest property," \
+                "so this node cannot say which guest of ${_dead} it is a replica of." \
+                "It is NOT promoted. One replication tick on ${_dead} records it;" \
+                "seance verify reports every replica in this state before it matters."
+            promote_note "${_ds}: no recorded guest name -- refused (see the error above)"
+            continue
+        fi
+
         [ -n "${_gf}" ] && [ "${_gf}" != "${_guest}" ] && continue
 
         PROMOTE_GUESTS_SEEN=$(( PROMOTE_GUESTS_SEEN + 1 ))
@@ -2614,6 +2653,19 @@ promote_run()
     done < "${PROMOTE_TMPDIR}/estate"
 
     if [ -n "${_gf}" ] && [ "${PROMOTE_GUESTS_SEEN}" -eq 0 ]; then
+        # The two answers are different answers, and giving the first one when
+        # the second is true is what cost a drill (D-183): the operator reads
+        # "no such guest" as "I am on the wrong node" and goes looking in the
+        # wrong place, while the guest's replica is sitting right here.
+        if [ -n "${PROMOTE_UNNAMED}" ]; then
+            seance_log err "promote: no replica here records the guest name \"${_gf}\"," \
+                "and ${PROMOTE_UNNAMED# } record no guest name at all -- \"${_gf}\" may be" \
+                "one of them. Run one replication tick on ${_dead} if it is up, or promote" \
+                "by dataset once you have established which replica is which."
+            printf 'promote: FAIL%sno replica of %s here is named "%s", and these record no name:%s\n' \
+                "${PROMOTE_SEP}" "${_dead}" "${_gf}" "${PROMOTE_UNNAMED}"
+            return 2
+        fi
         seance_log err "promote: ${_dead} has no guest called \"${_gf}\" on this node"
         printf 'promote: FAIL%sno guest called "%s" in the estate of %s held here\n' \
             "${PROMOTE_SEP}" "${_gf}" "${_dead}"
@@ -2622,8 +2674,17 @@ promote_run()
 
     # --- rung 6 -----------------------------------------------------------
     if [ -z "${_left}" ]; then
-        promote_rung 6 promotion "n/a" \
-            "no guest of ${_dead}'s estate is this node's to promote right now"
+        # "Nothing to do" and "nothing I can name" are different sentences, and
+        # the second one has a remedy (D-183).
+        if [ -n "${PROMOTE_UNNAMED}" ]; then
+            promote_rung 6 promotion "n/a" \
+                "no guest of ${_dead}'s estate is this node's to promote right now;" \
+                "and these replicas record no guest name, so they were not considered:" \
+                "${PROMOTE_UNNAMED# } -- one replication tick on ${_dead} records them"
+        else
+            promote_rung 6 promotion "n/a" \
+                "no guest of ${_dead}'s estate is this node's to promote right now"
+        fi
     else
         promote_rung 6 promotion pass \
             "promoting, alphabetically:" \
