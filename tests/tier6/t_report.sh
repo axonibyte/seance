@@ -137,6 +137,14 @@ EOF
 for n in alpha bravo; do
     cp "${CONF}" "$( cluster_root "${n}" )/etc/seance.conf"
     mkdir -p "$( cluster_root "${n}" )/usr/local/etc/cron.d"
+    # The boot gate, because these worlds assert that `verify` passes CLEANLY:
+    # a node with no gate is a node whose estate nothing withholds after a
+    # promotion, and verify says so (D-183). Installing it here keeps the
+    # clean-run assertions about what they were written to be about.
+    mkdir -p "$( cluster_root "${n}" )/usr/local/etc/rc.d"
+    cp "${T_ROOT}/rc.d/seance_gate" "$( cluster_root "${n}" )/usr/local/etc/rc.d/seance_gate"
+    chmod 0555 "$( cluster_root "${n}" )/usr/local/etc/rc.d/seance_gate"
+    printf 'seance_gate_enable="YES"\n' >> "$( cluster_root "${n}" )/etc/rc.conf"
 done
 
 node_sh alpha ". ${SN_ADAPTER}; adapter_init && pseudo_guest_create web01 jail alpha" ||

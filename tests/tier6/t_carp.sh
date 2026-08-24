@@ -57,7 +57,7 @@ if [ "$( id -u )" -ne 0 ]; then
     exit 2
 fi
 
-t_plan 37
+t_plan 39
 
 estate_up || { t_diag "estate_up failed"; t_done; }
 
@@ -182,6 +182,16 @@ t_like "$( awk '/^WARN /' "${VERIFY}" )" '^WARN devd: service devd status does n
     "and it is devd, which is KEYWORD: nojail and cannot run in a vnet jail"
 t_is "${VERIFY_RC}" "1" \
     "so verify exits 1 -- one warning is a difference between the rendering and reality"
+
+t_like "$( cat "${VERIFY}" )" '^PASS gate: /usr/local/etc/rc.d/seance_gate is installed and seance_gate_enable is YES' \
+    "verify sees the boot gate installed and enabled -- the check whose absence looked like health (D-183)"
+# On BRAVO, which is where alpha's replicas actually live: alpha holds nobody
+# else's estate in this world, and a check that reported on an empty standby
+# tree would be a green line about datasets that are not there.
+VERIFY_B=$( t_tmpdir )/verify.bravo
+node_seance bravo verify > "${VERIFY_B}" 2>&1
+t_like "$( cat "${VERIFY_B}" )" '^PASS replica: [1-9][0-9]* replica\(s\) of alpha record the guest they belong to' \
+    "and the node HOLDING alpha's replicas can say which guest each one belongs to"
 
 t_like "$( cat "${VERIFY}" )" '^verify: renderings available: cron, carp, devd' \
     "and the summary names every subject verify can render"

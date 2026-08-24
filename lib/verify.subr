@@ -10,9 +10,13 @@
 #   4. every peer holds the SAME configuration file, byte for byte;
 #   5. this node's standby parents on every peer are still hidden --
 #      canmount=noauto, mountpoint=none;
+#   5b. every replica this node HOLDS records which guest it is a replica of,
+#      because a promotion that cannot name one will refuse it (D-183);
 #   6. the crontab line seance expects is installed somewhere cron reads;
 #   7. the CARP vhids this node should carry are in rc.conf and on an
-#      interface, and the devd(8) rules that act on them are installed.
+#      interface, and the devd(8) rules that act on them are installed;
+#   8. the boot gate is installed and enabled, because the estate it withholds
+#      is withheld on a boot nobody is watching.
 #
 # VERIFY NEVER WRITES ANYTHING. Not the crontab, not a standby property, not a
 # configuration file. It renders what it expects and says where reality differs
@@ -172,6 +176,121 @@ done
 exit 0"
 
     seance_ssh "${_addr}" "${_cmd}"
+}
+
+# verify_gate
+#
+# The boot gate: rc.d/seance_gate installed where rc(8) will run it, and
+# enabled. It is checked here because it is the one piece of seance that runs
+# when nobody is watching and whose absence LOOKS like health -- a node with no
+# gate passes every other check in this verifier and then, on its first boot
+# after a promotion, starts the guests that are already running on the survivor.
+#
+# WARN and not FAIL, argued: a node serves its own guests correctly with no
+# gate at all, and the fleet drill that found this (2026-08-24) had three green
+# nodes and no gate anywhere. What the gate protects is the boot AFTER a
+# promotion, so a missing gate is a promise this fleet has not made yet rather
+# than a broken one -- and WARN is already enough to make `verify` exit
+# non-zero, which is the line an operator's automation reads.
+verify_gate()
+{
+    local _unit _rcvar _prog
+
+    _unit=/usr/local/etc/rc.d/seance_gate
+    _prog="${SEANCE_ROOT}/rc.d/seance_gate"
+
+    if [ ! -f "${_unit}" ]; then
+        verify_warn "gate: no rc.d unit at ${_unit}, so nothing withholds this" \
+            "node's estate when it boots after a promotion. Install it with:" \
+            "cp ${_prog} ${_unit} && sysrc seance_gate_enable=YES" \
+            "&& service seance_gate onestart"
+        return 0
+    fi
+
+    if [ ! -x "${_unit}" ]; then
+        verify_warn "gate: ${_unit} is not executable, so rc(8) will not run it;" \
+            "chmod 0555 ${_unit}"
+        return 0
+    fi
+
+    _rcvar=""
+    if command -v sysrc > /dev/null 2>&1; then
+        _rcvar=$( sysrc -n seance_gate_enable 2>/dev/null ) || _rcvar=""
+    fi
+
+    case "${_rcvar}" in
+        [Yy][Ee][Ss]|[Tt][Rr][Uu][Ee]|[Oo][Nn]|1)
+            verify_pass "gate: ${_unit} is installed and seance_gate_enable is ${_rcvar}"
+            ;;
+        '')
+            verify_warn "gate: ${_unit} is installed but seance_gate_enable is not set," \
+                "so rc(8) will not run it. Set it with: sysrc seance_gate_enable=YES"
+            ;;
+        *)
+            verify_warn "gate: ${_unit} is installed and seance_gate_enable is" \
+                "\"${_rcvar}\", which is not a yes: the gate will not run at boot." \
+                "Set it with: sysrc seance_gate_enable=YES"
+            ;;
+    esac
+
+    return 0
+}
+
+# verify_replica_identity <standby-root> <peerkey>
+#
+# Every replica this node holds for <peer> must record which guest it is a
+# replica OF, in `seance:guest` on its root (D-183). This is a check about a
+# FUTURE promotion, run now: the replica's dataset name comes from the source
+# dataset's basename, which on a real fleet is not the guest's name, so a
+# replica with no recorded name is one that `promote` will refuse -- and the
+# only cheap moment to learn that is before the node whose guests they are has
+# gone down.
+#
+# The remedy is a tick, never a hand-set property: the node that owns the guest
+# is the only one entitled to say what its name is.
+verify_replica_identity()
+{
+    local _sroot _peer _base _kids _ds _name _n_ok _n_bad _bad
+
+    _sroot=$1
+    _peer=$2
+    _base="${_sroot}/${_peer}"
+
+    zfs_exists "${_base}" || return 0
+
+    _kids=$( zfs_children "${_base}" 2>/dev/null ) || return 0
+    [ -n "${_kids}" ] || return 0
+
+    _n_ok=0
+    _n_bad=0
+    _bad=""
+
+    for _ds in ${_kids}; do
+        [ "${_ds##*/}" = "${REPL_SYS_GUEST}" ] && continue
+
+        _name=$( zfs_get seance:guest "${_ds}" 2>/dev/null ) || _name=""
+        case "${_name}" in
+            ''|'-')
+                _n_bad=$(( _n_bad + 1 ))
+                _bad="${_bad} ${_ds}"
+                ;;
+            *)
+                _n_ok=$(( _n_ok + 1 ))
+                ;;
+        esac
+    done
+
+    if [ "${_n_bad}" -gt 0 ]; then
+        verify_warn "replica: ${_n_bad} replica(s) of ${_peer} record no guest name" \
+            "(seance:guest):${_bad} -- a promotion cannot say which guest each one is," \
+            "and will refuse them by dataset. One replication tick on ${_peer} records" \
+            "them; do not set the property by hand."
+    fi
+
+    [ "${_n_ok}" -gt 0 ] && verify_pass "replica: ${_n_ok} replica(s) of ${_peer} record" \
+        "the guest they belong to"
+
+    return 0
 }
 
 # verify_cron
@@ -640,7 +759,7 @@ verify_devd()
 # The whole check. Returns the exit code documented at the top of this file.
 verify_report()
 {
-    local _home _conf _lsha _now _skew _peer _addr _tmp
+    local _home _conf _lsha _now _skew _peer _addr _tmp _selfroot
     local _psha _pdate _delta _sroot _root _line _ds _mp _cm _guest _names
 
     if ! conf_check > /dev/null; then
@@ -677,6 +796,17 @@ verify_report()
                 break
             fi
         done
+    fi
+
+    # WHERE THIS NODE KEEPS OTHER NODES' REPLICAS -- its OWN standby root, and
+    # not the one computed per peer below. The two are different datasets and
+    # confusing them is easy: `repl_standby_root <peer>` answers "where do THIS
+    # node's guests land ON that peer", which is what the standby-parent check
+    # asks a peer about; what the identity check reads is local, and lives
+    # under this node's own root, one directory per node whose estate it holds.
+    _selfroot=""
+    if ! _selfroot=$( repl_standby_root "${_home}" ); then
+        [ -n "${_root}" ] && _selfroot=$( repl_standby_root_derived "${_root}" )
     fi
 
     for _peer in $( conf_nodes ); do
@@ -771,6 +901,10 @@ verify_report()
                     "a standby parent that can mount is a shadow mount waiting for a reboot"
             fi
         done < "${_tmp}/standby"
+
+        # 5b. and what the replicas THIS node holds for that peer say they are
+        # replicas OF (D-183) -- local datasets, under this node's own root.
+        [ -n "${_selfroot}" ] && verify_replica_identity "${_selfroot}" "${_peer}"
     done
 
     # 6. the schedule
@@ -779,6 +913,9 @@ verify_report()
     # 7. detection: the vhids that carry it and the rules that act on it
     verify_carp "${_home}"
     verify_devd "${_home}"
+
+    # 8. the boot gate: the half that runs when nobody is watching
+    verify_gate
 
     printf 'verify: renderings available: %s (seance verify --render <subject>)\n' \
         "$( printf '%s' "${VERIFY_RENDERS}" | tr ' ' ',' | sed -e 's/,/, /g' )"

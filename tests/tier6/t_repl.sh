@@ -44,7 +44,7 @@ if [ "$( id -u )" -ne 0 ]; then
     exit 2
 fi
 
-t_plan 80
+t_plan 84
 
 TAB=$( printf '\t.' )
 TAB=${TAB%.}
@@ -154,6 +154,14 @@ EOF
 for n in alpha bravo charlie; do
     cp "${CONF}" "$( cluster_root "${n}" )/etc/seance.conf"
     mkdir -p "$( cluster_root "${n}" )/usr/local/etc/cron.d"
+    # The boot gate, because these worlds assert that `verify` passes CLEANLY:
+    # a node with no gate is a node whose estate nothing withholds after a
+    # promotion, and verify says so (D-183). Installing it here keeps the
+    # clean-run assertions about what they were written to be about.
+    mkdir -p "$( cluster_root "${n}" )/usr/local/etc/rc.d"
+    cp "${T_ROOT}/rc.d/seance_gate" "$( cluster_root "${n}" )/usr/local/etc/rc.d/seance_gate"
+    chmod 0555 "$( cluster_root "${n}" )/usr/local/etc/rc.d/seance_gate"
+    printf 'seance_gate_enable="YES"\n' >> "$( cluster_root "${n}" )/etc/rc.conf"
 done
 
 t_rc 0 "the fleet configuration validates on alpha" \
@@ -272,6 +280,19 @@ t_is "$( law_violations charlie "${DB_ON_CHARLIE}" )" "" \
 t_unlike "$( nz bravo get -H -o value mountpoint "${WEB_ON_BRAVO}" )" \
     '^/seance/web01$' \
     "the replica did not inherit the live guest's own mountpoint"
+
+# --- the replica's identity (D-183) -----------------------------------------
+#
+# The tick that maintains a replica also records WHICH GUEST it is a replica
+# of, because the replica's dataset name comes from the source dataset's
+# basename and cannot be read backwards. Asserted here, on the sending side's
+# own work, because promote's ability to name a guest at 03:00 is entirely this
+# line having run at some quiet moment beforehand.
+t_is "$( nz bravo get -H -o value seance:guest "${WEB_ON_BRAVO}" )" "web01" \
+    "the replica records the guest it belongs to"
+t_is "$( nz charlie get -H -o value seance:guest "${WEB_ON_CHARLIE}" )" "web01" \
+    "on every heir, not only the first"
+
 
 # --- the standby parents ----------------------------------------------------
 for pair in "bravo ${BASE_DS}/bravo/standby" \
@@ -603,5 +624,21 @@ DRIFT_VERIFY_RC=$?
 t_isnt "${DRIFT_VERIFY_RC}" "0" "verify on alpha refuses to exit 0 as well"
 t_like "${DRIFT_VERIFY}" '^FAIL config: charlie HOLDS A DIFFERENT FILE' \
     "and names the node, the file, and that seance will not fix it for you"
+
+# --- the identity comes BACK (D-183) ----------------------------------------
+#
+# LAST in this file on purpose: it runs an extra tick, and a tick that ran in
+# the middle would change the snapshot and lag assertions above into a
+# different test than the one they were written to be.
+#
+# A property somebody cleared -- or a replica received by a seance that
+# predates this contract, which is the whole upgrade path -- is put back by the
+# next tick, not left for a promotion to trip over at 03:00.
+nz bravo inherit seance:guest "${WEB_ON_BRAVO}" > /dev/null 2>&1
+t_is "$( nz bravo get -H -o value seance:guest "${WEB_ON_BRAVO}" )" "-" \
+    "a cleared identity really is cleared, so the next assertion means something"
+node_seance alpha repl --now > /dev/null 2>&1
+t_is "$( nz bravo get -H -o value seance:guest "${WEB_ON_BRAVO}" )" "web01" \
+    "and one more tick puts it back, which is how an upgraded fleet heals itself"
 
 t_done

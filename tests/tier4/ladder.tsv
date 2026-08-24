@@ -27,6 +27,13 @@
 #                                 what the guest's own configuration says about
 #                                 where its data lives, and whether that
 #                                 configuration travels inside its own replica
+#              replica=<named|fleetshape|unnamed>
+#                                 what the replica's dataset is CALLED and
+#                                 whether the tick recorded which guest it
+#                                 belongs to (D-183): fleetshape is the real
+#                                 fleet's -- basename <guest>-data, name
+#                                 recorded -- and unnamed is a replica no
+#                                 promotion may name
 #              platform=<agree|disagree|silent>
 #                                 what the platform reports about the guest's
 #                                 data path once it has been registered
@@ -165,3 +172,7 @@ auto-override-deferred	auto=1 override=charlie notify=ok	-	deferred	fence:mock	-
 auto-happy-notify	auto=1 notify=ok	-	proceed	fence:mock	-	0
 auto-not-armed-notify	auto=1 armed=no notify=ok	-	abort	-	0 arming	1
 auto-fence-unknown-notify	auto=1 fence=unknown notify=ok	-	notify	-	4 fence	1
+replica-fleetshape	replica=fleetshape	-	proceed	fence:mock	-	0
+replica-fleetshape-vm	replica=fleetshape guest=db01	-	proceed	fence:mock	-	0
+replica-unnamed	replica=unnamed	-	abort	fence:mock	-	1
+replica-unnamed-forced	replica=unnamed	all	abort	fence:mock	-	1

@@ -663,13 +663,19 @@ adapter_carp_state()
 # a guest up by name still finds it.
 pseudo_guest_create()
 {
-    local _name _type _home _astart _data _root _ds
+    local _name _type _home _astart _data _dsname _root _ds
 
     _name=$1
     _type=$2
     _home=$3
     _astart=${4:-1}
     _data=${5:-}
+    # The DATASET's basename, when it is not the guest's name. Real platforms
+    # name a guest's dataset by their own convention -- CBSD's is
+    # `<jname>-<jaildatapref>` -- and a fixture in which the two are always
+    # equal is a fixture that cannot express the fleet seance actually runs on
+    # (D-183). Defaults to the guest's name, which is the textbook shape.
+    _dsname=${6:-$1}
 
     pseudo_name_ok "${_name}" || { pseudo_diag "bad guest name: ${_name}"; return 2; }
 
@@ -680,8 +686,13 @@ pseudo_guest_create()
         *) pseudo_diag "not an absolute data path: [${_data}]"; return 2 ;;
     esac
 
+    pseudo_name_ok "${_dsname}" || {
+        pseudo_diag "bad dataset basename: ${_dsname}"
+        return 2
+    }
+
     _root=$( pseudo_root ) || return 1
-    _ds="${_root}/${_name}"
+    _ds="${_root}/${_dsname}"
 
     zfs create -o "mountpoint=${_data}" "${_ds}" || return 1
     zfs create "${_ds}/sys" || return 1

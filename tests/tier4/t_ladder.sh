@@ -236,6 +236,49 @@ zfs_volumes_r()
 W_MIRROR=ok
 W_MIRROR_GUEST=web01
 
+# WHAT THE REPLICA SAYS IT IS A REPLICA OF (D-183). Three shapes, and the
+# middle one is the fleet's:
+#
+#   named       the replica's dataset basename happens to equal the guest's
+#               name AND the tick recorded the name. The textbook shape, and
+#               the one every fixture in this repository used to assume.
+#   fleetshape  the basename is <guest>-data, because that is what the
+#               PLATFORM called the source dataset when it created the guest,
+#               and the tick recorded the guest's real name. Deriving a name
+#               from this basename produces a guest that does not exist --
+#               which is exactly what refused a correct promotion on the first
+#               real fleet, with the home node already down.
+#   unnamed     nothing recorded a name. The upgrade window, and the state
+#               a hand-made dataset is in. Must be refused BY DATASET.
+W_REPLICA=named
+W_REPLICA_BASE=""
+
+# shellcheck disable=SC2329
+zfs_get()
+{
+    case "$1" in
+        seance:guest)
+            # `zfs get` of an unset user property prints '-' and exits 0; a
+            # mock that printed nothing would be testing a shape the real
+            # command never produces.
+            case "${W_REPLICA}" in
+                unnamed) printf '%s\n' '-' ;;
+                *)
+                    case "$2" in
+                        *"/${REPL_SYS_GUEST}") printf '%s\n' '-' ;;
+                        *) printf '%s\n' "${W_MIRROR_GUEST}" ;;
+                    esac
+                    ;;
+            esac
+            return 0
+            ;;
+        *)
+            t_diag "zfs_get: this fixture has no answer for property [$1] on [$2]"
+            return 1
+            ;;
+    esac
+}
+
 # What the guest's own configuration says about where its data lives, and
 # whether that configuration travels inside the guest's own replica (D-181).
 W_DATA=none
@@ -458,7 +501,7 @@ ROWDIR=""
 # world_build <spec>
 world_build()
 {
-    local _spec _kv _k _v
+    local _spec _kv _k _v _replica
     local _nodes _reach _dead _fence _lineage _claim _peermute _kernel _guest _notify
     local _sysdir _mirror _tree _auto _fleetauto _armed _carp _vhid _succ
     local _override _data _platform
@@ -488,6 +531,7 @@ world_build()
     _override=-
     _data=none
     _platform=agree
+    _replica=named
 
     [ "${_spec}" = "-" ] && _spec=""
 
@@ -517,6 +561,7 @@ world_build()
             override) _override=${_v} ;;
             data)     _data=${_v} ;;
             platform) _platform=${_v} ;;
+            replica)  _replica=${_v} ;;
             *)
                 t_diag "world_build: unknown setting: ${_kv}"
                 return 2
@@ -625,9 +670,19 @@ world_build()
     # is in the estate listing on purpose: rung 5 has to walk past it, and a
     # promotion of seance's own bookkeeping is the failure this row exists to
     # make impossible.
-    W_GUESTROOT="pool0/bravo/standby/alpha/${_guest}"
+    case "${_replica}" in
+        named|fleetshape|unnamed) W_REPLICA=${_replica} ;;
+        *) t_diag "world_build: unknown replica shape: ${_replica}"; return 2 ;;
+    esac
 
-    W_ESTATE="pool0/bravo/standby/alpha/${_guest}
+    case "${W_REPLICA}" in
+        fleetshape) W_REPLICA_BASE="${_guest}-data" ;;
+        *)          W_REPLICA_BASE="${_guest}" ;;
+    esac
+
+    W_GUESTROOT="pool0/bravo/standby/alpha/${W_REPLICA_BASE}"
+
+    W_ESTATE="pool0/bravo/standby/alpha/${W_REPLICA_BASE}
 pool0/bravo/standby/alpha/${REPL_SYS_GUEST}"
 
     # --- the replica's lineage --------------------------------------------
@@ -928,7 +983,7 @@ fi
 # One assertion per row, plus the twenty-five named assertions below. A table
 # with no rows would have produced a green run of nothing, which is why the
 # count is derived from the table rather than written down.
-t_plan $(( NROWS + 105 ))
+t_plan $(( NROWS + 115 ))
 
 SAVED=$( t_tmpdir )
 AUTO_ROWS=""
@@ -1034,6 +1089,44 @@ t_like "$( cat "${SAVED}/happy.zfs" )" \
     "the replica is mounted IN PLACE at the path the platform expects"
 t_like "$( cat "${SAVED}/happy.zfs" )" '^mount pool0/bravo/standby/alpha/web01$' \
     "and it is mounted explicitly, because canmount stays noauto"
+
+# ---------------------------------------------------------------------------
+# The replica's identity (D-183)
+#
+# The fleet shape is the one that mattered: a replica called <guest>-data,
+# because that is what CBSD called the source dataset. Deriving the guest's
+# name from that basename names a guest that does not exist, and the ladder
+# refused a correct promotion with the home node already down. These rows say
+# the name is READ, and that a replica with no recorded name is refused BY
+# DATASET rather than skipped or guessed at.
+# ---------------------------------------------------------------------------
+
+t_like "$( cat "${SAVED}/replica-fleetshape.out" )" \
+    '^rung 5 lineage: pass .*estate of alpha .*: web01 ' \
+    "a replica called web01-data is the guest web01, because the tick recorded it"
+t_unlike "$( cat "${SAVED}/replica-fleetshape.out" )" 'web01-data:' \
+    "and nothing downstream ever calls the guest by its dataset's name"
+t_like "$( cat "${SAVED}/replica-fleetshape.out" )" \
+    '^rung 6 promotion: pass .*promoting, alphabetically:  *web01 *$' \
+    "so it is promoted under the name the platform knows it by"
+t_like "$( cat "${SAVED}/replica-fleetshape.zfs" )" \
+    "^set mountpoint=.*/jails-data/web01-data pool0/bravo/standby/alpha/web01-data\$" \
+    "the ceremony mounts the dataset it really is, at the path the guest's own configuration named"
+t_is "$( cat "${SAVED}/replica-fleetshape.placement" )" "web01	alpha" \
+    "and the placement claim names the GUEST, which is what the boot gate reads"
+
+t_like "$( cat "${SAVED}/replica-unnamed.out" )" \
+    'pool0/bravo/standby/alpha/web01 carries no seance:guest property' \
+    "a replica that records no guest name is refused by DATASET"
+t_like "$( cat "${SAVED}/replica-unnamed.out" )" 'One replication tick on alpha records it' \
+    "and the refusal names the remedy, which is a tick and never a hand-set property"
+t_unlike "$( cat "${SAVED}/replica-unnamed.out" )" '^rung 6 promotion: pass' \
+    "nothing is promoted under a guessed name"
+t_like "$( cat "${SAVED}/replica-unnamed.out" )" \
+    '^rung 6 promotion: n/a .*record no guest name, so they were not considered' \
+    "and rung 6 says which replicas it could not consider -- silence would read as 'nothing here'"
+t_unlike "$( cat "${SAVED}/replica-unnamed-forced.out" )" '^rung 6 promotion: pass' \
+    "and --force does not make an unnameable replica promotable: it is not a rung"
 
 # ---------------------------------------------------------------------------
 # The driver environment seance promises a fence driver (D-53)

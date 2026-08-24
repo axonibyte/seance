@@ -24,6 +24,10 @@
 #   #                            every tick and repaired if drifted
 #   # contract: replica path     <standby_root>/<homekey>/<basename of root>
 #   #                            plus each dataset's tail below that root
+#   # contract: replica identity seance:guest=<guest> on the replica root,
+#   #                            written every tick -- the replica's PATH is
+#   #                            derived from a dataset name and so cannot be
+#   #                            read backwards (D-183)
 #   # contract: lag record       "<replica_ts|-> <tick_epoch> <rc>", one file
 #   #                            per guest per peer under <state>/lag/
 #
@@ -351,6 +355,23 @@ repl_ds_safe()
     case "${1:-}" in
         '') return 1 ;;
         *[!$REPL_DS_SAFE]*) return 1 ;;
+    esac
+
+    return 0
+}
+
+# repl_guest_safe <guest>
+#
+# A guest name this file is willing to interpolate into a command that runs on
+# a peer. The rule is the platform's own (adapter names: a lower-case letter or
+# digit, then letters, digits, dot, dash, underscore), restated here rather
+# than borrowed from the adapter, because what is being guarded is not a
+# platform question -- it is whether this string may cross an ssh boundary.
+repl_guest_safe()
+{
+    case "${1:-}" in
+        ''|[!abcdefghijklmnopqrstuvwxyz0123456789]*) return 1 ;;
+        *[!abcdefghijklmnopqrstuvwxyz0123456789._-]*) return 1 ;;
     esac
 
     return 0
@@ -851,12 +872,27 @@ exit 0"
     seance_ssh "${_addr}" "${_cmd}"
 }
 
-# repl_remote_enforce_law <address> <replica-root>
+# repl_remote_enforce_law <address> <replica-root> <guest>
 #
 # The shadow-mount law, held on every dataset of the replica subtree every
 # tick: mountpoint must not be local or received on a replica (a real path
 # there is a mount waiting to happen over live data), and canmount must be
 # noauto.
+#
+# AND THE REPLICA'S IDENTITY, on the root only (D-183). The replica's name is
+# built from the SOURCE DATASET's basename (repl_replica_root), which is a name
+# this fleet's platform chose when it created the guest -- on the first real
+# fleet, `<jname>-data`. A survivor holding that replica has no way to read the
+# guest's name back out of it, and the promotion that tried to derive it named
+# a guest that does not exist while the home node was already down. So the tick
+# that maintains the replica also RECORDS what it is a replica OF, in
+# `seance:guest` on the replica root: the node that owns the guest is the only
+# one that knows its name, and this is the one moment it is in a position to
+# say so to the node that will need it.
+#
+# Every tick, not only at creation, for two reasons: a replica that predates
+# this decision is stamped by the next tick (which is the whole of the upgrade
+# path), and a property somebody cleared is a property that comes back.
 #
 # canmount is not an inheritable property, so a received dataset takes the
 # default 'on' whatever its parent says; -x canmount only keeps the SOURCE's
@@ -879,14 +915,17 @@ exit 0"
 # Prints one line per action, and nothing when the law already held.
 repl_remote_enforce_law()
 {
-    local _addr _root _cmd
+    local _addr _root _guest _cmd
 
     _addr=$1
     _root=$2
+    _guest=$3
 
     repl_ds_safe "${_root}" || return 2
+    repl_guest_safe "${_guest}" || return 2
 
     _cmd="root='${_root}'
+guest='${_guest}'
 zfs list -H -o name -t filesystem,volume -r \"\$root\" 2>/dev/null | while read -r d; do
     src=\$( zfs get -H -o source mountpoint \"\$d\" )
     if [ \"\$src\" = 'local' ] || [ \"\$src\" = 'received' ]; then
@@ -903,6 +942,15 @@ zfs list -H -o name -t filesystem,volume -r \"\$root\" 2>/dev/null | while read 
         fi
     fi
 done
+was=\$( zfs get -H -o value seance:guest \"\$root\" 2>/dev/null ) || was='-'
+if [ \"\$was\" != \"\$guest\" ]; then
+    zfs set seance:guest=\"\$guest\" \"\$root\" || exit 1
+    if [ \"\$was\" = '-' ]; then
+        printf 'recorded guest %s on %s\n' \"\$guest\" \"\$root\"
+    else
+        printf 'repaired guest on %s (was %s, now %s)\n' \"\$root\" \"\$was\" \"\$guest\"
+    fi
+fi
 exit 0"
 
     seance_ssh "${_addr}" "${_cmd}"
@@ -1237,7 +1285,7 @@ repl_pair()
     done
 
     # --- the shadow-mount law, on what has arrived ------------------------
-    if ! _res=$( repl_remote_enforce_law "${_addr}" "${_rroot}" ); then
+    if ! _res=$( repl_remote_enforce_law "${_addr}" "${_rroot}" "${_guest}" ); then
         seance_log err "repl ${_guest}->${_peer}: cannot hold the replica property law on ${_rroot}"
         _rc=1
     elif [ -n "${_res}" ]; then
@@ -1246,6 +1294,11 @@ repl_pair()
             [ -n "${_line}" ] || continue
             case "${_line}" in
                 enforced*) seance_log info "repl ${_peer}: ${_line}" ;;
+                # "recorded guest" is the routine half of the identity
+                # contract: expected once per replica, on the tick that created
+                # it or the first tick after an upgrade. "repaired guest" is
+                # not routine and keeps the warning below.
+                "recorded guest"*) seance_log info "repl ${_peer}: ${_line}" ;;
                 *) seance_log warning "repl ${_peer}: ${_line}" ;;
             esac
         done < "${_tmp}/repairs"

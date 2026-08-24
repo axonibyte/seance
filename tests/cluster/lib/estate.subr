@@ -183,7 +183,7 @@ nz()
 # (D-178, D-181).
 estate_guest_create()
 {
-    node_sh "$1" ". ${ESTATE_ADAPTER}; adapter_init && pseudo_guest_create $2 $3 $4 ${5:-1} ${6:-}"
+    node_sh "$1" ". ${ESTATE_ADAPTER}; adapter_init && pseudo_guest_create $2 $3 $4 ${5:-1} ${6:-} ${7:-}"
 }
 
 # estate_replica_root <peer> <homekey> <guest>
@@ -442,6 +442,33 @@ EOF
     return 0
 }
 
+# estate_install_gate <node>
+#
+# The boot gate, installed where rc(8) looks and enabled in rc.conf -- the two
+# lines docs/INSTALL.md tells an operator to run. The estate does it because an
+# estate that skips it is an estate that cannot notice its absence: the fleet
+# drill of 2026-08-24 found three nodes, every check green, and no gate on any
+# of them, because nothing in this repository had ever asserted one was there
+# (D-183).
+#
+# The unit is not RUN here -- rc(8) does not run inside these jails and the
+# gate's own behaviour is tier 6's t_resurrection and drill-guest's step 11.
+# What is asserted is that verify can see it.
+estate_install_gate()
+{
+    local _root
+
+    _root=$( cluster_root "$1" ) || return 1
+
+    mkdir -p "${_root}/usr/local/etc/rc.d" || return 1
+    cp "${T_ROOT}/rc.d/seance_gate" "${_root}/usr/local/etc/rc.d/seance_gate" || return 1
+    chmod 0555 "${_root}/usr/local/etc/rc.d/seance_gate" || return 1
+
+    printf 'seance_gate_enable="YES"\n' >> "${_root}/etc/rc.conf" || return 1
+
+    return 0
+}
+
 # estate_up
 #
 # Build the whole world. Returns 0 when every node is up, configured, carrying
@@ -462,6 +489,7 @@ estate_up()
         cp "${_conf}" "$( cluster_root "${_n}" )/etc/seance.conf" || return 1
         mkdir -p "$( cluster_root "${_n}" )/usr/local/etc/cron.d" || return 1
         estate_install_wrapper "${_n}" || return 1
+        estate_install_gate "${_n}" || return 1
     done
 
     fence_install || return 1

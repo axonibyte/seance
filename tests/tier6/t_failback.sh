@@ -63,9 +63,15 @@ WEB_ON_BRAVO=$( estate_replica_root bravo alpha web01 )
 # right is by asking the platform where the guest's data is rather than working
 # it out, which is the same rule the promotion follows.
 VMJ_DATA=/seance/vmdata/vmj01-data
-VMJ_ON_BRAVO=$( estate_replica_root bravo alpha vmj01 )
+VMJ_ON_BRAVO=$( estate_replica_root bravo alpha vmj01-data )
 
-estate_guest_create alpha vmj01 bhyve alpha 1 "${VMJ_DATA}" ||
+# The FLEET'S SHAPE, whole (D-183): a bhyve guest whose data lives on the
+# jail-shaped path AND whose dataset is called `vmj01-data`, because that is
+# what the platform called it at creation. Until this line said so, every
+# fixture in this repository kept the replica's basename equal to the guest's
+# name -- the one assumption that let `promote` refuse a correct promotion on
+# the real fleet, with the home node already down.
+estate_guest_create alpha vmj01 bhyve alpha 1 "${VMJ_DATA}" vmj01-data ||
     t_diag "creating vmj01 failed"
 node_sh alpha "echo vmj01-v1 > ${VMJ_DATA}/marker" ||
     t_diag "writing vmj01's marker failed"
@@ -227,9 +233,9 @@ t_is "${FBV_RC}" "0" "vmj01 fails back with no writes to discard, and no flag to
 t_like "$( cat "${FBV}" )" '^failback: vmj01 is home on alpha and running' \
     "and ends in one verdict line"
 
-t_is "$( nz alpha get -H -o value mountpoint "${ALPHA_DS}/vmj01" )" "${VMJ_DATA}" \
+t_is "$( nz alpha get -H -o value mountpoint "${ALPHA_DS}/vmj01-data" )" "${VMJ_DATA}" \
     "its dataset at home is still mounted where its own configuration says"
-t_is "$( nz alpha get -H -o value mounted "${ALPHA_DS}/vmj01" )" "yes" \
+t_is "$( nz alpha get -H -o value mounted "${ALPHA_DS}/vmj01-data" )" "yes" \
     "and it is mounted"
 t_stdout_is "vmj01-v1" "with the data that came back from the interim" \
     -- cluster_exec alpha cat "${VMJ_DATA}/marker"
