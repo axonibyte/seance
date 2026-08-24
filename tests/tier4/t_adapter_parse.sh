@@ -39,11 +39,19 @@ ROWS=""
 RRC=0
 rows()
 {
+    # THE SKIP MEMO IS CLEARED FIRST, so that each fixture below is its own
+    # process as far as the diagnostics are concerned. A skip line is said once
+    # per process (the dedupe section at the end of this file is about that),
+    # and these fixtures are about the PARSING -- a row of one that went quiet
+    # because a fixture three screens up had already said the same sentence
+    # would be a test measuring the memo by accident.
+    rm -f "$( _adapter_skip_log )"
+
     ROWS=$( printf '%s\n' "$1" | _adapter_list_rows 2> "${DIR}/err" )
     RRC=$?
 }
 
-t_plan 86
+t_plan 93
 
 # --- a listing of the shape CBSD prints --------------------------------------
 rows 'web01  jail   1  On
@@ -569,6 +577,71 @@ t_rc 2 "and a traversal is not a place CBSD ever put a guest" \
 
 t_rc 2 "a configuration file that cannot be read is a contract error, not an absence" \
     -- adapter_config_data_path "${CFG}/nosuchfile"
+
+# --- one line per skipped guest per PROCESS ----------------------------------
+#
+# `repl` enumerates the roster four times in one tick, and every enumeration
+# used to say the same thing about the same skipped guest: four identical lines
+# per tick, per guest, under cron, for ever. On a clustered node that is one
+# line per tick for every guest of every peer. A diagnostic that is always
+# there is a diagnostic nobody reads -- the same finding D-97 acted on for the
+# phantom-guest line.
+#
+# The behaviour is unchanged and the rows are unchanged; what is asserted here
+# is the COUNT, which is the whole of the fix, and the two things it must not
+# cost: a second, different sentence about the same guest, and a memo that
+# cannot be used going quiet instead of loud.
+
+SKIPLOG=$( _adapter_skip_log )
+rm -f "${SKIPLOG}"
+
+CLUSTERED='web01  jail             1  On
+far01  0                0  0
+qe01   qemu-arm-static  1  Off'
+
+: > "${DIR}/dedupe.err"
+n=0
+while [ "${n}" -lt 4 ]; do
+    printf '%s\n' "${CLUSTERED}" | _adapter_list_rows \
+        > "${DIR}/dedupe.out" 2>> "${DIR}/dedupe.err"
+    n=$(( n + 1 ))
+done
+
+t_is "$( grep -c 'skipping far01' "${DIR}/dedupe.err" )" "1" \
+    "four enumerations of the same roster say the remote guest's skip ONCE"
+t_is "$( grep -c 'skipping qe01' "${DIR}/dedupe.err" )" "1" \
+    "and the unsupported emulator's skip once, because every skip is deduped and not just one of them"
+t_is "$( grep -c 'skipping' "${DIR}/dedupe.err" )" "2" \
+    "so a tick that enumerates four times says two lines, not eight"
+t_is "$( cat "${DIR}/dedupe.out" )" "web01	jail	1	1" \
+    "and the ROWS are unchanged: this is what is said about a skip, never whether it happens"
+
+# A different sentence about the SAME guest is a different fact and is still
+# said: a guest whose row changed between two enumerations has something new to
+# report, and a memo keyed on the name alone would have swallowed it.
+printf 'far01  xen  1  Off\n' | _adapter_list_rows > /dev/null 2>> "${DIR}/dedupe.err"
+t_like "$( cat "${DIR}/dedupe.err" )" 'skipping far01: emulator xen is not supported' \
+    "a different sentence about the same guest is still said"
+
+# A memo that is not a plain file is not this process's memo: /tmp is
+# world-writable, and a symlink planted at the memo's path would otherwise make
+# seance append its diagnostics through it. Refusing costs the line being said
+# every time, which is the direction a failure here must fall in.
+rm -f "${SKIPLOG}"
+ln -sf "${DIR}/planted" "${SKIPLOG}"
+: > "${DIR}/planted.err"
+printf 'far02  0  0  0\n' | _adapter_list_rows > /dev/null 2>> "${DIR}/planted.err"
+printf 'far02  0  0  0\n' | _adapter_list_rows > /dev/null 2>> "${DIR}/planted.err"
+
+t_is "$( grep -c 'skipping far02' "${DIR}/planted.err" )" "2" \
+    "a memo that cannot be used says the line every time rather than going quiet"
+if [ -e "${DIR}/planted" ]; then
+    t_not_ok "and nothing is written through the planted link"
+else
+    t_ok "and nothing is written through the planted link"
+fi
+
+rm -f "${SKIPLOG}"
 
 # --- both layouts, through the resolution that has to tell them apart --------
 t_is "$( adapter_guest_datasets web01 )" "pool0/web01

@@ -62,6 +62,92 @@ _adapter_diag()
     printf 'adapter: %s\n' "$*" >&2
 }
 
+# _adapter_skip_log  -- this PROCESS's memo of skip diagnostics already said.
+#
+# A path derived from the PID rather than a variable remembered in the shell,
+# because the parser that says these lines runs inside a command substitution
+# (adapter_guest_list captures its output), and nothing a subshell assigns
+# survives it. $$ is the invoking shell's PID in every subshell it makes
+# (sh(1), "Special Parameters"), so the memo is one file per seance process
+# whichever shell writes to it.
+_adapter_skip_log()
+{
+    printf '%s/seance-adapter-skip.%s\n' "${TMPDIR:-/tmp}" "$$"
+}
+
+# _adapter_skip_reset  -- start this process with an empty memo, and clear away
+# the memos of processes that are gone.
+#
+# Both halves matter. A PID is reused eventually, and a memo left behind by a
+# previous owner of this one would silence a line THIS process has not said --
+# which is the only way this mechanism could ever lose a diagnostic. And a file
+# per seance process, on a node whose cron runs one every five minutes, is a
+# directory that fills up: the ones whose owner is gone are removed here, where
+# a process that is starting can afford the walk.
+_adapter_skip_reset()
+{
+    local _f _pid
+
+    rm -f "$( _adapter_skip_log )" 2>/dev/null
+
+    for _f in "${TMPDIR:-/tmp}"/seance-adapter-skip.*; do
+        [ -e "${_f}" ] || continue
+
+        _pid=${_f##*.}
+        case "${_pid}" in
+            ''|*[!0123456789]*) continue ;;
+        esac
+
+        kill -0 "${_pid}" 2>/dev/null && continue
+        rm -f "${_f}" 2>/dev/null
+    done
+
+    return 0
+}
+
+# _adapter_skip_once <message...>
+#
+# One skip diagnostic per process, per sentence.
+#
+# WHY THIS EXISTS. The roster is enumerated four times in a single `repl` tick,
+# and every enumeration said the same thing about the same skipped guest --
+# four identical lines per tick, per guest, under cron, for ever. A diagnostic
+# that is always there is a diagnostic nobody reads (the same finding as the
+# phantom-guest line D-97 removed). The BEHAVIOUR is unchanged: the row is
+# still skipped, and every distinct sentence is still said once, in full, with
+# its reasoning.
+#
+# The key is the whole sentence and not the guest's name: "not local to this
+# node" and "emulator xen is not supported" are two different facts about one
+# guest, and a guest whose row changes between enumerations has something new
+# to say.
+#
+# IT NEVER SUPPRESSES MORE THAN IT MEANS TO. A memo that cannot be read or
+# written -- a read-only ${TMPDIR}, or a path something else has planted a
+# symlink at, which /tmp being world-writable makes possible -- degrades to
+# saying the line every time, never to silence. The symlink is refused rather
+# than followed for the other half of that: appending a diagnostic through a
+# planted link would write seance's output into somebody else's file.
+_adapter_skip_once()
+{
+    local _f _msg
+
+    _msg=$*
+    _f=$( _adapter_skip_log )
+
+    if [ -h "${_f}" ] || { [ -e "${_f}" ] && [ ! -f "${_f}" ]; }; then
+        _adapter_diag "${_msg}"
+        return 0
+    fi
+
+    if [ -f "${_f}" ] && grep -q -F -x -e "${_msg}" "${_f}" 2>/dev/null; then
+        return 0
+    fi
+
+    printf '%s\n' "${_msg}" >> "${_f}" 2>/dev/null
+    _adapter_diag "${_msg}"
+}
+
 # ---------------------------------------------------------------------------
 # Validation
 # ---------------------------------------------------------------------------
@@ -161,6 +247,9 @@ adapter_init()
     ADAPTER_VERB="${_bin} seance"
 
     ADAPTER_DISTDIR=${SEANCE_CBSD_DISTDIR:-/usr/local/cbsd}
+
+    # This process has said nothing yet.
+    _adapter_skip_reset
 
     _wd=${SEANCE_CBSD_WORKDIR:-}
     if [ -z "${_wd}" ]; then
@@ -442,7 +531,7 @@ _adapter_list_rows()
                 # tell the two apart from one row and must not pretend to: a
                 # LOCAL guest whose registration never set an emulator prints
                 # the same field.
-                _adapter_diag "skipping ${_name}: it is not local to this node." \
+                _adapter_skip_once "skipping ${_name}: it is not local to this node." \
                     "CBSD prints a listing field it could not fill as \"${_emu}\"," \
                     "and on a clustered node that is how another node's guest appears" \
                     "in this listing -- seance replicates and promotes what THIS node" \
@@ -451,7 +540,7 @@ _adapter_list_rows()
                 continue
                 ;;
             *)
-                _adapter_diag "skipping ${_name}: emulator ${_emu} is not supported by seance"
+                _adapter_skip_once "skipping ${_name}: emulator ${_emu} is not supported by seance"
                 continue
                 ;;
         esac
@@ -475,7 +564,7 @@ _adapter_list_rows()
         case $? in
             0) ;;
             1)
-                _adapter_diag "skipping ${_name}: CBSD's database does not know it (status ${_status})"
+                _adapter_skip_once "skipping ${_name}: CBSD's database does not know it (status ${_status})"
                 continue
                 ;;
             *)
