@@ -36,6 +36,26 @@ unset SEANCE_MOCK_LOG
 # shellcheck source=../conformance/run.subr
 . "${T_ROOT}/tests/conformance/run.subr"
 
+# The three guest-configuration files the vectors name, in this adapter's own
+# spelling of one: bare key=value lines, which is what the tier-4 fixtures and
+# the pseudo-cluster's registrations use. They are written here rather than
+# committed because what they are FOR is the three verdicts, and a committed
+# file would tempt the next reader to add a fourth case to it instead of a row.
+# Where %JAIL%'s data is in this world: the mock has one layout per type, and
+# this is the jail half of it.
+SEANCE_CONF_DATAPATH="${SEANCE_MOCK_WORKDIR:-/nonexistent/mock}/jails-data/web01-data"
+export SEANCE_CONF_DATAPATH
+
+CONFDIR=$( t_tmpdir )
+SEANCE_CONF_RCFILE="${CONFDIR}/rc.conf_web01"
+SEANCE_CONF_RCFILE_NODATA="${CONFDIR}/rc.conf_nodata"
+SEANCE_CONF_RCFILE_BAD="${CONFDIR}/rc.conf_bad"
+export SEANCE_CONF_RCFILE SEANCE_CONF_RCFILE_NODATA SEANCE_CONF_RCFILE_BAD
+
+printf 'name=web01\ndata=/mockworld/jails-data/web01-data\n' > "${SEANCE_CONF_RCFILE}"
+printf 'name=web01\ndata=0\n' > "${SEANCE_CONF_RCFILE_NODATA}"
+printf 'name=web01\ndata=jails-data/web01-data\n' > "${SEANCE_CONF_RCFILE_BAD}"
+
 count=$( conformance_count "${VECTORS}" )
 
 # A vector file that shrank to nothing would otherwise pass in silence.

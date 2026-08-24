@@ -175,10 +175,15 @@ nz()
     cluster_exec "${_n}" zfs "$@" < /dev/null
 }
 
-# estate_guest_create <node> <guest> <type> <home>
+# estate_guest_create <node> <guest> <type> <home> [astart] [datapath]
+#
+# The last two are pseudo_guest_create's own optional arguments, forwarded so
+# that a stage can build the shape the first real fleet is in: a guest whose
+# data is NOT where this platform's convention for its type would have put it
+# (D-178, D-181).
 estate_guest_create()
 {
-    node_sh "$1" ". ${ESTATE_ADAPTER}; adapter_init && pseudo_guest_create $2 $3 $4"
+    node_sh "$1" ". ${ESTATE_ADAPTER}; adapter_init && pseudo_guest_create $2 $3 $4 ${5:-1} ${6:-}"
 }
 
 # estate_replica_root <peer> <homekey> <guest>

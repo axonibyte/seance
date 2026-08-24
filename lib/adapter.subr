@@ -1032,10 +1032,18 @@ adapter_guest_sysdir()
 
 # contract: adapter_guest_mountpoint(name,type) -> path [promises output]
 #
-# Where THIS platform expects the guest's root dataset to be mounted. It is the
-# one fact the promotion ceremony cannot work out for itself: a replica
-# promoted in place stays where replication put it and is given CBSD's expected
-# mountpoint (D-44 item 4), and only the adapter knows what CBSD expects.
+# Where this platform's creation scripts put a guest of this TYPE -- the
+# convention, not the layout, and the difference is D-178's whole subject.
+#
+# IT IS THE LAST RESORT AND NO LONGER THE ANSWER (D-181). The promotion
+# ceremony asks the guest's own configuration where its data belongs
+# (adapter_config_data_path, read out of the replicated rc.conf before
+# anything is mounted) and mounts the replica THERE; a fleet whose VMs live on
+# the jail-shaped path is a fleet this convention would send a replica to a
+# directory the platform never looks in. What is left for this function is the
+# guest whose configuration states no data path at all -- the schema's default
+# is "0" (share/local-jails.schema:39) -- and the promote note says so when it
+# is used.
 #
 # EVIDENCE, both cited to the scripts that create the datasets in the first
 # place, so that seance and CBSD cannot disagree about where a guest lives:
@@ -1077,15 +1085,22 @@ adapter_guest_mountpoint()
     return 0
 }
 
-# contract: adapter_guest_links(name,type) -> link<TAB>target per line [list: may be empty]
+# contract: adapter_guest_links(name,type,datapath) -> link<TAB>target per line [list: may be empty]
 #
 # The symlinks this platform needs in place before a guest whose data arrived
 # by replication can be registered and started here. One record per link, the
 # link first and what it must point at second; an empty list is a valid answer
 # and is what a jail produces.
 #
-# EVIDENCE. A bhyve guest's dataset is mounted at ${workdir}/vm/<name>, and
-# CBSD makes two symlinks to it at creation time -- sudoexec/bcreate:598-599,
+# <datapath> is where the guest's data IS -- what the ceremony mounted the
+# replica at, which is the guest's own `data=` (D-181) and not a path this
+# function may work out for itself. It is an argument for the reason the whole
+# of D-178 exists: CBSD's own links are made to ${data}, whatever ${data} is,
+# and computing it here from the type's creation convention is how a link ends
+# up pointing at a directory nothing is mounted on.
+#
+# EVIDENCE. CBSD makes two symlinks to a VM's data directory at creation time
+# -- sudoexec/bcreate:598-599,
 #
 #     ln -sf ${data} ${olddata}                 # jails-data/<name>-data
 #     ln -sf ${data} ${jailsysdir}/${jname}     # jails-system/<name>
@@ -1095,32 +1110,51 @@ adapter_guest_mountpoint()
 # (sudoexec/zfs-recv:66-69), which is the same ceremony this list describes.
 # A jail needs neither: its dataset is mounted where CBSD looks for it.
 #
+# A LINK WHOSE PATH IS ITS OWN TARGET IS NOT A LINK, and it is exactly what a
+# VM on the jail-shaped layout would produce here: ${jaildatadir}/<name>-data
+# is then the data directory itself. CBSD only makes that link in the branch
+# where the two differ (bcreate:594-598, olddata is captured BEFORE data is
+# moved to ${workdir}/vm/<name>), and `ln -sf X X` where X is a mounted
+# directory does not fail -- it puts a link INSIDE it. Such a record is left
+# out.
+#
 # The per-disk /dev/zvol symlinks are NOT here: they are computed from the
 # replica's own volume list by whoever is doing the promoting, because their
 # names come from the datasets rather than from the platform
 # (sudoexec/zfs-recv:82-93).
 adapter_guest_links()
 {
-    local _name _type _mp
+    local _name _type _mp _link
 
     _adapter_ready || return 2
 
     _name=${1:-}
     _type=${2:-}
+    _mp=${3:-}
 
     if ! _adapter_name_ok "${_name}"; then
         _adapter_diag "adapter_guest_links: not a usable guest name: [${_name}]"
         return 2
     fi
 
+    case "${_mp}" in
+        /*) ;;
+        *)
+            _adapter_diag "adapter_guest_links: not an absolute data path: [${_mp}]"
+            return 2
+            ;;
+    esac
+
     case "${_type}" in
         jail)
             return 0
             ;;
         bhyve)
-            _mp=$( adapter_guest_mountpoint "${_name}" bhyve ) || return 2
             printf '%s/%s\t%s\n' "${ADAPTER_JAILSYSDIR}" "${_name}" "${_mp}"
-            printf '%s/%s-data\t%s\n' "${ADAPTER_JAILDATADIR}" "${_name}" "${_mp}"
+
+            _link="${ADAPTER_JAILDATADIR}/${_name}-data"
+            [ "${_link}" = "${_mp}" ] && return 0
+            printf '%s\t%s\n' "${_link}" "${_mp}"
             return 0
             ;;
         *)
@@ -1156,16 +1190,34 @@ _adapter_data_field()
     awk -v n="${1:?}" '$1 == n && $2 ~ /^\// { print $2; exit }'
 }
 
-# _adapter_guest_data_path <name>
+# contract: adapter_guest_data_path(name) -> path [promises output]
 #
-# CBSD's own answer to where this guest's data is, or rc 1 and nothing.
-# Both listings are asked, for adapter_guest_list's reason: each shows only its
-# own emulators, so a VM is invisible to the first and a jail to the second.
-_adapter_guest_data_path()
+# CBSD's own answer to where this guest's data is: the `data` field of its
+# registration, read through both listings for adapter_guest_list's reason --
+# each shows only its own emulators, so a VM is invisible to the first and a
+# jail to the second.
+#
+# rc 1 and nothing when the platform does not say: a guest this node does not
+# have, a guest whose registration carries no data field (the schema default
+# "0"), or a clustered node's remote row, whose unfillable fields print as "0"
+# or "-" and are passed over rather than mistaken for a path (D-177).
+#
+# It is READ AFTER A PROMOTION as well as before one, and that is the point of
+# it being public: the ceremony mounts a replica where the guest's own
+# configuration says its data lives, and this is how the platform is asked
+# afterwards whether it agrees -- an observation, where the comparison used to
+# be against a path derived from a type (D-181).
+adapter_guest_data_path()
 {
     local _name _cmd _out _val
 
-    _name=$1
+    _adapter_ready || return 2
+
+    _name=${1:-}
+    if ! _adapter_name_ok "${_name}"; then
+        _adapter_diag "adapter_guest_data_path: not a usable guest name: [${_name}]"
+        return 2
+    fi
 
     for _cmd in jls bls; do
         _out=$( _adapter_cbsd "${_cmd}" header=0 display=jname,data \
@@ -1180,6 +1232,137 @@ _adapter_guest_data_path()
     done
 
     return 1
+}
+
+# _adapter_rcconf_value <file> <key>
+#
+# The value of <key> in one of CBSD's per-guest configuration files, PARSED
+# and never sourced (handoff §2.2 applies to every file seance reads).
+#
+# THE SHAPE, from the generator rather than from memory. `cbsd jmkrcconf`
+# writes one assignment per line, quoted and semicolon-terminated --
+# jailctl/jmkrcconf:27-35 prints `relative_path="1";` and then
+# `echo "${i}=\"${VAL}\";"` per column -- and the file is later SOURCED by the
+# platform (sudoexec/jregister:154). A sourced file's LAST assignment is the
+# one that takes effect, so the last is what is read here; taking the first
+# would answer with a value the platform does not use.
+#
+# Empty output for a key that is absent, and rc is awk's.
+_adapter_rcconf_value()
+{
+    awk -v k="${2:?}" -v q="'" '
+        {
+            line = $0
+            sub(/^[ \t]*/, "", line)
+            if (index(line, k "=") != 1) next
+
+            v = substr(line, length(k) + 2)
+            sub(/;[ \t]*$/, "", v)
+            sub(/[ \t]*$/, "", v)
+
+            if (length(v) > 1) {
+                f = substr(v, 1, 1)
+                l = substr(v, length(v), 1)
+                if ((f == "\"" && l == "\"") || (f == q && l == q))
+                    v = substr(v, 2, length(v) - 2)
+            }
+
+            last = v
+            found = 1
+        }
+        END { if (found) print last }
+    ' "${1:?}"
+}
+
+# _adapter_path_usable <path>
+#
+# rc 0 for a value seance is willing to mount a replica at: an absolute path,
+# not the root filesystem itself, with no whitespace and no ".." component.
+#
+# Each refusal is a mount that would go somewhere nobody meant. A relative path
+# resolves against whatever directory the promotion happens to run in; "/" is
+# the running system; whitespace cannot survive a `zfs set mountpoint=` written
+# in this repository's style, nor a tab-separated record (handoff §2.3); and
+# ".." is a traversal, which is not a place CBSD ever put a guest.
+_adapter_path_usable()
+{
+    local _p
+
+    _p=${1:-}
+
+    case "${_p}" in
+        /) return 1 ;;
+        /*) ;;
+        *) return 1 ;;
+    esac
+
+    case "${_p}" in
+        *" "*|*"${ADAPTER_TAB}"*) return 1 ;;
+        */../*|*/..) return 1 ;;
+    esac
+
+    return 0
+}
+
+# contract: adapter_config_data_path(rcfile) -> path [promises output]
+#
+# Where a guest's OWN configuration says its data lives, read out of the file
+# this platform registers it from -- before anything has been mounted, which is
+# the whole reason the promotion ceremony can ask it (D-181). The answer is the
+# path the replica must be mounted at: mount it anywhere else and the platform
+# starts a guest over an empty directory with its data sitting beside it.
+#
+#   rc 0  an absolute path, on stdout.
+#   rc 1  the file states no data path at all -- the schema's default is "0"
+#         (share/local-jails.schema:39) -- so the caller must fall back to this
+#         platform's convention for the type (adapter_guest_mountpoint) and say
+#         that it did.
+#   rc 2  the file cannot be read, or it states something that is not a usable
+#         absolute path. NOT a fallback: a configuration that names a place
+#         seance will not mount a replica at is a refusal, because the two
+#         readings of "data=usr/jails/..." differ by a directory tree.
+#
+# CBSDROOT IS THE PLATFORM'S OWN TOKEN AND IS RESOLVED THE PLATFORM'S WAY.
+# `cbsd junregister` tokenises the workdir out of the file it dumps
+# (sudoexec/junregister:140-141, `replacewdir ... old=${workdir} new="CBSDROOT"`)
+# and `cbsd jregister` puts THIS node's workdir back before it registers
+# anything (sudoexec/jregister:151, `replacewdir file0=... old="CBSDROOT"`,
+# tools/replacewdir:22 `sed s:${old}:${workdir}:`). A ceremony that mounted the
+# literal token's path would mount somewhere the registration is not about.
+adapter_config_data_path()
+{
+    local _f _v
+
+    _adapter_ready || return 2
+
+    _f=${1:-}
+
+    if [ -z "${_f}" ] || [ ! -r "${_f}" ]; then
+        _adapter_diag "adapter_config_data_path: no readable configuration file: [${_f}]"
+        return 2
+    fi
+
+    _v=$( _adapter_rcconf_value "${_f}" data ) || _v=""
+
+    # "0" is the schema's default for a guest whose data path was never
+    # recorded, and an empty value is a key that is not there at all. Neither
+    # is a place; both are "this file does not say".
+    case "${_v}" in
+        ''|0|-) return 1 ;;
+    esac
+
+    case "${_v}" in
+        CBSDROOT|CBSDROOT/*) _v="${ADAPTER_WORKDIR}${_v#CBSDROOT}" ;;
+    esac
+
+    if ! _adapter_path_usable "${_v}"; then
+        _adapter_diag "adapter_config_data_path: ${_f} says data=[${_v}]," \
+            "which is not a path a replica can be mounted at"
+        return 2
+    fi
+
+    printf '%s\n' "${_v}"
+    return 0
 }
 
 # _adapter_dataset_at <path>
@@ -1238,7 +1421,7 @@ _adapter_dataset_at()
 # So, in this order, and every step is something the platform or the mount
 # table SAID:
 #
-#   1. CBSD's own `data` field for this guest (_adapter_guest_data_path).
+#   1. CBSD's own `data` field for this guest (adapter_guest_data_path).
 #      It is recorded per guest at creation and travels in its rc.conf, so it
 #      is right for a guest CBSD made whatever convention it used, and right
 #      after a promotion in place -- where the dataset is the REPLICA under
@@ -1274,7 +1457,7 @@ adapter_guest_datasets()
 
     # 1. what CBSD says, and 2. what this platform's creation scripts would
     #    have used for this type. Both are paths; neither is a dataset name.
-    _mp=$( _adapter_guest_data_path "${_name}" ) || _mp=""
+    _mp=$( adapter_guest_data_path "${_name}" ) || _mp=""
 
     if [ -z "${_mp}" ]; then
         _type=$( adapter_guest_type "${_name}" 2>/dev/null ) || _type=""

@@ -55,14 +55,45 @@ adapter_guest_datasets	%BADNAME%	-	2
 adapter_guest_mountpoint	%JAIL% jail	^/.+$	0
 adapter_guest_mountpoint	%JAIL% nosuchtype	-	2
 adapter_guest_mountpoint	%BADNAME% jail	-	2
-# adapter_guest_links for a JAIL is empty on every platform -- a jail's dataset
-# is already mounted where CBSD looks. There is deliberately no %VM% row: what
-# a VM needs is precisely the thing that differs between platforms, which is
-# why this function exists at all, so a single expected shape for it would be
-# a fiction. tests/tier4/t_adapter_parse.sh pins the real adapter's answer.
-adapter_guest_links	%JAIL% jail	-	0
-adapter_guest_links	%JAIL% nosuchtype	-	2
-adapter_guest_links	%BADNAME% jail	-	2
+# adapter_guest_links for a guest that is WHERE THIS PLATFORM KEEPS IT needs
+# nothing reconciled, on every platform -- which is what %DATAPATH% names. It
+# used to read "%JAIL% jail" with a made-up path and the claim that a jail is
+# empty everywhere; tier 5 showed that to be a claim about CBSD and not about
+# every adapter. The pseudo-cluster's fixed sysdir path means a guest whose
+# data is somewhere else DOES need one link there, for either type, which is
+# what lets a guest promoted onto a path its home node chose be found at all.
+#
+# So the shared row says the thing that is true of all three, and each
+# platform's own answer for a guest that is NOT at that path is pinned where
+# the platform is real -- t_conformance_real.sh for CBSD (a jail needs none
+# wherever its data is), t_conformance_pseudo.sh for the pseudo-cluster (one
+# link, named), tests/tier4/t_adapter_parse.sh for the real adapter's VM.
+# The same treatment adapter_guest_sysdir already gets, above, and for the
+# same reason.
+adapter_guest_links	%JAIL% jail %DATAPATH%	-	0
+adapter_guest_links	%JAIL% nosuchtype /nonexistent/data	-	2
+adapter_guest_links	%BADNAME% jail /nonexistent/data	-	2
+# The data path is an ARGUMENT now (D-181) and every adapter checks it: a
+# caller that has not read the guest's configuration has nothing to pass, and a
+# relative one is a link into whatever directory the promotion ran in.
+adapter_guest_links	%JAIL% jail	-	2
+adapter_guest_links	%JAIL% jail nonexistent/data	-	2
+# Where the PLATFORM says a guest's data is (D-178): read, never derived, and
+# the ceremony's post-registration check is against this answer.
+adapter_guest_data_path	%JAIL%	^/.+$	0
+adapter_guest_data_path	%ABSENT%	-	1
+adapter_guest_data_path	%BADNAME%	-	2
+# Where the GUEST'S OWN CONFIGURATION says its data is, read before anything is
+# mounted (D-181). Three files, in each adapter's own spelling of a guest
+# configuration, provided by the test file that runs these vectors: one that
+# names an absolute path, one that names none, one that names something a
+# replica cannot be mounted at. The three answers are three different verdicts
+# and no adapter may blur them -- a fallback where the real answer is "refuse"
+# is a replica mounted somewhere nobody meant.
+adapter_config_data_path	%RCFILE%	^/.+$	0
+adapter_config_data_path	%RCFILE_NODATA%	-	1
+adapter_config_data_path	%RCFILE_BAD%	-	2
+adapter_config_data_path	/nonexistent/rc.conf_nobody	-	2
 adapter_carp_state	1	^(MASTER|BACKUP|INIT|absent)$	0
 adapter_carp_state	256	-	2
 adapter_carp_state	0	-	2

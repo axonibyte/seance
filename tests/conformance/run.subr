@@ -26,6 +26,19 @@
 #   %HELD%     SEANCE_CONF_HELD     a guest held in slave mode     (arc01)
 #   %ABSENT%   SEANCE_CONF_ABSENT   a name no guest has      (nosuchguest)
 #   %BADNAME%  SEANCE_CONF_BADNAME  a name no guest may have       (UPPER)
+#   %DATAPATH% SEANCE_CONF_DATAPATH where %JAIL%'s data actually is
+#
+# and three FILES, which have no default worth having -- each test file writes
+# them in its own adapter's spelling of a guest configuration, because that
+# spelling is exactly what the function under test is about:
+#
+#   %RCFILE%          SEANCE_CONF_RCFILE          names an absolute data path
+#   %RCFILE_NODATA%   SEANCE_CONF_RCFILE_NODATA   names no data path at all
+#   %RCFILE_BAD%      SEANCE_CONF_RCFILE_BAD      names one a replica cannot be
+#                                                 mounted at
+#
+# Their default is a path nothing is at, so a test file that forgets to write
+# them fails the rows loudly instead of passing three of them by accident.
 #
 # WHAT EACH ROW ASSERTS, and why there are three assertions in it and not one:
 # the exit status, that stdout has the shape the contract promises, and -- when
@@ -59,6 +72,10 @@ conformance_rows()
         -e "s|%HELD%|${SEANCE_CONF_HELD:-arc01}|g" \
         -e "s|%ABSENT%|${SEANCE_CONF_ABSENT:-nosuchguest}|g" \
         -e "s|%BADNAME%|${SEANCE_CONF_BADNAME:-UPPER}|g" \
+        -e "s|%DATAPATH%|${SEANCE_CONF_DATAPATH:-/nonexistent/datapath-unset}|g" \
+        -e "s|%RCFILE_NODATA%|${SEANCE_CONF_RCFILE_NODATA:-/nonexistent/rc.conf-unset}|g" \
+        -e "s|%RCFILE_BAD%|${SEANCE_CONF_RCFILE_BAD:-/nonexistent/rc.conf-unset}|g" \
+        -e "s|%RCFILE%|${SEANCE_CONF_RCFILE:-/nonexistent/rc.conf-unset}|g" \
         "$1"
 }
 

@@ -98,6 +98,23 @@ SEANCE_CONF_BADNAME=UPPER
 export SEANCE_CONF_JAIL SEANCE_CONF_VM SEANCE_CONF_HELD \
     SEANCE_CONF_ABSENT SEANCE_CONF_BADNAME
 
+# The three guest-configuration files the vectors name, in this adapter's own
+# spelling of one -- the same key=value lines adapter_guest_register reads.
+# Where %JAIL%'s data is on this platform: a pseudo guest's dataset is mounted
+# at ${PSEUDO_MOUNT}/<name>, which is what pseudo_guest_create gave it.
+SEANCE_CONF_DATAPATH="${PSEUDO_AT}/${SEANCE_CONF_JAIL}"
+export SEANCE_CONF_DATAPATH
+
+CONFDIR=$( t_tmpdir )
+SEANCE_CONF_RCFILE="${CONFDIR}/rc.conf_web01"
+SEANCE_CONF_RCFILE_NODATA="${CONFDIR}/rc.conf_nodata"
+SEANCE_CONF_RCFILE_BAD="${CONFDIR}/rc.conf_bad"
+export SEANCE_CONF_RCFILE SEANCE_CONF_RCFILE_NODATA SEANCE_CONF_RCFILE_BAD
+
+printf 'type=jail\ndata=%s/web01\n' "${PSEUDO_AT}" > "${SEANCE_CONF_RCFILE}"
+printf 'type=jail\n' > "${SEANCE_CONF_RCFILE_NODATA}"
+printf 'type=jail\ndata=web01\n' > "${SEANCE_CONF_RCFILE_BAD}"
+
 count=$( conformance_count "${VECTORS}" )
 
 # A vector file that shrank to nothing would otherwise pass in silence.
@@ -112,7 +129,10 @@ fi
 # actually built -- a suite that ran against an empty node would agree with
 # every "no such guest" row and prove nothing -- and the one layout claim the
 # vectors deliberately do not carry (see the sysdir comment in vectors.tsv).
-t_plan $(( count + 5 ))
+CONF_TAB=$( printf '\t.' )
+CONF_TAB=${CONF_TAB%.}
+
+t_plan $(( count + 7 ))
 
 adapter_init
 t_rc 0 "adapter_init on the pseudo node" -- adapter_init
@@ -139,6 +159,21 @@ t_stdout_is "1" "the world was built: ${SEANCE_CONF_HELD} is held" \
 t_stdout_is "${PSEUDO_AT}/${SEANCE_CONF_JAIL}/sys" \
     "a pseudo guest's configuration directory is a child of its own dataset" \
     -- adapter_guest_sysdir "${SEANCE_CONF_JAIL}"
+
+# THE LINKS CLAIM, which is this platform's and not the contract's (D-181).
+# The shared vector can only say that a guest sitting where this platform keeps
+# it needs nothing reconciled. Here, a guest whose data is SOMEWHERE ELSE needs
+# exactly one link -- ${PSEUDO_MOUNT}/<name> pointed at its data -- because
+# adapter_guest_sysdir answers with that fixed path, and a guest promoted onto
+# the path its home node chose is found through it or not at all. It is the
+# analogue of the link CBSD makes for a VM (sudoexec/bcreate:599), and it is
+# needed for EITHER type here, which is exactly where this platform and CBSD
+# differ.
+t_stdout_is "${PSEUDO_AT}/${SEANCE_CONF_JAIL}${CONF_TAB}/somewhere/else/web01-data" \
+    "a guest whose data is elsewhere gets one link, from this platform's fixed place to it" \
+    -- adapter_guest_links "${SEANCE_CONF_JAIL}" jail /somewhere/else/web01-data
+t_rc 0 "and asking for it is not an error" \
+    -- adapter_guest_links "${SEANCE_CONF_JAIL}" bhyve /somewhere/else/web01-data
 
 conformance_run "${VECTORS}"
 t_done

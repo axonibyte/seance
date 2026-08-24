@@ -68,6 +68,25 @@ export SEANCE_CONF_JAIL SEANCE_CONF_VM SEANCE_CONF_HELD \
 
 WD=$( shapeb_workdir )
 
+# Where %JAIL%'s data actually is on this platform, and the three guest
+# configurations the vectors name. %RCFILE% is CBSD'S OWN FILE -- the
+# registration jcreate wrote for this jail -- because the whole question the
+# function answers is what THIS platform's configuration format says, and a
+# file written by the test would be a test asking itself. The other two are
+# written here in that same format, because a guest whose data path is missing
+# or unusable is a state this substrate cannot be talked into producing.
+SEANCE_CONF_DATAPATH="${WD}/jails-data/${SHAPEB_JAIL}-data"
+SEANCE_CONF_RCFILE="${WD}/jails-system/${SHAPEB_JAIL}/rc.conf_${SHAPEB_JAIL}"
+
+CONFDIR=$( t_tmpdir )
+SEANCE_CONF_RCFILE_NODATA="${CONFDIR}/rc.conf_nodata"
+SEANCE_CONF_RCFILE_BAD="${CONFDIR}/rc.conf_bad"
+export SEANCE_CONF_DATAPATH SEANCE_CONF_RCFILE \
+    SEANCE_CONF_RCFILE_NODATA SEANCE_CONF_RCFILE_BAD
+
+printf 'relative_path="1";\ndata="0";\n' > "${SEANCE_CONF_RCFILE_NODATA}"
+printf 'relative_path="1";\ndata="jails-data/web01-data";\n' > "${SEANCE_CONF_RCFILE_BAD}"
+
 count=$( conformance_count "${VECTORS}" )
 
 if [ "${count}" -lt 3 ]; then
@@ -77,7 +96,7 @@ if [ "${count}" -lt 3 ]; then
     t_done
 fi
 
-t_plan $(( count + 20 ))
+t_plan $(( count + 23 ))
 
 # ---------------------------------------------------------------------------
 # The contract, against CBSD
@@ -178,10 +197,10 @@ t_is "$( zfs get -H -o value mountpoint "${POOL}/${SHAPEB_VM}" )" \
 # that were sitting there on disk. These rows are that resolution meeting real
 # CBSD: what the platform records, and that a dataset really is mounted exactly
 # there.
-t_is "$( _adapter_guest_data_path "${SHAPEB_JAIL}" )" \
+t_is "$( adapter_guest_data_path "${SHAPEB_JAIL}" )" \
     "${WD}/jails-data/${SHAPEB_JAIL}-data" \
     "CBSD records a jail's data path as \${jaildatadir}/<name>-data (etc/defaults/jail-freebsd-default.conf:102)"
-t_is "$( _adapter_guest_data_path "${SHAPEB_VM}" )" "${WD}/vm/${SHAPEB_VM}" \
+t_is "$( adapter_guest_data_path "${SHAPEB_VM}" )" "${WD}/vm/${SHAPEB_VM}" \
     "and a VM's as \${workdir}/vm/<name> (sudoexec/bcreate:595) -- read from the guest, not computed"
 t_is "$( _adapter_dataset_at "${WD}/jails-data/${SHAPEB_JAIL}-data" )" \
     "${POOL}/${SHAPEB_JAIL}" \
@@ -193,6 +212,26 @@ t_rc 1 "a path with no dataset of its own is a refusal, not a guess" \
 t_is "$( readlink "${WD}/jails-data/${SHAPEB_VM}-data" )" \
     "${WD}/vm/${SHAPEB_VM}" \
     "adapter_guest_links names a link CBSD really makes (sudoexec/bcreate:598)"
+
+# THE LINKS CLAIM FOR THIS PLATFORM, which is what the shared vector stopped
+# claiming for all of them (D-181). On CBSD a jail needs no symlink WHEREVER
+# its data is, because the platform reads `data` out of the registration rather
+# than looking in a fixed place -- and that is a fact about CBSD, not a fact
+# about adapters. The pseudo-cluster's own answer, which differs, is pinned in
+# tests/tier5/t_conformance_pseudo.sh.
+t_stdout_is "" "a jail needs no links even when its data is somewhere unusual" \
+    -- adapter_guest_links "${SHAPEB_JAIL}" jail /somewhere/else/web01-data
+t_rc 0 "and that empty answer is a success, not a refusal" \
+    -- adapter_guest_links "${SHAPEB_JAIL}" jail /somewhere/else/web01-data
+
+# And the guest's own configuration, read by the function the promotion
+# ceremony reads it with, against the file CBSD wrote: the platform's recorded
+# data path and the file's own `data=` are the same path, which is what makes
+# reading the file before anything is mounted a legitimate substitute for
+# asking a platform that does not know about the guest yet (D-181).
+t_stdout_is "$( adapter_guest_data_path "${SHAPEB_JAIL}" )" \
+    "adapter_config_data_path reads CBSD's own file to the same path CBSD reports" \
+    -- adapter_config_data_path "${SEANCE_CONF_RCFILE}"
 
 # ---------------------------------------------------------------------------
 # Liveness, on a guest that exists and is not running

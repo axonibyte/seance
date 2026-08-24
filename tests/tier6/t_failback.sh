@@ -46,7 +46,7 @@ if [ "$( id -u )" -ne 0 ]; then
     exit 2
 fi
 
-t_plan 31
+t_plan 38
 
 TAB=$( printf '\t.' )
 TAB=${TAB%.}
@@ -55,6 +55,20 @@ estate_up || { t_diag "estate_up failed"; t_done; }
 
 ALPHA_DS=$( cluster_dataset alpha )
 WEB_ON_BRAVO=$( estate_replica_root bravo alpha web01 )
+
+# THE FLEET'S SHAPE, here too (D-178, D-181): a guest whose data lives where
+# its own configuration says and not where this platform's convention for its
+# type would put it. A failback has to put such a guest back at ITS path, on a
+# node that has been holding the original all along -- and the way it gets that
+# right is by asking the platform where the guest's data is rather than working
+# it out, which is the same rule the promotion follows.
+VMJ_DATA=/seance/vmdata/vmj01-data
+VMJ_ON_BRAVO=$( estate_replica_root bravo alpha vmj01 )
+
+estate_guest_create alpha vmj01 bhyve alpha 1 "${VMJ_DATA}" ||
+    t_diag "creating vmj01 failed"
+node_sh alpha "echo vmj01-v1 > ${VMJ_DATA}/marker" ||
+    t_diag "writing vmj01's marker failed"
 
 # ---------------------------------------------------------------------------
 # Get to the state a failback starts from
@@ -194,6 +208,35 @@ t_like "${SUCC_BRAVO}" "^web01${TAB}bravo${TAB}alpha${TAB}[0-9]{8}T[0-9]{6}Z${TA
 SUCC_ALPHA=$( cluster_exec alpha cat /var/db/seance/succession.log < /dev/null )
 t_like "${SUCC_ALPHA}" "^web01${TAB}bravo${TAB}alpha${TAB}[0-9]{8}T[0-9]{6}Z${TAB}discard:[1-9][0-9]*\$" \
     "and the origin recorded the discarded byte count as its evidence"
+
+# ---------------------------------------------------------------------------
+# AND THE GUEST WHOSE DATA IS NOT WHERE A DERIVATION WOULD LOOK
+#
+# vmj01 comes home with no --discard-origin-writes, because nothing was written
+# to the origin's copy: the other half of the interlock, which this stage had
+# never taken. What is asserted beyond the ordinary failback is the path -- the
+# guest is mounted, at home, where ITS configuration says, and the replica the
+# interim was running is hidden again.
+# ---------------------------------------------------------------------------
+
+FBV=$( t_tmpdir )/failback-vmj01.out
+node_seance alpha failback vmj01 > "${FBV}" 2>&1
+FBV_RC=$?
+
+t_is "${FBV_RC}" "0" "vmj01 fails back with no writes to discard, and no flag to allow them"
+t_like "$( cat "${FBV}" )" '^failback: vmj01 is home on alpha and running' \
+    "and ends in one verdict line"
+
+t_is "$( nz alpha get -H -o value mountpoint "${ALPHA_DS}/vmj01" )" "${VMJ_DATA}" \
+    "its dataset at home is still mounted where its own configuration says"
+t_is "$( nz alpha get -H -o value mounted "${ALPHA_DS}/vmj01" )" "yes" \
+    "and it is mounted"
+t_stdout_is "vmj01-v1" "with the data that came back from the interim" \
+    -- cluster_exec alpha cat "${VMJ_DATA}/marker"
+t_is "$( node_seance alpha status --tsv | awk -F "${TAB}" '$1 == "guest" && $2 == "vmj01" { print $5 "/" $6 }' )" \
+    "yes/no" "vmj01 is running at home and no longer held"
+t_is "$( nz bravo get -H -o value mountpoint "${VMJ_ON_BRAVO}" )" "none" \
+    "and the replica on bravo is hidden again, whatever path it had been mounted at"
 
 # ---------------------------------------------------------------------------
 # Normal replication resumes, in the normal direction

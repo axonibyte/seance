@@ -26,7 +26,9 @@
 #   <root>/standby               where other nodes' replicas land
 #   /var/db/seance-pseudo/guests.tsv    the guest records
 #
-# Records are "<name> <type> <astart> <home> <running> <held>", tab separated.
+# Records are "<name> <type> <astart> <home> <running> <held> <data>", tab
+# separated; <data> is where the guest's registration says its data lives and is
+# empty for a guest that lives where this node puts its own.
 #
 # shellcheck shell=sh
 # shellcheck disable=SC3043
@@ -301,12 +303,23 @@ adapter_guest_mountpoint()
     printf '%s/%s\n' "${PSEUDO_MOUNT}" "$1"
 }
 
-# contract: adapter_guest_links(name,type) -> link<TAB>target per line [list: may be empty]
+# contract: adapter_guest_links(name,type,datapath) -> link<TAB>target per line [list: may be empty]
 #
-# None: a pseudo-node keeps every guest's data at one path for both types, so
-# there is nothing for a symlink to reconcile. An empty list is the answer, not
-# a failure -- which is what the contract marker on this function says, and is
-# the same shape a jail produces on real CBSD.
+# None for a guest that lives where this node puts its own -- there is nothing
+# for a symlink to reconcile, and an empty list is the answer rather than a
+# failure, which is what the contract marker says and the same shape a jail
+# produces on real CBSD.
+#
+# ONE, for a guest whose data is somewhere else: ${PSEUDO_MOUNT}/<name>, this
+# platform's fixed place for a guest, pointed at the data. It is the analogue
+# of what CBSD does for a VM (`ln -sf ${data} ${jailsysdir}/${jname}`,
+# sudoexec/bcreate:599) and it is what makes adapter_guest_sysdir resolve into
+# the guest's own datasets wherever they are mounted -- which is how the
+# configuration of a guest promoted onto a path its home node chose is found
+# after the ceremony.
+#
+# <datapath> is where the guest's data IS, passed in rather than looked up:
+# before a registration there is nothing on this node to look it up in.
 adapter_guest_links()
 {
     pseudo_name_ok "${1:-}" || { pseudo_diag "bad guest name: ${1:-}"; return 2; }
@@ -316,7 +329,84 @@ adapter_guest_links()
         *) pseudo_diag "unsupported guest type: ${2:-}"; return 2 ;;
     esac
 
+    case "${3:-}" in
+        /*) ;;
+        *) pseudo_diag "not an absolute data path: [${3:-}]"; return 2 ;;
+    esac
+
+    [ "$3" = "${PSEUDO_MOUNT}/$1" ] && return 0
+
+    printf '%s/%s\t%s\n' "${PSEUDO_MOUNT}" "$1" "$3"
     return 0
+}
+
+# contract: adapter_guest_data_path(name) -> path [promises output]
+#
+# Where this node says the guest's data is -- OBSERVED, which here means "what
+# was recorded when it was registered" and not "where a guest of this node's
+# would have been put" (D-178, D-181). A guest promoted in place is registered
+# from a configuration naming the path its home node used, and this adapter has
+# to be able to say so or the pseudo-cluster cannot express the shape the first
+# real fleet is built in.
+#
+# rc 1 for a guest this node does not have. Field 7 of the record is the data
+# path; a record written before this field existed leaves it empty, and the
+# node's own layout is then the answer -- which is what such a guest has.
+adapter_guest_data_path()
+{
+    local _d
+
+    pseudo_name_ok "${1:-}" || { pseudo_diag "bad guest name: ${1:-}"; return 2; }
+
+    pseudo_field "$1" 1 > /dev/null || return 1
+
+    _d=$( pseudo_field "$1" 7 ) || _d=""
+
+    case "${_d}" in
+        /*) printf '%s\n' "${_d}" ;;
+        *)  printf '%s/%s\n' "${PSEUDO_MOUNT}" "$1" ;;
+    esac
+}
+
+# contract: adapter_config_data_path(rcfile) -> path [promises output]
+#
+# The `data=` of a guest's own configuration file, in this adapter's spelling
+# of one: bare "key=value" lines, parsed and never sourced, the same way
+# adapter_guest_register reads the rest of it.
+#
+# rc 1 when the file states no data path -- a guest that lives where this node
+# puts its own -- and rc 2 when it states something a replica cannot be mounted
+# at. It is a stand-in for the real adapter's parser, not a second copy of it;
+# tests/conformance/vectors.tsv runs the same three cases against both.
+adapter_config_data_path()
+{
+    local _f _v
+
+    _f=${1:-}
+
+    if [ -z "${_f}" ] || [ ! -r "${_f}" ]; then
+        pseudo_diag "adapter_config_data_path: no readable configuration file: [${_f}]"
+        return 2
+    fi
+
+    _v=$( awk -F= '$1 == "data" { v = $2 } END { print v }' "${_f}" ) || _v=""
+
+    case "${_v}" in
+        ''|0|-) return 1 ;;
+        /|*" "*|*/../*|*/..)
+            pseudo_diag "adapter_config_data_path: ${_f} says data=[${_v}]," \
+                "which is not a path a replica can be mounted at"
+            return 2
+            ;;
+        /*) ;;
+        *)
+            pseudo_diag "adapter_config_data_path: ${_f} says data=[${_v}]," \
+                "which is not a path a replica can be mounted at"
+            return 2
+            ;;
+    esac
+
+    printf '%s\n' "${_v}"
 }
 
 # contract: adapter_guest_datasets(name) -> dataset per line, root first [promises output]
@@ -340,7 +430,8 @@ adapter_guest_datasets()
 
     _ds=""
 
-    _mp=$( adapter_guest_mountpoint "$1" jail ) || _mp=""
+    _mp=$( adapter_guest_data_path "$1" 2>/dev/null ) || _mp=""
+    [ -n "${_mp}" ] || _mp=$( adapter_guest_mountpoint "$1" jail ) || _mp=""
     if [ -n "${_mp}" ]; then
         _cand=$( zfs list -H -o name "${_mp}" 2>/dev/null ) || _cand=""
         if [ -n "${_cand}" ] &&
@@ -386,7 +477,7 @@ adapter_guest_sysdir()
 # unreadable rcfile.
 adapter_guest_register()
 {
-    local _name _rc _type _astart _home
+    local _name _rc _type _astart _home _data
 
     _name=${1:-}
     _rc=${2:-}
@@ -409,8 +500,16 @@ adapter_guest_register()
     [ -n "${_astart}" ] || _astart=0
     [ -n "${_home}" ] || _home=$( adapter_node_self )
 
-    printf '%s\t%s\t%s\t%s\t0\t0\n' \
-        "${_name}" "${_type}" "${_astart}" "${_home}" >> "${PSEUDO_DB}"
+    # AND WHERE ITS DATA IS, out of the same file. This is the platform half of
+    # D-181: a guest is registered from a configuration that names its data
+    # path, and everything this node afterwards says about where that guest
+    # lives has to come from what it was told, not from what this node would
+    # have chosen. A configuration that names none leaves the field empty and
+    # the node's own layout answers.
+    _data=$( adapter_config_data_path "${_rc}" ) || _data=""
+
+    printf '%s\t%s\t%s\t%s\t0\t0\t%s\n' \
+        "${_name}" "${_type}" "${_astart}" "${_home}" "${_data}" >> "${PSEUDO_DB}"
 }
 
 # contract: adapter_guest_unregister(name) -> nothing [no output]
@@ -548,26 +647,43 @@ adapter_carp_state()
 # how a real guest is made.
 # ---------------------------------------------------------------------------
 
-# pseudo_guest_create <name> <type> <home> [astart]
+# pseudo_guest_create <name> <type> <home> [astart] [datapath]
 #
 # Create a guest: its dataset root with a LOCAL mountpoint (the shadow-mount
 # law has nothing to bite on if the source's mountpoint is inherited -- see
 # docs/repl-wire.md), its sys child, and its record.
+#
+# <datapath> is where this guest's data lives when that is NOT this node's own
+# ${PSEUDO_MOUNT}/<name> -- the shape the first real fleet is built in, where
+# every guest is a VM whose data sits on the jail-shaped path and nothing at
+# all lives where the creation convention for its type would have put it
+# (D-178). A guest made that way carries `data=` in its own configuration, has
+# it recorded in its registration, and gets the same symlink from this
+# platform's fixed place that CBSD gives a VM -- so that everything which looks
+# a guest up by name still finds it.
 pseudo_guest_create()
 {
-    local _name _type _home _astart _root _ds
+    local _name _type _home _astart _data _root _ds
 
     _name=$1
     _type=$2
     _home=$3
     _astart=${4:-1}
+    _data=${5:-}
 
     pseudo_name_ok "${_name}" || { pseudo_diag "bad guest name: ${_name}"; return 2; }
+
+    [ -n "${_data}" ] || _data="${PSEUDO_MOUNT}/${_name}"
+
+    case "${_data}" in
+        /*) ;;
+        *) pseudo_diag "not an absolute data path: [${_data}]"; return 2 ;;
+    esac
 
     _root=$( pseudo_root ) || return 1
     _ds="${_root}/${_name}"
 
-    zfs create -o "mountpoint=${PSEUDO_MOUNT}/${_name}" "${_ds}" || return 1
+    zfs create -o "mountpoint=${_data}" "${_ds}" || return 1
     zfs create "${_ds}/sys" || return 1
 
     {
@@ -575,8 +691,13 @@ pseudo_guest_create()
         printf 'type=%s\n' "${_type}"
         printf 'astart=%s\n' "${_astart}"
         printf 'home=%s\n' "${_home}"
-    } > "${PSEUDO_MOUNT}/${_name}/sys/rc.conf_${_name}" || return 1
+        printf 'data=%s\n' "${_data}"
+    } > "${_data}/sys/rc.conf_${_name}" || return 1
 
-    printf '%s\t%s\t%s\t%s\t1\t0\n' \
-        "${_name}" "${_type}" "${_astart}" "${_home}" >> "${PSEUDO_DB}"
+    if [ "${_data}" != "${PSEUDO_MOUNT}/${_name}" ]; then
+        ln -sf "${_data}" "${PSEUDO_MOUNT}/${_name}" || return 1
+    fi
+
+    printf '%s\t%s\t%s\t%s\t1\t0\t%s\n' \
+        "${_name}" "${_type}" "${_astart}" "${_home}" "${_data}" >> "${PSEUDO_DB}"
 }

@@ -498,6 +498,59 @@ behind — see §8 defect 8. `junregister` does NOT touch
 `${jailrcconfdir}/rc.conf_<n>` and leaves the sysdir byte-identical, which is
 what lets seance go on reading the sysdir's copy.
 
+**`data=` in that file is where the guest's data lives, and it is a fact about
+the guest rather than about its type.** `cbsd jmkrcconf` writes one
+`<key>="<value>";` line per database column (`jailctl/jmkrcconf:27-35`), and
+`data` is one of them. The defaults are per type — `${jaildatadir}/${jname}-${jaildatapref}`
+for a jail (`etc/defaults/jail-freebsd-default.conf:102`, written by
+`sudoexec/jcreate:806-814`), `${workdir}/vm/${jname}` for a VM
+(`sudoexec/bcreate:595`) — but they are only the defaults of the branch that
+runs. **With an external mounter (`mnt_start`), `bcreate` takes the
+jail-shaped path instead, makes `${jailsysdir}/${jname}` with `mkdir`, and
+links nothing** (`sudoexec/bcreate:549-566`): that is the layout of the first
+real fleet seance met, where every guest is a bhyve VM at
+`${jaildatadir}/<name>-data`, with no zvols and no `vm/` subtree. Reading the
+field rather than deriving it is D-178; mounting a replica at what the field
+says, rather than at what the type's convention says, is D-181.
+
+**`jregister` expands a CBSDROOT token into THIS node's workdir; `junregister`
+was observed NOT to write one.** The source says both halves happen:
+`junregister` runs `replacewdir file0=<dump> old=${workdir} new="CBSDROOT"`
+after `jmkrcconf` (`sudoexec/junregister:140-141`) and `jregister` runs the
+reverse before it reads anything (`sudoexec/jregister:151`), `replacewdir`
+being `sed -i '' s:${old}:${workdir}:` over the file (`tools/replacewdir:22`).
+**Only the second half was observed doing it.** On CBSD 15.0.9 in shape B
+(`tests/tier5/t_mountpath_real.sh`, run in the reaper guest) the dump
+`cbsd junregister` leaves in `${jailrcconfdir}/rc.conf_<n>` carries the workdir
+ABSOLUTE -- `data="/tank/state/cbsd/vm/db01"` -- while a `data="CBSDROOT/..."`
+written into that same file by hand IS expanded to this node's workdir by
+`cbsd jregister`, and lands that way in `${jailsysdir}/<n>/rc.conf_<n>`.
+**The cause of the missing tokenisation is UNVERIFIED**: the `sed` in
+`tools/replacewdir:22` sits behind a `[ -r "${file}" ]` test and inside a loop
+bounded by `$#`, and either could account for it; nothing seance does depends
+on which. The tier-5 rows assert what was observed in BOTH directions, so a
+later CBSD that starts tokenising here is noticed in that tier rather than on a
+fleet.
+
+seance reads both forms, and resolves the token the way `jregister` does --
+the path it must mount a replica at is the path the platform will look in
+(`adapter_config_data_path`, D-181).
+
+**Two things a guest on that layout depends on, both found by building one
+(`tests/tier5/t_mountpath_real.sh`).** First, a VM's `dsk1.vhd` inside its data
+directory is a SYMLINK to the zvol's `/dev/zvol/...` path
+(`sudoexec/bcreate:573-600`; `sudoexec/zfs-recv:82-93` restores it after a
+receive), so on a layout whose disks are files that link has to go before a
+file of the same name can be made -- writing "through" it while the zvol is
+gone fails with ENOENT on a correctly mounted dataset. Second, **`cbsd bls`
+skips a VM whose `${jailsysdir}/<n>/local.sqlite` it cannot read**
+(`bhyvectl/bls:393-399`), and it skips it silently as far as `display=` output
+goes -- unless `mnt_start` is set, which is precisely the external-mounter
+layout above. A VM registered with an empty system directory is therefore
+registered and invisible: `cbsd jregister` exits 0, and every listing behaves
+as though the guest does not exist. Both are properties of the platform, not
+of seance, and both are pinned by that tier-5 file.
+
 ## 7. Hook directories and their exit semantics (D-8)
 
 `cbsd jcreate` creates thirteen per-guest hook directories under

@@ -235,23 +235,53 @@ zfs_volumes_r()
 
 W_MIRROR=ok
 W_MIRROR_GUEST=web01
-W_SYSPATH=""
+
+# What the guest's own configuration says about where its data lives, and
+# whether that configuration travels inside the guest's own replica (D-181).
+W_DATA=none
+W_DATAPATH=""
+W_TRAVELS=0
 
 # shellcheck disable=SC2329
 zfs_set()
 {
-    # Where the restore points the mirror is how this fixture learns which
-    # scratch path to put a configuration in -- the same way the real pair of
+    # THE MOUNTPOINT MAP is how this fixture learns which scratch path a
+    # read-only borrow put a dataset at -- the same way the real pair of
     # commands works, with the code telling the pool rather than the other way
-    # round.
-    case "$2" in
-        *"/${REPL_SYS_GUEST}")
-            case "$1" in
-                mountpoint=*) W_SYSPATH=${1#mountpoint=} ;;
-            esac
+    # round. It is a map and no longer one variable for the mirror, because
+    # the ceremony now borrows the guest's OWN replica too.
+    case "$1" in
+        mountpoint=*)
+            printf '%s\t%s\n' "$2" "${1#mountpoint=}" >> "${ROWDIR}/mountpoints"
             ;;
     esac
     printf 'set %s %s\n' "$1" "$2" >> "${W_ZFSLOG}"
+}
+
+# w_mountpoint <dataset>  -- the last mountpoint this world was told to set.
+w_mountpoint()
+{
+    [ -r "${ROWDIR}/mountpoints" ] || return 1
+
+    awk -F '\t' -v d="$1" \
+        '$1 == d { p = $2 } END { if (p == "") { exit 1 } ; print p }' \
+        "${ROWDIR}/mountpoints"
+}
+
+# w_rcconf <guest>  -- the guest's own configuration, as this world's platform
+# writes one. ONE WRITER for all three places it can appear (the mirror, the
+# replica, ${jailsysdir}), because a row in which the mount path and the
+# registration disagree is a row about a fixture and not about seance.
+w_rcconf()
+{
+    printf 'name=%s\n' "$1"
+
+    case "${W_DATA}" in
+        none)     ;;
+        zero)     printf 'data=0\n' ;;
+        relative) printf 'data=jails-data/%s-data\n' "$1" ;;
+        *)        printf 'data=%s\n' "${W_DATAPATH}" ;;
+    esac
 }
 
 # shellcheck disable=SC2329
@@ -263,14 +293,30 @@ zfs_exists()
 # shellcheck disable=SC2329
 zfs_mount_ro()
 {
+    local _at
+
     printf 'mount-ro %s\n' "$1" >> "${W_ZFSLOG}"
 
-    [ "${W_MIRROR}" = "ok" ] || return 0
-    [ -n "${W_SYSPATH}" ] || return 0
+    _at=$( w_mountpoint "$1" ) || return 0
 
-    mkdir -p "${W_SYSPATH}/${W_MIRROR_GUEST}" || return 1
-    printf 'name=%s\n' "${W_MIRROR_GUEST}" \
-        > "${W_SYSPATH}/${W_MIRROR_GUEST}/rc.conf_${W_MIRROR_GUEST}"
+    case "$1" in
+        *"/${REPL_SYS_GUEST}")
+            # The dead node's configuration mirror.
+            [ "${W_MIRROR}" = "ok" ] || return 0
+            mkdir -p "${_at}/${W_MIRROR_GUEST}" || return 1
+            w_rcconf "${W_MIRROR_GUEST}" \
+                > "${_at}/${W_MIRROR_GUEST}/rc.conf_${W_MIRROR_GUEST}"
+            ;;
+        *)
+            # The guest's own replica, which carries its configuration only
+            # when this world says the configuration travels (D-84 item 3).
+            [ "${W_TRAVELS}" = "1" ] || return 0
+            [ "$1" = "${W_GUESTROOT}" ] || return 0
+            w_rcconf "${W_MIRROR_GUEST}" > "${_at}/rc.conf_${W_MIRROR_GUEST}"
+            ;;
+    esac
+
+    return 0
 }
 
 # shellcheck disable=SC2329
@@ -297,8 +343,21 @@ W_MOUNTS=""
 # shellcheck disable=SC2329
 zfs_mount()
 {
+    local _at
+
     printf 'mount %s\n' "$1" >> "${W_ZFSLOG}"
     W_MOUNTS="${W_MOUNTS} $1"
+
+    # A MOUNTED DATASET HAS A DIRECTORY AT ITS MOUNTPOINT, and the ceremony's
+    # next steps walk into it: a VM's ${jailsysdir}/<n> is a symlink to its
+    # data directory, and the configuration restore writes THROUGH that link.
+    # A fixture that logged the mount without making the directory made every
+    # such row fail on a dangling symlink -- a fact about the fixture, not
+    # about seance.
+    _at=$( w_mountpoint "$1" ) || return 0
+    mkdir -p "${_at}" || return 1
+
+    return 0
 }
 
 # shellcheck disable=SC2329
@@ -402,7 +461,7 @@ world_build()
     local _spec _kv _k _v
     local _nodes _reach _dead _fence _lineage _claim _peermute _kernel _guest _notify
     local _sysdir _mirror _tree _auto _fleetauto _armed _carp _vhid _succ
-    local _override
+    local _override _data _platform
     local _conf _wd _n _lnow
 
     _spec=$1
@@ -427,6 +486,8 @@ world_build()
     _vhid=yes
     _succ=default
     _override=-
+    _data=none
+    _platform=agree
 
     [ "${_spec}" = "-" ] && _spec=""
 
@@ -454,6 +515,8 @@ world_build()
             vhid)    _vhid=${_v} ;;
             succ)    _succ=${_v} ;;
             override) _override=${_v} ;;
+            data)     _data=${_v} ;;
+            platform) _platform=${_v} ;;
             *)
                 t_diag "world_build: unknown setting: ${_kv}"
                 return 2
@@ -494,11 +557,35 @@ world_build()
     FENCE_MOCK_SLEEP=3
     export FENCE_MOCK_LOG FENCE_MOCK_MODE FENCE_MOCK_SLEEP
 
+    # --- where this guest's own configuration says its data lives ---------
+    #
+    # `none` is the world every row before D-181 described: a configuration
+    # that states no data path at all, so the ceremony falls back to where this
+    # platform CREATES a guest of that type -- which is what it used to do
+    # unconditionally, and what it must still do when there is nothing to
+    # observe. `jailshape` is the first real fleet, verbatim: a bhyve guest
+    # whose data is at the jail-shaped path.
+    W_DATA=${_data}
+    W_TRAVELS=0
+    case "${_data}" in
+        none|zero)  W_DATAPATH="" ;;
+        relative)   W_DATAPATH="" ;;
+        jailshape)  W_DATAPATH="${_wd}/jails-data/${_guest}-data" ;;
+        travels)
+            W_DATAPATH="${_wd}/jails-data/${_guest}-data"
+            W_TRAVELS=1
+            ;;
+        *) t_diag "world_build: unknown data: ${_data}"; return 2 ;;
+    esac
+
+    W_MIRROR=${_mirror}
+    W_MIRROR_GUEST=${_guest}
+
     # --- the guest, its type, its estate and its configuration ------------
     if [ "${_guest}" = "db01" ]; then
         W_GUESTTYPE=bhyve
         mkdir -p "${_wd}/vm/db01"
-        printf 'name=db01\n' > "${_wd}/vm/db01/rc.conf_db01"
+        w_rcconf db01 > "${_wd}/vm/db01/rc.conf_db01"
     else
         W_GUESTTYPE=jail
         mkdir -p "${_wd}/jails-system/${_guest}"
@@ -506,14 +593,33 @@ world_build()
         # its own dataset, so it did not travel with the data and has to come
         # out of the dead node's configuration mirror instead (D-82).
         if [ "${_sysdir}" = "present" ]; then
-            printf 'name=%s\n' "${_guest}" \
+            w_rcconf "${_guest}" \
                 > "${_wd}/jails-system/${_guest}/rc.conf_${_guest}"
         fi
     fi
 
-    W_MIRROR=${_mirror}
-    W_MIRROR_GUEST=${_guest}
-    W_SYSPATH=""
+    # WHAT THE PLATFORM SAYS AFTERWARDS. A guest registered from a
+    # configuration naming a data path is a guest the platform then reports at
+    # that path, and rung 6 checks its own work against exactly that
+    # (D-181). The mock's world has one layout per type and no mount table, so
+    # a row whose guest lives anywhere else says so here -- and `disagree` is
+    # the row that proves the check can still fire.
+    case "${_platform}" in
+        agree)
+            [ -n "${W_DATAPATH}" ] &&
+                printf 'adapter_guest_data_path %s\tok\t%s\n' \
+                    "${_guest}" "${W_DATAPATH}" >> "${SEANCE_MOCK_SCRIPT}"
+            ;;
+        disagree)
+            printf 'adapter_guest_data_path %s\tok\t%s\n' \
+                "${_guest}" "${_wd}/vm/${_guest}" >> "${SEANCE_MOCK_SCRIPT}"
+            ;;
+        silent)
+            printf 'adapter_guest_data_path %s\tfail\tthis platform records no data path\n' \
+                "${_guest}" >> "${SEANCE_MOCK_SCRIPT}"
+            ;;
+        *) t_diag "world_build: unknown platform: ${_platform}"; return 2 ;;
+    esac
 
     # The configuration mirror sits in the standby tree beside the guests. It
     # is in the estate listing on purpose: rung 5 has to walk past it, and a
@@ -822,7 +928,7 @@ fi
 # One assertion per row, plus the twenty-five named assertions below. A table
 # with no rows would have produced a green run of nothing, which is why the
 # count is derived from the table rather than written down.
-t_plan $(( NROWS + 87 ))
+t_plan $(( NROWS + 105 ))
 
 SAVED=$( t_tmpdir )
 AUTO_ROWS=""
@@ -998,6 +1104,90 @@ t_unlike "$( cat "${SAVED}/tree-child-foreign.mock" )" 'adapter_guest_start' \
     "and it is not started -- an incoherent guest is aborted, and --force cannot reach it"
 t_unlike "$( cat "${SAVED}/tree-child-foreign-forced.mock" )" 'adapter_guest_start' \
     "not even with every forceable rung named"
+
+# ---------------------------------------------------------------------------
+# WHERE THE REPLICA IS MOUNTED (D-178's open paragraph, closed by D-181)
+#
+# The path is the guest's own `data=`, read before anything is mounted out of
+# whichever replica carries its configuration. These assertions are about the
+# thing the disposition column cannot say: WHICH PATH, and out of WHICH FILE.
+# ---------------------------------------------------------------------------
+
+# The fleet, verbatim: a bhyve guest whose configuration puts it on the
+# jail-shaped path. The convention for its type says ${workdir}/vm/<name>, and
+# a ceremony that used the convention would mount the replica there, register
+# the guest from an rc.conf naming somewhere else, and start nothing usable.
+t_like "$( cat "${SAVED}/mount-fleet.out" )" \
+    'db01: its own configuration in pool0/bravo/standby/alpha/seance-sys says data=.*/jails-data/db01-data' \
+    "the mount path is READ out of the guest's own configuration, and the file it came from is named"
+t_like "$( cat "${SAVED}/mount-fleet.zfs" )" \
+    "^set mountpoint=.*/jails-data/db01-data pool0/bravo/standby/alpha/db01\$" \
+    "so a VM on the jail layout is mounted where its own configuration says"
+t_unlike "$( cat "${SAVED}/mount-fleet.zfs" )" \
+    "^set mountpoint=.*/vm/db01 pool0/bravo/standby/alpha/db01\$" \
+    "and NOT at the path this platform's creation convention for a VM would have named"
+t_like "$( cat "${SAVED}/mount-fleet.out" )" \
+    'db01: the platform looks for its data at .*/jails-data/db01-data, which is where its replica is mounted' \
+    "and the platform, asked after the registration, agrees about the path"
+
+# The other half of the same fact: the configuration that travelled inside the
+# guest's own replica is the one that is read, and the ceremony says so.
+t_like "$( cat "${SAVED}/mount-travels.out" )" \
+    'web01: its own configuration in pool0/bravo/standby/alpha/web01 says data=' \
+    "a configuration that travelled inside the guest's own replica is read out of THAT"
+t_like "$( cat "${SAVED}/mount-travels.zfs" )" \
+    '^mount-ro pool0/bravo/standby/alpha/web01$' \
+    "which means the replica itself is borrowed read-only, before the ceremony mounts it"
+t_like "$( cat "${SAVED}/mount-travels.zfs" )" \
+    '^inherit mountpoint pool0/bravo/standby/alpha/web01$' \
+    "and given back afterwards, so the borrow leaves nothing behind"
+
+# A configuration that states no data path at all: the LAST RESORT, announced.
+t_like "$( cat "${SAVED}/mount-zero.out" )" \
+    'states no data path .the platform.s schema default is "0"., so the LAST RESORT is used' \
+    "a guest whose configuration states no data path falls back to the convention, and the note says so"
+t_like "$( cat "${SAVED}/mount-zero.zfs" )" \
+    "^set mountpoint=.*/jails-data/web01-data pool0/bravo/standby/alpha/web01\$" \
+    "and the fallback is this platform's own answer for the type"
+
+# A configuration that names something a replica cannot be mounted at is a
+# REFUSAL. The difference from "states none" is the whole of it: seance knows
+# the answer is wrong rather than missing, and a convention would paper over it.
+t_like "$( cat "${SAVED}/mount-unusable.out" )" \
+    'names a data path this node will not mount a replica at' \
+    "a relative data path stops the promotion by name"
+# The scratch borrow DOES set a mountpoint on the replica -- read-only, at a
+# path under the run's own temporary directory -- so what this asserts is that
+# nothing was pointed at the guest's FINAL path, which is the mount that would
+# have mattered.
+t_unlike "$( cat "${SAVED}/mount-unusable.zfs" )" \
+    '^set mountpoint=.*/jails-data/web01-data pool0/bravo/standby/alpha/web01$' \
+    "and nothing is mounted at the guest's final path"
+t_unlike "$( cat "${SAVED}/mount-unusable.zfs" )" \
+    '^mount pool0/bravo/standby/alpha/web01$' \
+    "and the replica is never mounted read-write at all"
+t_unlike "$( cat "${SAVED}/mount-unusable.mock" )" 'adapter_guest_register' \
+    "and nothing is registered"
+t_unlike "$( cat "${SAVED}/mount-unusable.mock" )" 'adapter_guest_start' \
+    "and nothing is started"
+
+# THE CHECK'S OWN FALSIFIABILITY. The platform is made to report the guest's
+# data somewhere else once it is registered; the promotion must stop THERE,
+# with the guest registered and not started, rather than starting it over a
+# directory that is not its own.
+t_like "$( cat "${SAVED}/mount-platform-disagrees.out" )" \
+    'it is registered here and the platform looks for its data at .*/vm/db01, while its replica is mounted at .*/jails-data/db01-data' \
+    "a platform that looks somewhere else stops the promotion, naming both paths"
+t_like "$( cat "${SAVED}/mount-platform-disagrees.mock" )" 'adapter_guest_register' \
+    "after the registration, which is where the disagreement becomes visible"
+t_unlike "$( cat "${SAVED}/mount-platform-disagrees.mock" )" 'adapter_guest_start' \
+    "and the guest is NOT started"
+
+# And a platform that records no data path at all is not a disagreement: there
+# is nothing to check against, which is said rather than treated as a no.
+t_like "$( cat "${SAVED}/mount-platform-silent.out" )" \
+    'the platform records no data path for it, so there is nothing to check the mount against' \
+    "a platform with nothing to say about the path says so, and the promotion stands"
 
 # ---------------------------------------------------------------------------
 # The configuration mirror (D-82)

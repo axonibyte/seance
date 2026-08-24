@@ -547,10 +547,10 @@ adapter_guest_mountpoint()
     return 0
 }
 
-# contract: adapter_guest_links(name,type) -> link<TAB>target per line [list: may be empty]
+# contract: adapter_guest_links(name,type,datapath) -> link<TAB>target per line [list: may be empty]
 adapter_guest_links()
 {
-    local _rc _wd _mp
+    local _rc _wd _mp _link
 
     _mock_log adapter_guest_links "$@"
     _mock_scripted adapter_guest_links "$@"
@@ -563,15 +563,29 @@ adapter_guest_links()
     fi
 
     _wd=${SEANCE_MOCK_WORKDIR:-/nonexistent/mock}
+    _mp=${3:-}
+
+    case "${_mp}" in
+        /*) ;;
+        *)
+            _mock_diag "adapter_guest_links: not an absolute data path: [${_mp}]"
+            return 2
+            ;;
+    esac
 
     case "${2:-}" in
         jail)
             return 0
             ;;
         bhyve)
-            _mp=$( adapter_guest_mountpoint "$1" bhyve ) || return 2
             printf '%s/jails-system/%s\t%s\n' "${_wd}" "$1" "${_mp}"
-            printf '%s/jails-data/%s-data\t%s\n' "${_wd}" "$1" "${_mp}"
+
+            # A link whose path is its own target is not a link -- the real
+            # adapter leaves it out for the reason written there, and a mock
+            # that emitted it would make the ceremony's guard untested.
+            _link="${_wd}/jails-data/$1-data"
+            [ "${_link}" = "${_mp}" ] && return 0
+            printf '%s\t%s\n' "${_link}" "${_mp}"
             return 0
             ;;
         *)
@@ -579,6 +593,91 @@ adapter_guest_links()
             return 2
             ;;
     esac
+}
+
+# contract: adapter_guest_data_path(name) -> path [promises output]
+#
+# Where THIS world says the guest's data is. The mock's world has one layout
+# per type and no mount table, so the answer is that layout -- and a tier-4 row
+# about a fleet whose guests live somewhere else SCRIPTS this function, which
+# is how the ladder's post-registration check gets a platform that disagrees
+# with the ceremony without a second world model being invented here.
+adapter_guest_data_path()
+{
+    local _rc _type _wd
+
+    _mock_log adapter_guest_data_path "$@"
+    _mock_scripted adapter_guest_data_path "$@"
+    _rc=$?
+    [ "${_rc}" -ne 100 ] && return "${_rc}"
+
+    if ! _mock_name_ok "${1:-}"; then
+        _mock_diag "adapter_guest_data_path: not a usable guest name: [${1:-}]"
+        return 2
+    fi
+
+    _type=$( _mock_guest_field "$1" 2 ) || {
+        _mock_diag "no such guest on this node: $1"
+        return 1
+    }
+
+    _wd=${SEANCE_MOCK_WORKDIR:-/nonexistent/mock}
+
+    case "${_type}" in
+        bhyve) printf '%s/vm/%s\n' "${_wd}" "$1" ;;
+        *)     printf '%s/jails-data/%s-data\n' "${_wd}" "$1" ;;
+    esac
+}
+
+# contract: adapter_config_data_path(rcfile) -> path [promises output]
+#
+# The `data=` of a guest's own configuration file, in this world's spelling of
+# one: bare "key=value" lines, which is what the tier-4 fixtures write and what
+# the pseudo-cluster's adapter registers from.
+#
+# IT IS A STAND-IN AND NOT A SECOND IMPLEMENTATION OF THE REAL PARSER, which
+# also has CBSD's quoting, its trailing semicolons and its CBSDROOT token to
+# deal with (lib/adapter.subr). What keeps the two from drifting where it
+# matters is tests/conformance/vectors.tsv, which runs the same three cases --
+# a path, a configuration that states none, one that states something
+# unusable -- against every adapter.
+adapter_config_data_path()
+{
+    local _rc _f _v
+
+    _mock_log adapter_config_data_path "$@"
+    _mock_scripted adapter_config_data_path "$@"
+    _rc=$?
+    [ "${_rc}" -ne 100 ] && return "${_rc}"
+
+    _f=${1:-}
+
+    if [ -z "${_f}" ] || [ ! -r "${_f}" ]; then
+        _mock_diag "adapter_config_data_path: no readable configuration file: [${_f}]"
+        return 2
+    fi
+
+    _v=$( awk -F= '$1 == "data" { v = $2 } END { print v }' "${_f}" ) || _v=""
+
+    case "${_v}" in
+        ''|0|-) return 1 ;;
+    esac
+
+    case "${_v}" in
+        /|*" "*|*/../*|*/..) 
+            _mock_diag "adapter_config_data_path: ${_f} says data=[${_v}]," \
+                "which is not a path a replica can be mounted at"
+            return 2
+            ;;
+        /*) ;;
+        *)
+            _mock_diag "adapter_config_data_path: ${_f} says data=[${_v}]," \
+                "which is not a path a replica can be mounted at"
+            return 2
+            ;;
+    esac
+
+    printf '%s\n' "${_v}"
 }
 
 # contract: adapter_guest_datasets(name) -> dataset per line, root first [promises output]

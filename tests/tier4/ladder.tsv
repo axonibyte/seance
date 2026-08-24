@@ -23,6 +23,13 @@
 #              claim=<-|charlie>  a living peer that already claims the guest
 #              kernel=<same|differs>
 #              guest=<web01|db01> web01 is a jail, db01 a bhyve VM
+#              data=<none|zero|relative|jailshape|travels>
+#                                 what the guest's own configuration says about
+#                                 where its data lives, and whether that
+#                                 configuration travels inside its own replica
+#              platform=<agree|disagree|silent>
+#                                 what the platform reports about the guest's
+#                                 data path once it has been registered
 #              notify=<none|ok|missing|crash|hang>
 #                                 tree=<coherent|child-ahead|child-foreign>
 #                                 sysdir=<present|absent>, mirror=<ok|absent|empty>
@@ -110,6 +117,25 @@ tree-child-foreign-forced	tree=child-foreign	all	abort	fence:mock	-	1
 sysdir-from-mirror	sysdir=absent	-	proceed	fence:mock	-	0
 sysdir-mirror-absent	sysdir=absent mirror=absent	-	abort	fence:mock	-	1
 sysdir-mirror-empty	sysdir=absent mirror=empty	-	abort	fence:mock	-	1
+# --- where a replica is mounted is READ, never derived (D-178, D-181) -------
+#
+# The path comes out of the guest's own rc.conf, before anything is mounted,
+# from whichever replica carries that file. What the rows are about:
+#   jailshape  the first real fleet -- a bhyve guest whose data lives at the
+#              jail-shaped path, which the type's creation convention would
+#              have put at ${workdir}/vm/<n>
+#   travels    the configuration inside the guest's own replica, which is
+#              where a VM on CBSD keeps it (sudoexec/bcreate:599)
+#   relative   a configuration naming a path a replica cannot be mounted at:
+#              a REFUSAL, and never a quiet fall back to the convention
+#   disagree   the platform, asked after the registration, reports the guest's
+#              data somewhere other than where the replica was mounted
+mount-fleet	guest=db01 data=jailshape	-	proceed	fence:mock	-	0
+mount-travels	data=travels	-	proceed	fence:mock	-	0
+mount-zero	data=zero	-	proceed	fence:mock	-	0
+mount-unusable	data=relative	-	abort	fence:mock	-	1
+mount-platform-disagrees	guest=db01 data=jailshape platform=disagree	-	abort	fence:mock	-	1
+mount-platform-silent	data=travels platform=silent	-	proceed	fence:mock	-	0
 # --- the notify contract: never changes a rung's disposition ----------------
 notify-none	fence=unknown notify=none	-	notify	-	4 fence	1
 notify-ok	fence=unknown notify=ok	-	notify	-	4 fence	1
