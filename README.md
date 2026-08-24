@@ -14,7 +14,7 @@ the implementation brief is in `HANDOFF.md`. Installing it is
 `docs/INSTALL.md`, step by step, with the CBSD source citations behind each
 step.
 
-## Status: M5 — v0.5.2
+## Status: M5 — v0.5.3
 
 Everything the design describes is implemented and tested at every tier the
 harness has. Layer 1 is live: `repl` snapshots, sends and prunes; `status` is
@@ -272,7 +272,23 @@ recorded data path — the field CBSD writes into its rc.conf at creation and
 carries ever since — and then asks the mount table which dataset is mounted
 exactly there. If the platform will not say, the type's documented data path is
 tried instead; if no dataset is mounted at the path that answered, that is a
-refusal naming the path, and never a name seance made up. The distinction that
+refusal naming the path, and never a name seance made up.
+
+The same convention decided **where a promotion mounts a replica**, and there
+it was worse: the guest is not registered on the surviving node yet, so there
+was nothing to observe and the type's creation path was all the ceremony had.
+On that fleet it would have mounted every replica where the platform does not
+look, registered the guest from a configuration naming somewhere else, and
+started nothing usable. The mount path is now read out of that configuration
+before anything is mounted — the same file the registration will use, so the
+two cannot disagree — and the ceremony checks its own work afterwards by asking
+the platform where it now looks for that guest's data. The post-registration
+check used to compare against the creation convention too, and on this fleet it
+would have false-alarmed on every correctly mounted replica: a VM whose disks
+are files has a replica that looks like a jail, and the convention for the type
+the platform reports is a path nothing on that fleet lives at.
+
+The distinction that
 matters is not "observed versus derived paths" but that **a path can be checked
 against the mount table before it names anything, and a computed dataset name
 was checked against nothing.**
@@ -751,12 +767,21 @@ overrides says `forced` in its own line. The forceable rungs are `quorum`,
 promoted until a fence has confirmed the corpse is off*, above.
 
 Promotion is **in place**: the replica stays where replication put it, under
-`<standby_root>/<dead>/<guest>`, and is given the mountpoint the platform
-expects. A guest whose configuration did not travel inside its own datasets — a
-jail — has it restored from the dead node's configuration mirror, which is
-mounted read-only for the copy and put back afterwards; a guest whose
-configuration did travel is registered straight from the replica. Every
-mutating step prints its undo. Each guest reports its RPO — the age of the
+`<standby_root>/<dead>/<guest>`, and is given the mountpoint **the guest's own
+configuration names** — `data=` in the `rc.conf_<guest>` the platform is about
+to be handed to register it with, read before anything is mounted, out of a
+read-only scratch mount of whichever replica carries that file. Where this
+platform *creates* a guest of that type is the last resort, for a
+configuration that states no data path at all, and the promote note says so
+when it is used; a configuration that states a path a replica cannot be mounted
+at is a refusal, not a fallback. Once the guest is registered, the platform is
+asked where it looks for that guest's data, and a disagreement stops the
+promotion before anything is started. A guest whose configuration did not
+travel inside its own datasets — a jail, and a VM on the fleet's layout — has
+it restored from the dead node's configuration mirror, which is mounted
+read-only for the copy and put back afterwards; a guest whose configuration did
+travel is registered straight from the replica. Every mutating step prints its
+undo. Each guest reports its RPO — the age of the
 newest replica snapshot at the moment it was promoted, which is exactly what
 the promotion cost.
 

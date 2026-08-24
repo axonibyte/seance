@@ -68,22 +68,31 @@
 # from this node's configuration, or from LIVING peers -- which the state model
 # permits and the resurrection gate depends on (design §5).
 #
-# OPEN PROBLEM, STATED HERE RATHER THAN WORKED AROUND. Rung 6 registers a guest
-# from the configuration that arrived with its datasets:
-# `$( adapter_guest_sysdir <guest> )/rc.conf_<guest>`, read AFTER the mount
-# ceremony so that the path resolves into the replica. On real CBSD that works
-# for a bhyve guest -- ${jailsysdir}/<name> is a symlink to ${workdir}/vm/<name>
-# (sudoexec/bcreate:599), which IS the guest's dataset, so its rc.conf travels
-# with replication. It does NOT work for a jail: ${jailsysdir}/<name> is a plain
-# directory on CBSD's workdir dataset, outside <pool>/<jname>, and
-# `adapter_guest_datasets` -- correctly -- does not replicate it. A jail's
-# configuration therefore does not travel today, and rung 6 fails that guest
-# loudly, naming the missing file, rather than registering something it guessed.
-# Closing it means either replicating jails-system or having `repl` place a
-# copy inside the guest's own dataset; both change the wire, and neither is
-# this milestone's to decide. The pseudo-cluster's adapter puts the guest's
-# configuration in a child dataset (adapter-pseudo.subr) and so does not meet
-# the problem, which is exactly why it is written down here.
+# WHERE A REPLICA IS MOUNTED IS READ, NEVER DERIVED (D-178, D-181). Rung 6
+# needs two things out of a guest's own configuration and takes both from the
+# same file -- the one the platform is about to be handed to register it:
+#
+#   * WHERE ITS DATA BELONGS. `data=` in rc.conf_<guest>, read BEFORE anything
+#     is mounted, out of a read-only scratch mount of whichever replica carries
+#     the file (promote_mount_path). The platform's convention for the guest's
+#     type is the LAST RESORT and says so in the note when it is used: on the
+#     first real fleet every guest is a bhyve VM living on the jail-shaped
+#     path, so a convention would have mounted every replica where nothing
+#     looks for it.
+#   * HOW TO REGISTER IT. `$( adapter_guest_sysdir <guest> )/rc.conf_<guest>`,
+#     read AFTER the ceremony so that the path resolves into the replica for
+#     anything whose configuration travels inside its own datasets -- a VM on
+#     CBSD whose ${jailsysdir}/<name> is a symlink to its data directory
+#     (sudoexec/bcreate:599), and every guest in the pseudo-cluster -- and out
+#     of the dead node's configuration mirror for everything else, which is
+#     what that mirror exists for (D-82): a jail's ${jailsysdir}/<name> is a
+#     plain directory on CBSD's workdir dataset, outside the guest's own
+#     dataset, and so is a VM's when it was created with mnt_start
+#     (sudoexec/bcreate:549-566).
+#
+# The two reads are in that order and from the same source, which is the point:
+# a path read from one file and a registration read from another are two
+# opinions about where a guest lives, and the platform only ever acts on one.
 #
 # shellcheck shell=sh
 # shellcheck disable=SC3043
@@ -126,6 +135,8 @@ PROMOTE_GUEST_DISPOSITIONS=""   # "<guest>=<disposition>" per guest, space sep
 PROMOTE_DEFERRED=""             # one line per deferred guest: the command, and
                                 # the node that has to run it (D-130)
 PROMOTE_TMPDIR=""               # scratch for one run
+PROMOTE_CONFIG_SOURCE=""        # the dataset a guest's rc.conf was read out of
+PROMOTE_MOUNT_PATH=""           # where the guest being promoted is to be mounted
 PROMOTE_AUTO=0                  # 1 when devd, not a human, is the trigger
 PROMOTE_AUTO_VHID=""            # the vhid whose MASTER transition must still hold
 
@@ -1430,17 +1441,68 @@ ${_vols}"
     return "${_rc}"
 }
 
+# promote_borrow_ro <dataset> <scratch-path>
+#
+# Mount a replica READ-ONLY at a scratch path, so that something inside it can
+# be read before the ceremony that will mount it properly has begun.
+#
+# Read-only because everything read this way is another node's record of its
+# own estate: there is nothing in it seance should be able to write. `zfs mount
+# -o ro` is a property of THE MOUNT (zfs-mount(8) -o), so it lasts exactly as
+# long as the mount and there is nothing on disk to put back afterwards but the
+# mountpoint, which promote_return_ro does.
+#
+# ONE MOUNTER, TWO READERS. The configuration mirror (D-82) and the guest's own
+# replica are both read this way, and writing a second mounter for the second
+# reader is how two paths that must behave identically stop doing so -- the
+# undo line, the read-only property and the restoration of the mountpoint are
+# one implementation or they are two half-implementations.
+#
+# rc 0 mounted, 1 not (and the mountpoint has been put back).
+promote_borrow_ro()
+{
+    local _ds _at
+
+    _ds=$1
+    _at=$2
+
+    mkdir -p "${_at}" || return 1
+
+    promote_undo "zfs unmount ${_ds}; zfs inherit mountpoint ${_ds}"
+
+    if ! zfs_set "mountpoint=${_at}" "${_ds}"; then
+        seance_log err "promote: cannot point ${_ds} at ${_at}"
+        return 1
+    fi
+
+    if ! zfs_mount_ro "${_ds}"; then
+        seance_log err "promote: cannot mount ${_ds} read-only at ${_at}"
+        zfs_inherit mountpoint "${_ds}"
+        return 1
+    fi
+
+    return 0
+}
+
+# promote_return_ro <dataset>  -- give back what promote_borrow_ro took.
+promote_return_ro()
+{
+    local _ds _rc
+
+    _ds=$1
+    _rc=0
+
+    zfs_unmount "${_ds}" || _rc=1
+    zfs_inherit mountpoint "${_ds}" || _rc=1
+
+    return "${_rc}"
+}
+
 # promote_sys_restore <guest> <sys-replica-dataset> <destination-directory>
 #                     <scratch-directory>
 #
 # Put a guest's configuration back where the platform looks for it, out of the
 # replica of the dead node's configuration mirror (D-82).
-#
-# The mirror is mounted READ-ONLY at a scratch path for the length of the copy
-# and then put back to where it was. Read-only because this node is reading
-# another node's record of its own estate: there is nothing here seance should
-# be able to write, and `zfs mount -o ro` is a property that lasts only as long
-# as the mount, so nothing has to be undone afterwards.
 #
 # rc 0 the configuration is in place, 1 it could not be.
 promote_sys_restore()
@@ -1459,20 +1521,7 @@ promote_sys_restore()
         return 1
     fi
 
-    mkdir -p "${_scratch}" || return 1
-
-    promote_undo "zfs unmount ${_sds}; zfs inherit mountpoint ${_sds}"
-
-    if ! zfs_set "mountpoint=${_scratch}" "${_sds}"; then
-        seance_log err "promote ${_guest}: cannot point ${_sds} at ${_scratch}"
-        return 1
-    fi
-
-    if ! zfs_mount_ro "${_sds}"; then
-        seance_log err "promote ${_guest}: cannot mount ${_sds} read-only"
-        zfs_inherit mountpoint "${_sds}"
-        return 1
-    fi
+    promote_borrow_ro "${_sds}" "${_scratch}" || return 1
 
     _rc=0
 
@@ -1490,8 +1539,7 @@ promote_sys_restore()
         fi
     fi
 
-    zfs_unmount "${_sds}" || _rc=1
-    zfs_inherit mountpoint "${_sds}" || _rc=1
+    promote_return_ro "${_sds}" || _rc=1
 
     return "${_rc}"
 }
@@ -1856,6 +1904,193 @@ promote_guest_type()
     fi
 }
 
+# promote_config_read <guest> <replica-root> <sys-replica-dataset>
+#                     <scratch-directory> <destination-file>
+#
+# The guest's own configuration file, copied out of the replicas this node
+# holds WITHOUT mounting anything at its final path -- because what the
+# ceremony needs from it is WHERE that final path is (D-181). Prints the
+# dataset it was found in.
+#
+# THE ORDER IS THE REGISTRATION'S ORDER, and that is the whole of why it is
+# this way round. Rung 6 registers the guest from the copy that travelled
+# inside its own datasets when there is one, and from the dead node's
+# configuration mirror when there is not (D-82). The mount path has to be read
+# out of the FILE THAT WILL BE REGISTERED: reading a path from the mirror and
+# then registering a travelled copy that says something else would mount the
+# replica in one place and tell the platform to look in another, which is the
+# defect this unit exists to remove, wearing a different hat.
+#
+#   1. the replica's root dataset -- a VM on CBSD, whose ${jailsysdir}/<n> is a
+#      symlink to its own data directory (sudoexec/bcreate:599), so its
+#      rc.conf_<n> sits at the top of the replica;
+#   2. each immediate FILESYSTEM child of it -- the pseudo-cluster's guests
+#      keep their configuration in a `sys` child dataset (D-84 item 3) so that
+#      it travels the way a VM's does. One level, because a platform that
+#      buries a guest's configuration deeper than its own data directory is not
+#      one seance has met, and a recursive search of a replica for a filename
+#      would be a guess wearing a find(1);
+#   3. the dead node's configuration mirror, which is where `repl` puts the
+#      configuration of everything whose sysdir does NOT travel -- a jail on
+#      CBSD, and any VM whose ${jailsysdir}/<n> is a real directory rather than
+#      a symlink into its dataset (a VM created with mnt_start, which is the
+#      shape the first real fleet is built in: sudoexec/bcreate:549-566 makes
+#      the sysdir with mkdir and never links it).
+#
+# rc 0 with the file copied and PROMOTE_CONFIG_SOURCE naming the dataset it
+# came out of, 1 when no replica this node holds carries it.
+#
+# THE ANSWER IS A VARIABLE AND NOT STDOUT, and that is not a style choice: this
+# function mounts things, and every mounting step in this file prints its undo
+# line on stdout (promote_undo). A caller capturing stdout would capture the
+# undo lines with the answer -- which is exactly what the first draft did, and
+# what turned a mount path into four lines of log.
+promote_config_read()
+{
+    local _guest _root _sds _scratch _dst _kids _ds _rc
+
+    _guest=$1
+    _root=$2
+    _sds=$3
+    _scratch="${4:?}/config"
+    _dst=$5
+
+    PROMOTE_CONFIG_SOURCE=""
+    rm -f "${_dst}"
+
+    # 1 and 2: the guest's own replica.
+    _kids=$( zfs_filesystems_r "${_root}" 2>/dev/null ) || _kids=""
+
+    for _ds in ${_kids}; do
+        [ -n "${_ds}" ] || continue
+
+        # One level: the root itself and its immediate children.
+        case "${_ds#"${_root}"}" in
+            '')     ;;              # the root
+            /*/*)   continue ;;     # deeper than one level
+            /*)     ;;              # an immediate child
+            *)      continue ;;     # not under this root at all
+        esac
+
+        promote_borrow_ro "${_ds}" "${_scratch}" || continue
+
+        _rc=1
+        if [ -r "${_scratch}/rc.conf_${_guest}" ] &&
+           cp "${_scratch}/rc.conf_${_guest}" "${_dst}"
+        then
+            _rc=0
+        fi
+
+        promote_return_ro "${_ds}"
+
+        if [ "${_rc}" -eq 0 ]; then
+            PROMOTE_CONFIG_SOURCE=${_ds}
+            return 0
+        fi
+    done
+
+    # 3: the dead node's configuration mirror.
+    zfs_exists "${_sds}" || return 1
+
+    promote_borrow_ro "${_sds}" "${_scratch}" || return 1
+
+    _rc=1
+    if [ -r "${_scratch}/${_guest}/rc.conf_${_guest}" ] &&
+       cp "${_scratch}/${_guest}/rc.conf_${_guest}" "${_dst}"
+    then
+        _rc=0
+    fi
+
+    promote_return_ro "${_sds}"
+
+    [ "${_rc}" -eq 0 ] || return 1
+
+    PROMOTE_CONFIG_SOURCE=${_sds}
+    return 0
+}
+
+# promote_mount_path <guest> <type> <replica-root> <sys-replica-dataset>
+#                    <scratch-directory>
+#
+# WHERE THIS GUEST'S REPLICA IS TO BE MOUNTED, observed rather than derived
+# (D-178's open paragraph, closed by D-181).
+#
+# It is the `data=` of the guest's OWN configuration -- the same file the
+# platform is about to be handed to register it with -- read before the
+# ceremony out of a read-only scratch mount of whichever replica carries it.
+# The alternative, which is what this replaced, was to ask the platform where a
+# guest of this TYPE is created here: on the first real fleet every guest is a
+# VM whose data lives on the jail-shaped path, so that answer would have
+# mounted the replica at ${workdir}/vm/<n> and then registered it from an
+# rc.conf whose data= names somewhere else. Nothing would have started, and
+# what did start would have started over an empty directory.
+#
+# THE LAST RESORT IS STILL THE PLATFORM'S CONVENTION, and it is announced when
+# it is used: a guest whose configuration states no data path at all (the
+# schema's default is "0") has nothing to observe, and this platform's own
+# convention for the type is the best available answer. A configuration that
+# states something that is NOT a usable absolute path is a REFUSAL, not a
+# fallback -- it is the one case where seance knows the answer is wrong rather
+# than missing.
+#
+# rc 0 with the path in PROMOTE_MOUNT_PATH -- a variable rather than stdout,
+# for promote_config_read's reason -- and 1 when the guest cannot be promoted
+# here at all.
+promote_mount_path()
+{
+    local _guest _type _root _sds _scratch _cfg _src _path _rc
+
+    _guest=$1
+    _type=$2
+    _root=$3
+    _sds=$4
+    _scratch=$5
+
+    PROMOTE_MOUNT_PATH=""
+    _cfg="${_scratch}/rcconf.${_guest}"
+
+    if promote_config_read "${_guest}" "${_root}" "${_sds}" \
+            "${_scratch}" "${_cfg}"
+    then
+        _src=${PROMOTE_CONFIG_SOURCE}
+        _path=$( adapter_config_data_path "${_cfg}" )
+        _rc=$?
+
+        case "${_rc}" in
+            0)
+                promote_note "${_guest}: its own configuration in ${_src} says" \
+                    "data=${_path}, so that is where its replica is mounted"
+                PROMOTE_MOUNT_PATH=${_path}
+                return 0
+                ;;
+            1)
+                promote_note "${_guest}: its configuration in ${_src} states no" \
+                    "data path (the platform's schema default is \"0\"), so the" \
+                    "LAST RESORT is used: where this platform creates a ${_type}"
+                ;;
+            *)
+                seance_log err "promote ${_guest}: its configuration in ${_src} names" \
+                    "a data path this node will not mount a replica at (see the" \
+                    "diagnostic above). Nothing has been mounted, registered or started."
+                return 1
+                ;;
+        esac
+    else
+        promote_note "${_guest}: no copy of rc.conf_${_guest} could be read from" \
+            "${_root} or from ${_sds}, so the LAST RESORT is used: where this" \
+            "platform creates a ${_type}. Registration will fail on the same" \
+            "absence if it really is absent"
+    fi
+
+    if ! _path=$( adapter_guest_mountpoint "${_guest}" "${_type}" ); then
+        seance_log err "promote ${_guest}: the adapter cannot say where a ${_type} belongs here"
+        return 1
+    fi
+
+    PROMOTE_MOUNT_PATH=${_path}
+    return 0
+}
+
 # promote_mount_ceremony <guest> <replica-root> <mountpoint>
 #
 # The replica is promoted IN PLACE (D-44 item 4): it stays under the standby
@@ -1928,6 +2163,11 @@ promote_mount_ceremony()
 # (sudoexec/zfs-recv:82-93), and whatever the platform itself asks for
 # (adapter_guest_links -- on CBSD, a VM's jails-system and jails-data links,
 # sudoexec/bcreate:598-599).
+#
+# <mountpoint> is where the replica IS -- the guest's own data path (D-181) --
+# and it is passed to the adapter rather than worked out there, because CBSD's
+# own links point at ${data} whatever ${data} is. A link made to a convention
+# instead would point at a directory nothing is mounted on.
 promote_relink()
 {
     local _guest _root _type _mp _vols _v _name _links _line _link _target _rc
@@ -1956,7 +2196,7 @@ promote_relink()
         fi
     done
 
-    _links=$( adapter_guest_links "${_guest}" "${_type}" ) || {
+    _links=$( adapter_guest_links "${_guest}" "${_type}" "${_mp}" ) || {
         seance_log err "promote ${_guest}: the adapter could not say which links this platform needs"
         return 1
     }
@@ -1988,7 +2228,7 @@ promote_relink()
 promote_guest_promote()
 {
     local _guest _root _ts _self _now _sroot _type _mp _sysdir _rcfile
-    local _running _real _age _epoch
+    local _running _real _where _age _epoch
 
     _guest=$1
     _root=$2
@@ -1999,18 +2239,21 @@ promote_guest_promote()
 
     _type=$( promote_guest_type "${_root}" )
 
-    if ! _mp=$( adapter_guest_mountpoint "${_guest}" "${_type}" ); then
-        seance_log err "promote ${_guest}: the adapter cannot say where a ${_type} belongs here"
-        return 1
-    fi
-
-    promote_note "${_guest}: ${_type}, replica ${_root}, promotion point ${_ts}," \
-        "mounting at ${_mp}"
+    promote_note "${_guest}: ${_type}, replica ${_root}, promotion point ${_ts}"
 
     # Every dataset at the same instant, BEFORE anything is mounted (D-85).
     # Mounting a tree whose child is ahead of its root would hand the guest a
     # filesystem that no complete copy of it ever had.
     promote_align_tree "${_guest}" "${_root}" "${PROMOTE_DEAD}" "${_ts}" || return 1
+
+    # AND ONLY THEN IS THE CONFIGURATION READ (D-181). It is read after the
+    # alignment because the file that decides where this guest's data belongs
+    # must be the file at the promotion point, not one an interrupted tick left
+    # a child dataset holding; and before the ceremony because the ceremony is
+    # what it decides.
+    promote_mount_path "${_guest}" "${_type}" "${_root}" \
+        "${_sroot}/${PROMOTE_DEAD}/${REPL_SYS_GUEST}" "${PROMOTE_TMPDIR}" || return 1
+    _mp=${PROMOTE_MOUNT_PATH}
 
     promote_mount_ceremony "${_guest}" "${_root}" "${_mp}" || return 1
     promote_relink "${_guest}" "${_root}" "${_type}" "${_mp}" || return 1
@@ -2070,19 +2313,52 @@ promote_guest_promote()
     fi
     promote_note "registered ${_guest} from ${_rcfile}"
 
-    # The platform's own answer, now that it has one. A ceremony built on the
-    # wrong type put the guest somewhere the platform will not look, and that
-    # must be found here rather than by an operator at 03:00.
+    # THE PLATFORM'S OWN ANSWER, NOW THAT IT HAS ONE, and it is asked about the
+    # PATH rather than about the type (D-181).
+    #
+    # What matters at this instant is one thing: does the platform, having read
+    # the registration, look for this guest's data where the replica is
+    # mounted? That is a question the platform answers directly -- the `data`
+    # field of the guest it has just registered -- and a disagreement means the
+    # next step would start a guest over a directory with nothing in it.
+    #
+    # WHAT THIS REPLACED, AND WHY IT HAD TO GO. The comparison used to be
+    # against `adapter_guest_mountpoint <guest> <platform's type>`: where this
+    # platform would CREATE a guest of that type. On the first real fleet the
+    # replica's datasets look like a jail (no zvols -- the disks are files
+    # inside the data directory) while the platform registers a bhyve, and the
+    # bhyve convention is ${workdir}/vm/<n>, which is not where any of those
+    # guests live. The check would have failed every promotion on that fleet
+    # AFTER registering the guest -- a false alarm about a correctly mounted
+    # replica, which is worse than no check at all because it stops a promotion
+    # that was going right.
+    #
+    # THE TYPE DISAGREEMENT IS STILL REPORTED, and is no longer fatal by
+    # itself. What promote_guest_type answers is what the replica's DISK LAYOUT
+    # says (zvols or not), which is the right predictor of the symlinks
+    # promote_relink has to make and not a claim about the emulator; the
+    # platform's word for the guest and the shape of its disks are two
+    # different facts and only their effect on the path can be checked here.
     _real=$( adapter_guest_type "${_guest}" 2>/dev/null ) || _real=""
     if [ -n "${_real}" ] && [ "${_real}" != "${_type}" ]; then
-        if [ "$( adapter_guest_mountpoint "${_guest}" "${_real}" 2>/dev/null )" != "${_mp}" ]; then
-            seance_log err "promote ${_guest}: the replica's datasets look like a ${_type}" \
-                "but the platform registered a ${_real}, which belongs somewhere else." \
-                "The guest has NOT been started. Undo with the lines printed above."
-            return 1
-        fi
-        promote_note "${_guest}: the platform calls this a ${_real} rather than a ${_type};" \
-            "both live at ${_mp} here, so the ceremony stands"
+        promote_note "${_guest}: the platform calls this a ${_real}; its replica's" \
+            "datasets have the shape of a ${_type}, which is what the relinking was" \
+            "done for. The mounted path is checked against the platform next"
+    fi
+
+    _where=$( adapter_guest_data_path "${_guest}" 2>/dev/null ) || _where=""
+    if [ -z "${_where}" ]; then
+        promote_note "${_guest}: the platform records no data path for it, so there is" \
+            "nothing to check the mount against; it was mounted at ${_mp}"
+    elif [ "${_where}" != "${_mp}" ]; then
+        seance_log err "promote ${_guest}: it is registered here and the platform looks" \
+            "for its data at ${_where}, while its replica is mounted at ${_mp}." \
+            "The guest has NOT been started -- it would have started over a directory" \
+            "that is not its own. Undo with the lines printed above."
+        return 1
+    else
+        promote_note "${_guest}: the platform looks for its data at ${_where}," \
+            "which is where its replica is mounted"
     fi
 
     promote_undo "seance failback-assist ${_guest} stop"

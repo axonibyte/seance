@@ -52,7 +52,7 @@ if [ "$( id -u )" -ne 0 ]; then
     exit 2
 fi
 
-t_plan 59
+t_plan 68
 
 TAB=$( printf '\t.' )
 TAB=${TAB%.}
@@ -60,6 +60,28 @@ TAB=${TAB%.}
 estate_up || { t_diag "estate_up failed"; t_done; }
 
 BASE_DS=$( cluster_base_dataset )
+
+# ---------------------------------------------------------------------------
+# A THIRD GUEST, IN THE SHAPE THE FIRST REAL FLEET IS BUILT IN (D-178, D-181)
+#
+# Every guest on that fleet is a bhyve VM whose data lives on the JAIL-shaped
+# path -- nothing at all is where this platform's creation convention for a VM
+# would put it. Until this stage carried one, every guest in the pseudo-cluster
+# lived exactly where the convention said, so a ceremony that DERIVED the mount
+# path and one that READ it were indistinguishable here, and the fleet was the
+# first place the difference could show.
+#
+# vmj01's data path is named by its own configuration and by nothing else. If
+# rung 6 derived the path, its replica would be mounted at /seance/vmj01, the
+# registration would name /seance/vmdata/vmj01-data, and the guest would start
+# over an empty directory -- which is precisely what would have happened on the
+# fleet.
+VMJ_DATA=/seance/vmdata/vmj01-data
+
+estate_guest_create alpha vmj01 bhyve alpha 1 "${VMJ_DATA}" ||
+    t_diag "creating vmj01 failed"
+node_sh alpha "echo vmj01-v1 > ${VMJ_DATA}/marker" ||
+    t_diag "writing vmj01's marker failed"
 
 # ---------------------------------------------------------------------------
 # Lineage first: a promotion has nothing to promote without one
@@ -163,7 +185,7 @@ oracle_capture()
     # invariant 1's business and not 4a's. Written down in decisions.md for M3,
     # whose world driver has to answer the same question.
     for _n in alpha bravo charlie; do
-        for _g in web01 db01; do
+        for _g in web01 db01 vmj01; do
             if [ "${_n}" = alpha ]; then
                 _ds="${BASE_DS}/alpha/${_g}"
             else
@@ -271,7 +293,7 @@ t_like "$( cat "${PROMOTE_OUT}" )" 'RPO ' \
     "the promotion reports what it cost"
 t_like "$( cat "${PROMOTE_OUT}" )" '^  undo: ' \
     "every mutating step printed its undo"
-t_like "$( cat "${PROMOTE_OUT}" )" '^promote: 2 of 2 guest\(s\) promoted from alpha' \
+t_like "$( cat "${PROMOTE_OUT}" )" '^promote: 3 of 3 guest\(s\) promoted from alpha' \
     "and the verdict line counts the estate"
 
 # --- the disks, which are the only account that matters ---------------------
@@ -294,6 +316,37 @@ t_stdout_is "web01-child-v1" "and the child dataset's data came too" \
 t_is "$( nz bravo get -H -o value mountpoint "${BASE_DS}/bravo/standby" )" "none" \
     "the standby PARENT was left alone: it still cannot mount"
 
+# --- and the guest whose data is NOT where the convention would put it -------
+#
+# The assertion the fleet needed and could not get: a replica mounted where the
+# guest's own configuration says, on a path no derivation from this node's
+# layout could have produced.
+VMJ_ON_BRAVO=$( estate_replica_root bravo alpha vmj01 )
+
+t_is "$( nz bravo get -H -o value mountpoint "${VMJ_ON_BRAVO}" )" "${VMJ_DATA}" \
+    "vmj01's replica is mounted where its OWN configuration says its data lives"
+t_isnt "$( nz bravo get -H -o value mountpoint "${VMJ_ON_BRAVO}" )" "/seance/vmj01" \
+    "and NOT at the path this platform's convention for the type would have derived"
+t_is "$( nz bravo get -H -o value canmount "${VMJ_ON_BRAVO}" )" "noauto" \
+    "with canmount still noauto, like every other replica"
+t_is "$( nz bravo get -H -o value mounted "${VMJ_ON_BRAVO}" )" "yes" \
+    "and it really is mounted"
+t_stdout_is "vmj01-v1" "and the data that was on the source is on the survivor" \
+    -- cluster_exec bravo cat "${VMJ_DATA}/marker"
+t_like "$( cat "${PROMOTE_OUT}" )" \
+    "vmj01: its own configuration in .* says data=${VMJ_DATA}" \
+    "the ladder says where it read the path, and out of which replica"
+t_like "$( cat "${PROMOTE_OUT}" )" \
+    "vmj01: the platform looks for its data at ${VMJ_DATA}, which is where its replica is mounted" \
+    "and it checked its own work against the platform after registering the guest"
+
+# The platform's own record on the survivor, read from the file the pseudo
+# adapter keeps it in: bravo now says vmj01's data is where alpha said it was.
+t_stdout_is "${VMJ_DATA}" \
+    "and bravo's registration of vmj01 carries the data path it was registered with" \
+    -- cluster_exec bravo sh -c \
+    "awk -F'\t' '\$1 == \"vmj01\" { print \$7 }' /var/db/seance-pseudo/guests.tsv"
+
 # --- the platform's own account ---------------------------------------------
 
 # The home column is deliberately not pinned. `status` prints the REPORTING
@@ -307,6 +360,8 @@ t_like "${STATUS_TSV}" "^guest${TAB}web01${TAB}jail${TAB}[a-z]+${TAB}yes${TAB}no
     "bravo reports web01 as a running, unheld guest"
 t_like "${STATUS_TSV}" "^guest${TAB}db01${TAB}bhyve${TAB}[a-z]+${TAB}yes${TAB}no\$" \
     "and db01 too"
+t_like "${STATUS_TSV}" "^guest${TAB}vmj01${TAB}bhyve${TAB}[a-z]+${TAB}yes${TAB}no\$" \
+    "and vmj01, the one whose data is not where a derivation would look, is running here too"
 
 # --- the records -------------------------------------------------------------
 
@@ -319,7 +374,7 @@ t_like "${SUCCESSION}" "^db01${TAB}alpha${TAB}bravo${TAB}[0-9]{8}T[0-9]{6}Z${TAB
 PLACEMENT=$( node_seance bravo placement )
 t_like "${PLACEMENT}" "^placement${TAB}web01${TAB}alpha\$" \
     "placement says bravo is hosting web01 away from its home"
-t_like "${PLACEMENT}" '^placement: 2 guest\(s\) hosted away from home$' \
+t_like "${PLACEMENT}" '^placement: 3 guest\(s\) hosted away from home$' \
     "and the verdict line counts them"
 
 # ---------------------------------------------------------------------------
@@ -393,7 +448,7 @@ oracle_capture "${ORACLE_DIR}/cur" bravo charlie ||
 
 mkdir -p "${ORACLE_DIR}/model"
 printf 'alpha\tdead\nbravo\talive\ncharlie\talive\n' > "${ORACLE_DIR}/model/nodes"
-printf 'web01\talpha\ndb01\talpha\n' > "${ORACLE_DIR}/model/guests"
+printf 'web01\talpha\ndb01\talpha\nvmj01\talpha\n' > "${ORACLE_DIR}/model/guests"
 : > "${ORACLE_DIR}/model/lineage"
 
 # shellcheck source-path=SCRIPTDIR
@@ -485,7 +540,7 @@ REVERSE_RC=$?
 
 t_is "${REVERSE_RC}" "1" \
     "a tick on the successor reports failure, because one of its peers is the corpse"
-t_like "$( cat "${REVERSE}" )" '^repl: 2 guests x 4 pairs, 2 ok, 2 failed, 0 skipped, 0 in progress$' \
+t_like "$( cat "${REVERSE}" )" '^repl: 3 guests x 6 pairs, 3 ok, 3 failed, 0 skipped, 0 in progress$' \
     "and the verdict line counts them: every pair to a living peer went through"
 t_like "$( cat "${REVERSE}" )" '^repl: configuration mirror: 2 pairs, 1 ok, 1 failed, 0 in progress$' \
     "the mirror is counted on a line of its own, because it is not a guest"

@@ -39,11 +39,19 @@ ROWS=""
 RRC=0
 rows()
 {
+    # THE SKIP MEMO IS CLEARED FIRST, so that each fixture below is its own
+    # process as far as the diagnostics are concerned. A skip line is said once
+    # per process (the dedupe section at the end of this file is about that),
+    # and these fixtures are about the PARSING -- a row of one that went quiet
+    # because a fixture three screens up had already said the same sentence
+    # would be a test measuring the memo by accident.
+    rm -f "$( _adapter_skip_log )"
+
     ROWS=$( printf '%s\n' "$1" | _adapter_list_rows 2> "${DIR}/err" )
     RRC=$?
 }
 
-t_plan 61
+t_plan 93
 
 # --- a listing of the shape CBSD prints --------------------------------------
 rows 'web01  jail   1  On
@@ -439,11 +447,201 @@ t_is "$( adapter_guest_mountpoint db01 bhyve )" "/wd/vm/db01" \
 t_rc 2 "a guest type this platform does not support is a contract error" \
     -- adapter_guest_mountpoint web01 xen
 
-t_is "$( adapter_guest_links web01 jail )" "" \
+# --- the links, which follow the DATA PATH and not a convention (D-181) ------
+#
+# CBSD links ${jailsysdir}/<n> and ${jaildatadir}/<n>-data to ${data}, whatever
+# ${data} is (sudoexec/bcreate:594-599), so the ceremony passes the path it
+# mounted the replica at and the adapter does not work one out for itself.
+t_is "$( adapter_guest_links web01 jail /wd/jails-data/web01-data )" "" \
     "a jail needs no symlinks: its dataset mounts where CBSD looks"
-t_is "$( adapter_guest_links db01 bhyve )" "/wd/jails-system/db01	/wd/vm/db01
+t_is "$( adapter_guest_links db01 bhyve /wd/vm/db01 )" "/wd/jails-system/db01	/wd/vm/db01
 /wd/jails-data/db01-data	/wd/vm/db01" \
     "a bhyve guest needs both of CBSD's own links (sudoexec/bcreate:598-599)"
+
+# THE FLEET'S SHAPE AGAIN: a VM whose data IS ${jaildatadir}/<name>-data. The
+# second link would then be its own target, and `ln -sf X X` on a mounted
+# directory does not fail -- it puts a link inside it. CBSD only makes that
+# link in the branch where the two differ (bcreate:594-598).
+t_is "$( adapter_guest_links vm01 bhyve /wd/jails-data/vm01-data )" \
+    "/wd/jails-system/vm01	/wd/jails-data/vm01-data" \
+    "a link whose path is its own target is left out, and the other one is not"
+t_rc 0 "and leaving it out is not a failure" \
+    -- adapter_guest_links vm01 bhyve /wd/jails-data/vm01-data
+
+t_rc 2 "a caller with no data path to pass is a contract error, not an empty list" \
+    -- adapter_guest_links db01 bhyve
+t_rc 2 "and a relative one is refused before anything is linked" \
+    -- adapter_guest_links db01 bhyve vm/db01
+
+# --- what the PLATFORM says about where a guest's data is --------------------
+#
+# The same field adapter_guest_datasets resolves through, now readable by the
+# ceremony that has to check its own work: promote mounts a replica where the
+# guest's configuration says, registers it, and then asks THIS.
+t_stdout_is "/wd/jails-data/web01-data" \
+    "the platform's data path for a jail is read from its own listing row" \
+    -- adapter_guest_data_path web01
+t_stdout_is "/wd/vm/db01" "and a VM's comes out of bls, which is asked second" \
+    -- adapter_guest_data_path db01
+t_stdout_is "/wd/jails-data/vm01-data" \
+    "and the fleet's VM answers with the jail-shaped path it really lives at" \
+    -- adapter_guest_data_path vm01
+t_rc 1 "a guest whose data field was never filled (CBSD prints \"0\") is not a path" \
+    -- adapter_guest_data_path old01
+t_rc 1 "and neither is a clustered node's remote row (D-177)" \
+    -- adapter_guest_data_path far01
+t_rc 2 "a name seance will not put on a command line is a contract error" \
+    -- adapter_guest_data_path WEB01
+
+# --- what the GUEST'S OWN CONFIGURATION says, before anything is mounted -----
+#
+# This is the read the whole of D-181 turns on: the promotion ceremony has a
+# replica and no registration, so the only thing that can say where the replica
+# belongs is the file the platform is about to be handed to register it with.
+# The shapes below are the ones `cbsd jmkrcconf` writes (jailctl/jmkrcconf:27-35:
+# quoted values, trailing semicolons) and the token junregister leaves behind.
+CFG="${DIR}/rcconf"
+mkdir -p "${CFG}"
+
+printf 'relative_path="1";\ndata="/wd/jails-data/web01-data";\nastart="1";\n' \
+    > "${CFG}/rc.conf_web01"
+t_stdout_is "/wd/jails-data/web01-data" \
+    "a configuration in CBSD's own shape -- quoted, semicolon-terminated -- is read" \
+    -- adapter_config_data_path "${CFG}/rc.conf_web01"
+
+printf 'emulator="bhyve";\ndata="/wd/jails-data/vm01-data";\n' > "${CFG}/rc.conf_vm01"
+t_stdout_is "/wd/jails-data/vm01-data" \
+    "THE FLEET: a bhyve guest whose own configuration puts it on the jail-shaped path" \
+    -- adapter_config_data_path "${CFG}/rc.conf_vm01"
+
+printf 'data=/wd/vm/db01\n' > "${CFG}/rc.conf_db01"
+t_stdout_is "/wd/vm/db01" "an unquoted value is the same value" \
+    -- adapter_config_data_path "${CFG}/rc.conf_db01"
+
+printf "data='/wd/vm/db02';\n" > "${CFG}/rc.conf_db02"
+t_stdout_is "/wd/vm/db02" "and so is a single-quoted one" \
+    -- adapter_config_data_path "${CFG}/rc.conf_db02"
+
+# The platform's own token: junregister replaces the workdir with CBSDROOT
+# (sudoexec/junregister:140-141) and jregister puts THIS node's workdir back
+# before it registers anything (sudoexec/jregister:151, tools/replacewdir:22).
+# A ceremony that mounted the literal token's path would mount somewhere the
+# registration is not about.
+printf 'data="CBSDROOT/jails-data/tok01-data";\n' > "${CFG}/rc.conf_tok01"
+t_stdout_is "/wd/jails-data/tok01-data" \
+    "CBSDROOT is resolved to this node's workdir, the way jregister resolves it" \
+    -- adapter_config_data_path "${CFG}/rc.conf_tok01"
+
+# A file the platform SOURCES: the last assignment is the one that takes
+# effect (sudoexec/jregister:154), so the last is the one read.
+printf 'data="/wd/vm/dup01";\ndata="/wd/jails-data/dup01-data";\n' \
+    > "${CFG}/rc.conf_dup01"
+t_stdout_is "/wd/jails-data/dup01-data" \
+    "a repeated assignment is read the way sourcing it would read it: the last wins" \
+    -- adapter_config_data_path "${CFG}/rc.conf_dup01"
+
+# --- states no path: the LAST RESORT, not a refusal --------------------------
+printf 'data="0";\n' > "${CFG}/rc.conf_zero01"
+t_rc 1 "the schema's default (\"0\") states no data path (share/local-jails.schema:39)" \
+    -- adapter_config_data_path "${CFG}/rc.conf_zero01"
+printf 'astart="1";\n' > "${CFG}/rc.conf_none01"
+t_rc 1 "and a configuration with no data key at all states none either" \
+    -- adapter_config_data_path "${CFG}/rc.conf_none01"
+printf 'data="";\n' > "${CFG}/rc.conf_empty01"
+t_rc 1 "and so does an empty value" \
+    -- adapter_config_data_path "${CFG}/rc.conf_empty01"
+
+# --- states an unusable path: a REFUSAL, and never a fallback ----------------
+#
+# The difference matters: "it does not say" leaves the platform's convention as
+# the best available answer, while "it says something seance will not mount a
+# replica at" is a fact about THIS guest that a convention would paper over.
+printf 'data="jails-data/rel01-data";\n' > "${CFG}/rc.conf_rel01"
+t_rc 2 "a relative data path is a refusal: it resolves against whatever directory promote ran in" \
+    -- adapter_config_data_path "${CFG}/rc.conf_rel01"
+adapter_config_data_path "${CFG}/rc.conf_rel01" 2> "${DIR}/cfg.err" > /dev/null
+t_like "$( cat "${DIR}/cfg.err" )" 'not a path a replica can be mounted at' \
+    "and it says so, naming the file and the value"
+
+printf 'data="/";\n' > "${CFG}/rc.conf_root01"
+t_rc 2 "the root filesystem is not a place to mount a replica" \
+    -- adapter_config_data_path "${CFG}/rc.conf_root01"
+
+printf 'data="/wd/vm/two words";\n' > "${CFG}/rc.conf_space01"
+t_rc 2 "a path with whitespace in it cannot survive a mountpoint property or a TSV record" \
+    -- adapter_config_data_path "${CFG}/rc.conf_space01"
+
+printf 'data="/wd/vm/../../etc";\n' > "${CFG}/rc.conf_dots01"
+t_rc 2 "and a traversal is not a place CBSD ever put a guest" \
+    -- adapter_config_data_path "${CFG}/rc.conf_dots01"
+
+t_rc 2 "a configuration file that cannot be read is a contract error, not an absence" \
+    -- adapter_config_data_path "${CFG}/nosuchfile"
+
+# --- one line per skipped guest per PROCESS ----------------------------------
+#
+# `repl` enumerates the roster four times in one tick, and every enumeration
+# used to say the same thing about the same skipped guest: four identical lines
+# per tick, per guest, under cron, for ever. On a clustered node that is one
+# line per tick for every guest of every peer. A diagnostic that is always
+# there is a diagnostic nobody reads -- the same finding D-97 acted on for the
+# phantom-guest line.
+#
+# The behaviour is unchanged and the rows are unchanged; what is asserted here
+# is the COUNT, which is the whole of the fix, and the two things it must not
+# cost: a second, different sentence about the same guest, and a memo that
+# cannot be used going quiet instead of loud.
+
+SKIPLOG=$( _adapter_skip_log )
+rm -f "${SKIPLOG}"
+
+CLUSTERED='web01  jail             1  On
+far01  0                0  0
+qe01   qemu-arm-static  1  Off'
+
+: > "${DIR}/dedupe.err"
+n=0
+while [ "${n}" -lt 4 ]; do
+    printf '%s\n' "${CLUSTERED}" | _adapter_list_rows \
+        > "${DIR}/dedupe.out" 2>> "${DIR}/dedupe.err"
+    n=$(( n + 1 ))
+done
+
+t_is "$( grep -c 'skipping far01' "${DIR}/dedupe.err" )" "1" \
+    "four enumerations of the same roster say the remote guest's skip ONCE"
+t_is "$( grep -c 'skipping qe01' "${DIR}/dedupe.err" )" "1" \
+    "and the unsupported emulator's skip once, because every skip is deduped and not just one of them"
+t_is "$( grep -c 'skipping' "${DIR}/dedupe.err" )" "2" \
+    "so a tick that enumerates four times says two lines, not eight"
+t_is "$( cat "${DIR}/dedupe.out" )" "web01	jail	1	1" \
+    "and the ROWS are unchanged: this is what is said about a skip, never whether it happens"
+
+# A different sentence about the SAME guest is a different fact and is still
+# said: a guest whose row changed between two enumerations has something new to
+# report, and a memo keyed on the name alone would have swallowed it.
+printf 'far01  xen  1  Off\n' | _adapter_list_rows > /dev/null 2>> "${DIR}/dedupe.err"
+t_like "$( cat "${DIR}/dedupe.err" )" 'skipping far01: emulator xen is not supported' \
+    "a different sentence about the same guest is still said"
+
+# A memo that is not a plain file is not this process's memo: /tmp is
+# world-writable, and a symlink planted at the memo's path would otherwise make
+# seance append its diagnostics through it. Refusing costs the line being said
+# every time, which is the direction a failure here must fall in.
+rm -f "${SKIPLOG}"
+ln -sf "${DIR}/planted" "${SKIPLOG}"
+: > "${DIR}/planted.err"
+printf 'far02  0  0  0\n' | _adapter_list_rows > /dev/null 2>> "${DIR}/planted.err"
+printf 'far02  0  0  0\n' | _adapter_list_rows > /dev/null 2>> "${DIR}/planted.err"
+
+t_is "$( grep -c 'skipping far02' "${DIR}/planted.err" )" "2" \
+    "a memo that cannot be used says the line every time rather than going quiet"
+if [ -e "${DIR}/planted" ]; then
+    t_not_ok "and nothing is written through the planted link"
+else
+    t_ok "and nothing is written through the planted link"
+fi
+
+rm -f "${SKIPLOG}"
 
 # --- both layouts, through the resolution that has to tell them apart --------
 t_is "$( adapter_guest_datasets web01 )" "pool0/web01

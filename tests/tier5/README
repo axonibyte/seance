@@ -46,6 +46,18 @@ THE FILES
                             successor's half of a promotion: a real jail
                             registers and starts out of the configuration
                             mirror and nothing else.
+  t_mountpath_real.sh       the first real fleet's LAYOUT, built with CBSD's
+                            own verbs: a bhyve guest moved onto the jail-shaped
+                            path (junregister, edit the data path, jregister),
+                            with no zvols and a plain-directory sysdir. Then
+                            the successor's half again, asserting that the
+                            replica is mounted where the guest's OWN
+                            configuration says -- read out of the mirror before
+                            anything is mounted -- and that the platform, asked
+                            afterwards, agrees. It does not START the guest:
+                            a bhyve VM in this substrate has never been booted
+                            (see STILL UNVERIFIED below); that half is tier 6's
+                            vmj01.
 
 Each of the three real files builds and destroys its own CBSD node
 (tests/shapeb/lib/shapeb.subr, about 19 seconds), for the reason tier 6's
@@ -79,6 +91,12 @@ captures):
     measured rather than assumed by type;
   * and the mirror: a real jail registers and starts from a
     promote_sys_restore out of a replica of `<pool>/seance-sys` (D-82, D-84);
+  * that `data=` in a guest's own registration is what says where its data
+    lives, that CBSD expands its CBSDROOT token into THIS node's workdir when
+    it registers one, and that a promotion mounts the replica there rather than
+    where the platform's convention for the guest's type would have put it
+    (D-181) -- on a guest whose layout is the fleet's and whose path neither
+    convention could have produced;
   * `seance failback-assist <g> unregister` leaves nothing behind in
     ${jailrcconfdir}: junregister writes its own export of the guest as it
     goes and nothing ever removes it, so before the fix one failback made this

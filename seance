@@ -1,5 +1,5 @@
 #!/usr/local/bin/cbsd
-#v0.5.2
+#v0.5.3
 # seance -- CBSD verb wrapper (decision D-2).
 #
 # This is the only file in the project that runs under cbsdsh. It does no
