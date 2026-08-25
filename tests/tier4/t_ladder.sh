@@ -272,6 +272,13 @@ zfs_get()
             esac
             return 0
             ;;
+        mountpoint)
+            # What this world was last told to set (w_mountpoint), which is
+            # what promote_config_travelled reads to decide whether a guest's
+            # sysdir resolves inside its replica (D-187).
+            w_mountpoint "$2"
+            return $?
+            ;;
         *)
             t_diag "zfs_get: this fixture has no answer for property [$1] on [$2]"
             return 1
@@ -641,6 +648,16 @@ world_build()
             w_rcconf "${_guest}" \
                 > "${_wd}/jails-system/${_guest}/rc.conf_${_guest}"
         fi
+        # sysdir=stale is THE FLEET (D-187): a jails-system/<guest> directory
+        # already on the survivor -- the platform keeps one per cluster guest
+        # on every node -- holding a readable rc.conf that is WRONG (an older
+        # data path) and a local.sqlite the platform cannot read. Readable is
+        # not travelled; the mirror must be written over it.
+        if [ "${_sysdir}" = "stale" ]; then
+            w_rcconf "${_guest}" | sed -e "s|^data=.*|data=\"${_wd}/vm/${_guest}-STALE\";|" \
+                > "${_wd}/jails-system/${_guest}/rc.conf_${_guest}"
+            printf 'not a database\n' > "${_wd}/jails-system/${_guest}/local.sqlite"
+        fi
     fi
 
     # WHAT THE PLATFORM SAYS AFTERWARDS. A guest registered from a
@@ -983,7 +1000,7 @@ fi
 # One assertion per row, plus the twenty-five named assertions below. A table
 # with no rows would have produced a green run of nothing, which is why the
 # count is derived from the table rather than written down.
-t_plan $(( NROWS + 117 ))
+t_plan $(( NROWS + 123 ))
 
 SAVED=$( t_tmpdir )
 AUTO_ROWS=""
@@ -1291,6 +1308,35 @@ t_like "$( cat "${SAVED}/mount-platform-silent.out" )" \
     "and the stop says so, with the undo lines above it"
 t_unlike "$( cat "${SAVED}/mount-platform-silent.out" )" '^  started ' \
     "nothing was started on a guest the platform will not claim"
+
+# ---------------------------------------------------------------------------
+# A stale sysdir on the survivor is NOT the guest's configuration (D-187)
+#
+# drill-guest attempt 3: the survivor held the platform's own months-old
+# jails-system/<guest> directory, rc.conf readable, local.sqlite from an older
+# schema. Rung 6 read "readable" as "travelled", never restored the mirror,
+# registered the guest against a database the platform could not read, and
+# the platform reported nothing about a guest whose datasets were mounted
+# underneath it.
+# ---------------------------------------------------------------------------
+
+t_like "$( cat "${SAVED}/sysdir-stale.out" )" \
+    'did not travel inside its own datasets; restoring it from alpha.s configuration mirror' \
+    "a readable rc.conf in a sysdir that does not resolve into the replica is NOT travelled"
+t_like "$( cat "${SAVED}/sysdir-stale.out" )" \
+    'already existed here \(the platform.s own, stale copy\); backed up to' \
+    "the survivor's own copy is backed up before the mirror overwrites it"
+t_like "$( cat "${SAVED}/sysdir-stale.out" )" \
+    '^  undo: find .*/jails-system/web01 -mindepth 1 -delete; cp -a .*/sysdir-backup/web01\.' \
+    "and the undo line puts that copy back rather than deleting a directory the platform made"
+t_unlike "$( cat "${SAVED}/sysdir-stale.out" )" 'STALE' \
+    "nothing downstream ever saw the stale data path"
+t_is "$( cat "${SAVED}/sysdir-stale.placement" )" "web01	alpha" \
+    "and the guest is promoted from the mirror's configuration"
+
+t_like "$( cat "${SAVED}/sysdir-stale-mirror-absent.out" )" \
+    'its configuration is not here' \
+    "with no mirror, a stale local copy is a REFUSAL, not a fallback: it is the survivor's, not the guest's"
 
 # ---------------------------------------------------------------------------
 # The configuration mirror (D-82)

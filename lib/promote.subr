@@ -1521,6 +1521,57 @@ promote_return_ro()
     return "${_rc}"
 }
 
+# promote_config_travelled <guest> <replica-root>
+#
+# DID THIS GUEST'S CONFIGURATION ARRIVE INSIDE ITS OWN REPLICA? (D-187)
+#
+# rc 0 when the platform's configuration directory for <guest> resolves AT or
+# UNDER the mountpoint of a dataset in the replica tree that the ceremony has
+# just mounted -- a VM whose ${jailsysdir}/<n> is a symlink into its data
+# directory, or a pseudo-cluster guest whose sys/ is a child dataset. That is
+# repl's own rule (repl_sys_travels), asked on the survivor: it is a fact about
+# WHERE the directory resolves, and never about whether a file happens to be
+# readable there.
+#
+# WHAT THIS REPLACED. Rung 6 used to take "rc.conf_<n> is readable in the
+# sysdir" as proof the configuration travelled. On the first real fleet every
+# node carries a `jails-system/<guest>` directory for EVERY cluster guest --
+# the platform's own, months old -- with a stale rc.conf and a local.sqlite
+# from an older schema. The file was readable, so the mirror was never
+# restored over it, the guest was registered against a database the platform
+# could not read, and `bls` reported nothing about a guest whose datasets were
+# mounted underneath it (drill-guest attempt 3). A directory that merely
+# exists on the survivor is the survivor's copy; the dead node's mirror is
+# fresher by construction, because the dead node wrote it on its last tick.
+promote_config_travelled()
+{
+    local _guest _root _sd _real _kids _ds _mp
+
+    _guest=$1
+    _root=$2
+
+    _sd=$( adapter_guest_sysdir "${_guest}" 2>/dev/null ) || return 1
+    [ -n "${_sd}" ] || return 1
+    _real=$( realpath "${_sd}" 2>/dev/null ) || return 1
+
+    _kids=$( zfs_filesystems_r "${_root}" 2>/dev/null ) || return 1
+
+    for _ds in ${_kids}; do
+        [ -n "${_ds}" ] || continue
+        _mp=$( zfs_get mountpoint "${_ds}" 2>/dev/null ) || continue
+        case "${_mp}" in
+            /*) ;;
+            *) continue ;;
+        esac
+        [ "${_real}" = "${_mp}" ] && return 0
+        case "${_real}" in
+            "${_mp}/"*) return 0 ;;
+        esac
+    done
+
+    return 1
+}
+
 # promote_sys_restore <guest> <sys-replica-dataset> <destination-directory>
 #                     <scratch-directory>
 #
@@ -1530,7 +1581,7 @@ promote_return_ro()
 # rc 0 the configuration is in place, 1 it could not be.
 promote_sys_restore()
 {
-    local _guest _sds _dst _scratch _rc
+    local _guest _sds _dst _scratch _rc _bak
 
     _guest=$1
     _sds=$2
@@ -1553,7 +1604,32 @@ promote_sys_restore()
             "${_guest}/ directory; the dead node never mirrored this guest"
         _rc=1
     else
-        promote_undo "rm -rf ${_dst}"
+        # A DIRECTORY THAT IS ALREADY THERE IS THE SURVIVOR'S OWN COPY (D-187),
+        # and on a clustered platform it usually is there: CBSD keeps a
+        # jails-system/<guest> directory for every guest in the cluster, on
+        # every node. It is stale by definition -- the mirror is what the dead
+        # node wrote on its last tick -- so the mirror is written OVER it.
+        # But it is not seance's to destroy: it is backed up, outside the
+        # platform's view, and the undo line puts it back rather than deleting
+        # a directory the platform made.
+        if [ -d "${_dst}" ] && [ -n "$( ls -A "${_dst}" 2>/dev/null )" ]; then
+            _bak="$( seance_state_dir )/sysdir-backup/${_guest}.$( pol_now 2>/dev/null || date -u +%Y%m%dT%H%M%SZ )"
+            if mkdir -p "${_bak}" && cp -a "${_dst}/." "${_bak}/"; then
+                promote_note "${_guest}: ${_dst} already existed here (the platform's own," \
+                    "stale copy); backed up to ${_bak} before the mirror overwrites it"
+                promote_undo "find ${_dst} -mindepth 1 -delete; cp -a ${_bak}/. ${_dst}/"
+            else
+                seance_log err "promote ${_guest}: ${_dst} exists and could not be backed up" \
+                    "to ${_bak}; the mirror is not written over a copy seance cannot put back"
+                promote_return_ro "${_sds}"
+                return 1
+            fi
+        else
+            promote_undo "rm -rf ${_dst}"
+        fi
+        # -wal/-shm sidecars of a live copy must not outlive the file they
+        # belong to; the mirror's own (if any) arrive with cp -a below.
+        rm -f "${_dst}"/*.sqlite-wal "${_dst}"/*.sqlite-shm 2>/dev/null
         if mkdir -p "${_dst}" && cp -a "${_scratch}/${_guest}/." "${_dst}/"; then
             promote_note "restored ${_guest}'s configuration into ${_dst} from ${_sds}"
         else
@@ -2293,13 +2369,25 @@ promote_guest_promote()
     #      nothing else replicates it.
     _sysdir=""
     _rcfile=""
-    if _sysdir=$( adapter_guest_sysdir "${_guest}" 2>/dev/null ); then
-        _rcfile="${_sysdir}/rc.conf_${_guest}"
-    fi
+    _sysdir=$( adapter_guest_sysdir "${_guest}" 2>/dev/null ) || _sysdir=""
 
-    if [ -z "${_rcfile}" ] || [ ! -r "${_rcfile}" ]; then
+    # TRAVELLED means "resolves inside the replica", not "a file is readable
+    # there" (D-187, promote_config_travelled). The survivor may well hold a
+    # directory of that name already -- CBSD keeps one per cluster guest on
+    # every node -- and it is the survivor's stale copy, not the guest's.
+    # Both halves, and in this order: the directory resolves INTO the replica
+    # (so what is there is the guest's, not the survivor's), AND the file is
+    # there (a replica whose sys directory is inside it but carries no rc.conf
+    # is a guest the mirror is for, D-82).
+    if [ -n "${_sysdir}" ] && promote_config_travelled "${_guest}" "${_root}" &&
+       [ -r "${_sysdir}/rc.conf_${_guest}" ]; then
+        _rcfile="${_sysdir}/rc.conf_${_guest}"
+        promote_note "${_guest}: its configuration travelled inside its own replica" \
+            "(${_sysdir} resolves into it, and carries rc.conf_${_guest})"
+    else
         promote_note "${_guest}: its configuration did not travel inside its own" \
-            "datasets; restoring it from ${PROMOTE_DEAD}'s configuration mirror"
+            "datasets; restoring it from ${PROMOTE_DEAD}'s configuration mirror" \
+            "${_sysdir:+(over ${_sysdir}, the copy this node already held)}"
 
         if [ -z "${_sysdir}" ]; then
             _sysdir="$( adapter_fact jailsysdir )/${_guest}"

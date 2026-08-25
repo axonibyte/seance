@@ -39,7 +39,9 @@
 #                                 data path once it has been registered
 #              notify=<none|ok|missing|crash|hang>
 #                                 tree=<coherent|child-ahead|child-foreign>
-#                                 sysdir=<present|absent>, mirror=<ok|absent|empty>
+#                                 sysdir=<present|absent|stale>, mirror=<ok|absent|empty>
+#                                   stale: the survivor already holds a readable but
+#                                   WRONG copy outside the replica (D-187)
 #              auto=<0|1>         drive the ladder as devd would (--auto)
 #              fleetauto=<0|1>    the fleet key `auto`
 #              armed=<yes|no>     whether node_bravo_auto_promote names alpha
@@ -176,3 +178,5 @@ replica-fleetshape	replica=fleetshape	-	proceed	fence:mock	-	0
 replica-fleetshape-vm	replica=fleetshape guest=db01	-	proceed	fence:mock	-	0
 replica-unnamed	replica=unnamed	-	abort	fence:mock	-	1
 replica-unnamed-forced	replica=unnamed	all	abort	fence:mock	-	1
+sysdir-stale	sysdir=stale	-	proceed	fence:mock	-	0
+sysdir-stale-mirror-absent	sysdir=stale mirror=absent	-	abort	fence:mock	-	1

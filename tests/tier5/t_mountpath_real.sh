@@ -98,7 +98,7 @@ EOF
 
 SEANCE="${T_ROOT}/bin/seance"
 
-t_plan 55
+t_plan 60
 
 # ---------------------------------------------------------------------------
 # Move the VM onto the fleet's layout, with CBSD's own verbs
@@ -435,9 +435,33 @@ t_rc 0 "relinking a guest whose disks are files asks for no symlinks at all" \
 
 # The configuration, restored the way rung 6 restores it, into the plain
 # directory this layout keeps it in.
+# THE FLEET'S OWN TRAP (D-187): the survivor already holds ${jailsysdir}/<V> --
+# on a clustered platform every node keeps one per cluster guest -- with a
+# readable rc.conf and a local.sqlite the platform cannot read. Here the
+# directory is the one this file made above, so it is made STALE the way the
+# fleet's was: the rc.conf names an older data path, the database is not one.
+STALE_SYSDIR="${WD}/jails-system/${V}"
+sed -i '' -e "s|^data=.*|data=\"${WD}/vm/${V}-STALE\";|" "${STALE_SYSDIR}/rc.conf_${V}" ||
+    t_diag "staling the sysdir's rc.conf failed"
+printf 'not a database\n' > "${STALE_SYSDIR}/local.sqlite"
+rm -f "${STALE_SYSDIR}/local.sqlite-wal" "${STALE_SYSDIR}/local.sqlite-shm"
+
+t_rc 1 "a readable rc.conf in a sysdir OUTSIDE the replica does not count as travelled" \
+    -- promote_config_travelled "${V}" "${REPLICA}"
+
 t_rc 0 "the configuration is restored out of the mirror" \
     -- promote_sys_restore "${V}" "${SYS_REPLICA}" "${WD}/jails-system/${V}" \
     "${PROMOTE_TMPDIR}"
+
+t_is "$( awk -F'"' '/^data=/ { print $2; exit }' "${STALE_SYSDIR}/rc.conf_${V}" )" "${VMDATA}" \
+    "and the mirror's rc.conf is written OVER the stale one"
+t_isnt "$( head -c 14 "${STALE_SYSDIR}/local.sqlite" )" "not a database" \
+    "and so is the platform's per-guest database, which is what bls reads"
+t_rc 0 "the database the mirror brought is one the platform can open" \
+    -- sqlite3 "file:${STALE_SYSDIR}/local.sqlite?mode=ro&immutable=1" ".tables"
+BAK=""; for _b in "${SEANCE_STATE_DIR}/sysdir-backup/${V}."*; do [ -d "${_b}" ] && BAK=${_b}; done
+t_is "$( head -c 14 "${BAK}/local.sqlite" 2>/dev/null )" "not a database" \
+    "and the survivor's stale copy was backed up first, outside the platform's view"
 
 t_rc 0 "and CBSD registers the guest from it" \
     -- adapter_guest_register "${V}" "${RCFILE}"
