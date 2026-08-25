@@ -335,6 +335,15 @@ it that is.
 10. **Bring the home node back**, and let the gate run. Do not start anything
     by hand.
 
+    A node that was shut down can come back with `net.inet.carp.demotion`
+    left elevated (seen every time on one fleet: 720, three interfaces'
+    worth), advertising its own vhid so badly that it stays BACKUP for its
+    own identity. `verify` on that node says so ("this node's OWN identity
+    and it is BACKUP for it"). Record the counter before touching it -- it
+    is the drill's evidence -- then bring it back to 0 with a relative
+    write (`sysctl net.inet.carp.demotion=-<value>`), re-read it after the
+    interfaces have settled, and never leave it negative.
+
 11. **Prove the gate withheld the estate.** On the home node:
 
     ```sh
@@ -386,6 +395,12 @@ it that is.
 15. **Let one more replication tick run in the normal direction**, then
     `seance verify` and `seance status` on all three nodes. Both must exit 0.
 
+    Expect the two SURVIVING nodes to carry `WARN replica <guest>@<home>:
+    the last tick exited 1` until their next tick after the home node
+    returns: every pair toward it failed while it was down, and `status`
+    reports the last exit of each pair. One tick on each clears it. That
+    is not a drill failure; a WARN that survives the next tick is.
+
 ### Timing
 
 Both directions are timed, the way drill-replication is: note the wall clock at
@@ -408,7 +423,7 @@ for the way home.
 | 10–11 | the home node booting to `gate` having held the estate | < 5 min | elapsed |
 | 12 | `seance failback <guest>`, start to verdict line | < 2 min + the reverse stream | elapsed, and the bytes moved |
 | **12→14** | **the second outage: guest stopped on the heir to the service answering at home** | **< 10 min** | **elapsed** |
-| 15 | `verify` + `status` on all three nodes | < 60 s | elapsed |
+| 15 | `verify` + `status` on all three nodes | < 240 s | elapsed (each `verify` now asks every fence driver on the wire, D-186 -- measured 146 s on three nodes) |
 
 A step that overruns its target is not by itself a failure; it is the number
 the next drill is compared against, and the first one to move is the one worth
