@@ -28,7 +28,7 @@ set -u
 
 DIR=$( t_tmpdir )
 
-t_plan 14
+t_plan 17
 
 # --- neither a node override nor a fleet setting: the caller derives -------
 
@@ -42,6 +42,19 @@ t_stdout_is "" "and prints nothing" -- repl_standby_root alpha
 t_stdout_is "mypool/standby" \
     "repl_standby_root_derived falls back to <root's parent>/standby" -- \
     repl_standby_root_derived mypool/alpha01
+
+# A ROOT ALREADY INSIDE A STANDBY TREE IS REFUSED (D-188): a guest promoted in
+# place lives under <standby_root>/<deadkey>/, and deriving from it answers a
+# standby root nested inside the dead node's estate -- which is where a real
+# fleet shipped a 3.82 GB copy of a promoted guest. The fleet's shape, the
+# pseudo-cluster's shape, and the textbook one that still derives:
+t_rc 1 "a promoted-in-place root (fleet shape) is refused rather than derived from" -- \
+    repl_standby_root_derived zroot/cbsd/jails-data/standby/hyp2c/crowdeasedev01-data
+t_rc 1 "and the pseudo-cluster's shape too" -- \
+    repl_standby_root_derived tank/state/seance/bravo/standby/alpha/web01
+t_stdout_is "zroot/cbsd/jails-data/standby" \
+    "while a home guest on the same fleet still derives the real standby root" -- \
+    repl_standby_root_derived zroot/cbsd/jails-data/crowdeasedev01-data
 
 # --- the fleet setting, verbatim, when no peer owns an override ------------
 

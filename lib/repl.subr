@@ -439,9 +439,19 @@ repl_standby_root()
 # is <pool>/<jname> (D-6). A derivation can only speak for THIS node's layout,
 # so a fleet that is not uniform must set the key; that is documented rather
 # than guessed at.
+#
+# AND IT REFUSES A ROOT THAT IS ALREADY INSIDE A STANDBY TREE (D-188). A guest
+# promoted in place lives under <standby_root>/<deadkey>/ -- that is what "in
+# place" means (D-44 item 4) -- and the derivation, applied to it, answers
+# <standby_root>/<deadkey>/standby: a standby root nested inside the dead
+# node's estate. On the first real fleet, with the key unset, the survivor
+# then shipped a 3.82 GB copy of the promoted guest to its peers under that
+# path. The derivation speaks for the textbook layout, <pool>/<jname>, and
+# for nothing else; a path with a `standby` component in it is a replica,
+# promoted or not, and the only truthful answer is the configuration key.
 repl_standby_root_derived()
 {
-    local _root
+    local _root _rest
 
     _root=${1:?}
 
@@ -449,6 +459,14 @@ repl_standby_root_derived()
         */*) ;;
         *) return 1 ;;
     esac
+
+    _rest=${_root}
+    while [ "${_rest}" != "${_rest#*/}" ]; do
+        case "${_rest%%/*}" in
+            standby) return 1 ;;
+        esac
+        _rest=${_rest#*/}
+    done
 
     printf '%s/standby\n' "${_root%/*}"
 }
