@@ -226,7 +226,15 @@ mode_is_private()
 {
     local _m
 
-    _m=$( stat -f '%Lp' "$1" 2>/dev/null ) || return 1
+    # -L, and it is load-bearing (D-184). FreeBSD stat(1) uses lstat(2) by
+    # default and reports the LINK's own mode, which is lrwxrwxrwx -- and the
+    # path this driver is handed is a symlink by seance's own installation
+    # design (docs/INSTALL.md puts the real file in /usr/local/etc/seance/ and
+    # links it into ${etcdir}). So this check refused every correctly installed
+    # fleet: on the real one it turned a working fence into rung 4 `notify`,
+    # mid-drill, with the node already down. -L asks about the file the caller
+    # actually reads.
+    _m=$( stat -L -f '%Lp' "$1" 2>/dev/null ) || return 1
 
     case "${_m}" in
         ''|*[!01234567]*) return 1 ;;
