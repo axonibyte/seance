@@ -163,9 +163,15 @@ SEANCE_MOCK_WORKDIR="${DIR}/workdir"
 SEANCE_MOCK_LOG="${DIR}/mock.log"
 SEANCE_MOCK_SCRIPT="${DIR}/mock.script"
 export SEANCE_MOCK_NODE SEANCE_MOCK_WORKDIR SEANCE_MOCK_LOG SEANCE_MOCK_SCRIPT
-mkdir -p "${SEANCE_MOCK_WORKDIR}/jails-system/web01" \
+mkdir -p "${SEANCE_MOCK_WORKDIR}/jails-system" "${SEANCE_MOCK_WORKDIR}/jails-data/web01-data" \
          "${SEANCE_MOCK_WORKDIR}/jails-data"
-printf 'name=web01\n' > "${SEANCE_MOCK_WORKDIR}/jails-system/web01/rc.conf_web01"
+# web01's configuration TRAVELS in this world: its sysdir is a symlink into the
+# replica's data directory, the way a CBSD VM's is (and the pseudo-cluster's
+# sys/ child dataset). A plain jails-system/web01 holding a readable file is,
+# since D-187, the survivor's stale copy and is refused -- rightly, which is
+# why this fixture no longer models one.
+ln -s "${SEANCE_MOCK_WORKDIR}/jails-data/web01-data" "${SEANCE_MOCK_WORKDIR}/jails-system/web01"
+printf 'name=web01\n' > "${SEANCE_MOCK_WORKDIR}/jails-data/web01-data/rc.conf_web01"
 : > "${SEANCE_MOCK_SCRIPT}"
 
 PROMOTE_DEAD=alpha
@@ -187,6 +193,23 @@ W_MOUNTED=""
 
 # shellcheck disable=SC2329
 zfs_filesystems_r() { printf '%s\n' "$1"; }
+
+# zfs_get mountpoint: where this world's replicas mount, by the same layout the
+# mock adapter answers (a jail at jails-data/<n>-data, a VM at vm/<n>), so that
+# promote_config_travelled (D-187) can tell a sysdir INSIDE the replica from a
+# survivor's stale copy of the same name.
+zfs_get()
+{
+    case "$1" in
+        mountpoint)
+            case "${2##*/}" in
+                db01) printf '%s/vm/db01\n' "${SEANCE_MOCK_WORKDIR}" ;;
+                *)    printf '%s/jails-data/%s-data\n' "${SEANCE_MOCK_WORKDIR}" "${2##*/}" ;;
+            esac
+            ;;
+        *) return 1 ;;
+    esac
+}
 # shellcheck disable=SC2329
 zfs_volumes_r() { return 0; }
 # shellcheck disable=SC2329
