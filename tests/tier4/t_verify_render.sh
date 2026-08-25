@@ -240,7 +240,7 @@ fails()
     printf '%s\n' "${CHECK_OUT}" | awk '/^FAIL /{ n++ } END { print n + 0 }'
 }
 
-t_plan 35
+t_plan 38
 
 # ---------------------------------------------------------------------------
 # 1. The rendering is a function of the configuration and nothing else
@@ -406,5 +406,25 @@ t_like "${CHECK_OUT}" 'WARN cron: .* does not carry the expected line' \
     "a fragment somebody rewrote is a WARN"
 t_like "${CHECK_OUT}" 'expected:.*seance repl' \
     "and the expected line is printed, so the operator can see the difference"
+
+# ---------------------------------------------------------------------------
+# The standby root: stated, or guessed (D-188)
+# ---------------------------------------------------------------------------
+
+# This world's configuration states no standby_root, which is the fleet's
+# condition when a promoted guest's replica was shipped to a nested path.
+check verify_standby_key
+t_like "${CHECK_OUT}" '^WARN standby: standby_root is UNSET' \
+    "with the key unset, verify WARNs: the derivation is a guess that refuses a promoted guest"
+t_like "${CHECK_OUT}" 'State the fleet.s layout: standby_root=' \
+    "and names the remedy"
+
+SBK=$( t_tmpdir )/withkey.conf
+{ cat "${CONF}"; printf 'standby_root=pool0/standby\n'; } > "${SBK}"
+conf_load "${SBK}" || t_diag "loading the keyed config failed"
+check verify_standby_key
+t_like "${CHECK_OUT}" '^PASS standby: standby_root is stated \(pool0/standby\)' \
+    "with the key set, verify says so and names it"
+conf_load "${CONF}" || t_diag "reloading the config failed"
 
 t_done

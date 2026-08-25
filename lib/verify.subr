@@ -181,6 +181,42 @@ exit 0"
     seance_ssh "${_addr}" "${_cmd}"
 }
 
+# verify_standby_key
+#
+# IS THE STANDBY ROOT STATED, OR GUESSED? (D-188) With `standby_root` unset,
+# every verb derives one from a local guest's dataset -- right for the
+# textbook layout and WRONG for a node hosting a guest promoted in place,
+# whose dataset is already inside a standby tree: on the first real fleet the
+# survivor derived <standby_root>/<dead>/standby and shipped a nested copy of
+# the promoted guest to its peers. The derivation now refuses that shape, so
+# an unset key fails loudly at the worst moment instead of quietly at a wrong
+# path -- and the way to have neither is to state the key.
+verify_standby_key()
+{
+    local _v _peer _n
+
+    _v=$( conf_get standby_root "" ) || _v=""
+    [ -n "${_v}" ] && { verify_pass "standby: standby_root is stated (${_v})"; return 0; }
+
+    _n=0
+    for _peer in $( conf_nodes ); do
+        _v=$( conf_get "node_${_peer}_standby_root" "" ) || _v=""
+        [ -n "${_v}" ] && _n=$(( _n + 1 ))
+    done
+    if [ "${_n}" -gt 0 ]; then
+        verify_pass "standby: standby_root is stated per node (${_n} node(s))"
+        return 0
+    fi
+
+    verify_warn "standby: standby_root is UNSET, so every verb derives it from a local" \
+        "guest's dataset. That is wrong for a guest promoted in place (its dataset is" \
+        "already under a standby tree) and the derivation refuses it, so a promotion" \
+        "on this node would stop replicating rather than guess. State the fleet's" \
+        "layout: standby_root=<pool>/.../standby (the parent of the per-node" \
+        "directories this node's replicas already live under)."
+    return 0
+}
+
 # verify_gate
 #
 # The boot gate: rc.d/seance_gate installed where rc(8) will run it, and
@@ -1051,6 +1087,9 @@ verify_report()
 
     # 8. the boot gate: the half that runs when nobody is watching
     verify_gate
+
+    # 8b. and whether the standby root is stated or guessed (D-188)
+    verify_standby_key
 
     # 9. and the rung that makes a promotion safe, asked on the wire
     verify_fence "${_home}"
