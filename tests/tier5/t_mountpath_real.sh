@@ -98,7 +98,7 @@ EOF
 
 SEANCE="${T_ROOT}/bin/seance"
 
-t_plan 52
+t_plan 55
 
 # ---------------------------------------------------------------------------
 # Move the VM onto the fleet's layout, with CBSD's own verbs
@@ -122,6 +122,7 @@ else
     t_not_ok "and the dump is at \${jailrcconfdir}/rc.conf_<name>"
     find "${WD}/jails-rcconf" -maxdepth 1 2>&1 | sed -e 's/^/# /'
 fi
+
 
 # WHAT THE DUMP ACTUALLY CARRIES, observed rather than assumed -- and it is not
 # what junregister's own source says it should be. `sudoexec/junregister:140-141`
@@ -468,7 +469,20 @@ t_stdout_is "${REPLICA}" \
 #
 # Registering through the ADAPTER (not through cbsd directly, as the rows above
 # do) must leave the platform calling this guest ours.
-adapter_guest_unregister "${V}" > /dev/null 2>&1
+# First the FLEET'S OWN CASE: a bhyve VM left in CBSD's unregistered area on a
+# survivor (raw junregister leaves the rc.conf export behind, and bls lists the
+# entry out of that export alone). The node must still be able to count its
+# own guests -- on the fleet this state produced "0 guests, 1 failures" and a
+# stopped replication (D-185).
+t_rc 0 "raw junregister leaves the VM in the unregistered area" \
+    -- shapeb_cbsd junregister jname="${V}" inter=0
+t_diag "raw bls rows: $( shapeb_cbsd bls header=0 display=jname,emulator,astart,status 2>/dev/null | tr '\n' '|' )"
+t_diag "raw jls rows: $( shapeb_cbsd jls header=0 display=jname,emulator,astart,status 2>/dev/null | tr '\n' '|' )"
+t_rc 0 "adapter_guest_list still succeeds with an unregistered VM in the listing" \
+    -- adapter_guest_list
+t_unlike "$( adapter_guest_list 2>/dev/null )" "^${V}	" \
+    "and the unregistered VM is skipped, not listed and not counted"
+rm -f "${WD}/jails-rcconf/rc.conf_${V}"
 
 # From ${RCFILE}, not ${DUMP}: jregister MOVED the dump into
 # ${jailsysdir}/<n>/ (jregister:215, asserted above), so ${DUMP} no longer

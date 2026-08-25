@@ -504,6 +504,41 @@ _adapter_list_rows()
             continue
         fi
 
+        # A LINE THAT IS NOT A ROW (D-185). CBSD writes some of its own error
+        # text to STDOUT, in the middle of the listing:
+        #
+        #   Unable to fetch vm data from: /usr/jails/jails-system/<n>/local.sqlite
+        #
+        # Four whitespace-separated fields fall out of that -- Unable/to/fetch/vm
+        # -- so the length check above passes it, the emulator switch called
+        # "to" an unsupported emulator, and the call SUCCEEDED. On the fleet
+        # that produced `status: 0 guests, 0 warnings, 0 failures` on a node
+        # whose two guests were missing from a truncated listing, and their
+        # replication stopped for twelve and a half hours with nothing said.
+        #
+        # A guest name is the platform's own (a lower-case letter or digit,
+        # then letters, digits, dot, dash, underscore) and a listing row has
+        # exactly four fields. Anything else is not a row seance may read past:
+        # what follows it may be a short listing, and a short listing is an
+        # estate with a guest missing from it.
+        if ! _adapter_name_ok "${_name}"; then
+            _adapter_diag "THE PLATFORM'S LISTING CONTAINS A LINE THAT IS NOT A GUEST:" \
+                "[${_name} ${_emu} ${_astart} ${_status}${_rest:+ ${_rest}}]." \
+                "This is usually CBSD writing an error onto its own stdout, and it means" \
+                "the listing may be SHORT -- guests this node hosts may be missing from" \
+                "it. seance will not read past it and will not guess what is missing."
+            _rc=2
+            continue
+        fi
+
+        if [ -n "${_rest}" ]; then
+            _adapter_diag "listing row for ${_name} carries more than the four fields" \
+                "seance asked for: [${_name} ${_emu} ${_astart} ${_status} ${_rest}]." \
+                "The listing is not the shape this adapter reads, so it is not read."
+            _rc=2
+            continue
+        fi
+
         case "${_emu}" in
             jail|bhyve) ;;
             0|-)
@@ -1101,6 +1136,20 @@ adapter_guest_unregister()
             return 1
         fi
         _adapter_diag "removed ${_rcconf}, the export junregister wrote as it ran"
+    fi
+
+    # AND IT CHECKS ITS OWN WORK (D-185). junregister exits 0 in more cases than
+    # "the row is gone" -- on the fleet a guest registered under another node's
+    # name stayed in the database through an unregister that reported success,
+    # and the survivor then could not enumerate its own guests. What the caller
+    # was promised is that this node no longer has the guest; that is a fact
+    # about the listing, so the listing is what is read.
+    if adapter_guest_list 2>/dev/null | awk -F "${ADAPTER_TAB}" -v n="${_name}" '$1 == n { f = 1 } END { exit !f }'; then
+        _adapter_diag "adapter_guest_unregister: cbsd junregister ${_name} exited 0 but" \
+            "the platform's listing still carries ${_name} as this node's guest." \
+            "Nothing seance can do removes it; look at the platform's database for" \
+            "a registration that names another node (cbsd bls jname=${_name})."
+        return 1
     fi
 
     return 0

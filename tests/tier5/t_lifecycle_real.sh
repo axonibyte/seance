@@ -61,7 +61,7 @@ RCFILE="${SYSDIR}/rc.conf_${J}"
 POOL=$( zfs list -H -o name "${WD}/jails-data" )
 DATAPATH="${WD}/jails-data/${J}-data"
 
-t_plan 56
+t_plan 59
 
 # ---------------------------------------------------------------------------
 # Start, and what CBSD says about a guest that exists
@@ -187,6 +187,19 @@ t_is "$( awk -F '\t' -v j="${J}" '$1 == j' "${lst}/out" )" "" \
 t_is "$( sha256 -q "${RCFILE}" )" "${before_rc}" \
     "junregister leaves \${jailsysdir}/<n>/rc.conf_<n> byte-identical"
 
+# THE NODE MUST STILL BE ABLE TO COUNT ITS OWN GUESTS while that dump exists
+# (D-185). On the fleet a guest sitting in this exact state -- unregistered,
+# export present -- made adapter_guest_list FAIL the whole node: status said
+# "0 guests, 1 failures" and replication stopped, over a guest the node does
+# not even have. The raw rows are recorded because the two listings render
+# an unregistered entry differently and the parser has to read both.
+t_diag "raw jls rows: $( shapeb_cbsd jls header=0 display=jname,emulator,astart,status 2>/dev/null | tr '\n' '|' )"
+t_diag "raw bls rows: $( shapeb_cbsd bls header=0 display=jname,emulator,astart,status 2>/dev/null | tr '\n' '|' )"
+t_rc 0 "adapter_guest_list still succeeds with an unregistered entry in the listing" \
+    -- adapter_guest_list
+t_unlike "$( adapter_guest_list 2>/dev/null )" "^${J}	" \
+    "and the unregistered guest is skipped, not listed and not counted"
+
 t_rc 1 "adapter_guest_register refuses an rcfile it cannot read" \
     -- adapter_guest_register "${J}" /nonexistent/rc.conf
 t_rc 0 "adapter_guest_register brings it back from the sysdir's rcfile" \
@@ -205,6 +218,7 @@ t_stdout_is "jail" "the adapter still answers about the registered one" \
     -- adapter_guest_type "${J}"
 t_rc 1 "and a question about another name is not answered with this row" \
     -- adapter_guest_type nosuchguest
+
 
 # --- and now the same round trip through seance ------------------------------
 #
@@ -229,6 +243,9 @@ if [ -e "${DUMP}" ]; then
 else
     t_ok "and the export junregister wrote is gone with it"
 fi
+
+t_unlike "$( adapter_guest_list 2>/dev/null )" "^${J}	" \
+    "and the adapter checked its own work: the guest is gone from the listing, not merely from the call's exit status"
 
 t_is "$( rows_for "${J}" )" "0" \
     "so CBSD lists no row for the guest at all: no phantom to outlive it"

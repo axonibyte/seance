@@ -35,6 +35,9 @@ stage_begin repl
 # shellcheck source-path=SCRIPTDIR
 # shellcheck source=../cluster/lib/cluster.subr
 . "${T_ROOT}/tests/cluster/lib/cluster.subr"
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=../cluster/lib/fence.subr
+. "${T_ROOT}/tests/cluster/lib/fence.subr"
 
 export SEANCE_ROOT="${T_ROOT}"
 
@@ -44,7 +47,7 @@ if [ "$( id -u )" -ne 0 ]; then
     exit 2
 fi
 
-t_plan 84
+t_plan 87
 
 TAB=$( printf '\t.' )
 TAB=${TAB%.}
@@ -114,6 +117,12 @@ guest_create()
 
 cluster_up 3 || { t_diag "cluster_up failed"; t_done; }
 
+# The fence driver, because `verify` now asks every peer it may have to fence
+# whether it answers (D-186), and a world without one is an incomplete fleet
+# rather than a passing one -- the same reasoning as the boot gate above.
+fence_install || { t_diag "fence_install failed"; t_done; }
+t_at_exit 'fence_uninstall'
+
 BASE_DS=$( cluster_base_dataset )
 ALPHA_DS=$( cluster_dataset alpha )
 BRAVO_DS=$( cluster_dataset bravo )
@@ -134,16 +143,22 @@ ssh_extra_opts=-i /root/.ssh/id_ed25519 -o StrictHostKeyChecking=no -o UserKnown
 standby_root=${BASE_DS}/%n/standby
 
 node_alpha_nodename=alpha
+node_alpha_fence_driver=jail
+node_alpha_fence_target=alpha
 node_alpha_mgmt=$( cluster_ip alpha )
 node_alpha_heir=bravo
 node_alpha_heir2=charlie
 
 node_bravo_nodename=bravo
+node_bravo_fence_driver=jail
+node_bravo_fence_target=bravo
 node_bravo_mgmt=$( cluster_ip bravo )
 node_bravo_heir=charlie
 node_bravo_heir2=alpha
 
 node_charlie_nodename=charlie
+node_charlie_fence_driver=jail
+node_charlie_fence_target=charlie
 node_charlie_mgmt=$( cluster_ip charlie )
 node_charlie_heir=alpha
 node_charlie_heir2=bravo
@@ -624,6 +639,32 @@ DRIFT_VERIFY_RC=$?
 t_isnt "${DRIFT_VERIFY_RC}" "0" "verify on alpha refuses to exit 0 as well"
 t_like "${DRIFT_VERIFY}" '^FAIL config: charlie HOLDS A DIFFERENT FILE' \
     "and names the node, the file, and that seance will not fix it for you"
+
+# --- a replica that somebody wrote to (D-185) --------------------------------
+#
+# `written` on a replica must be 0: nothing here is the holder's to change
+# between receives, and a replica with local writes cannot receive its next
+# incremental at all -- zfs recv refuses with "destination has been modified"
+# and seance will not -F past it. On the fleet that state went unnoticed until
+# a tick failed hours later, so verify is made to say it first.
+nz bravo set canmount=on "${WEB_ON_BRAVO}" > /dev/null 2>&1
+nz bravo set mountpoint=/seance/scribble "${WEB_ON_BRAVO}" > /dev/null 2>&1
+nz bravo mount "${WEB_ON_BRAVO}" > /dev/null 2>&1
+cluster_exec bravo sh -c 'echo scribble > /seance/scribble/written-by-somebody' > /dev/null 2>&1
+nz bravo unmount "${WEB_ON_BRAVO}" > /dev/null 2>&1
+nz bravo inherit mountpoint "${WEB_ON_BRAVO}" > /dev/null 2>&1
+nz bravo set canmount=noauto "${WEB_ON_BRAVO}" > /dev/null 2>&1
+
+VERIFY_W=$( node_seance bravo verify 2>&1 )
+t_like "${VERIFY_W}" "WARN replica: ${WEB_ON_BRAVO} has .* of LOCAL WRITES" \
+    "verify names a replica that has been written to, before a tick has to fail on it"
+t_like "${VERIFY_W}" 'next incremental for it will be REFUSED' \
+    "and says the consequence, which is the thing an operator needs to know"
+
+# Put it back, so the assertions after this are about what they say they are.
+nz bravo rollback "$( nz bravo list -H -o name -t snapshot "${WEB_ON_BRAVO}" | tail -1 )" > /dev/null 2>&1
+t_is "$( nz bravo get -H -o value written "${WEB_ON_BRAVO}" )" "0" \
+    "and a rollback to the newest snapshot is what clears it"
 
 # --- the identity comes BACK (D-183) ----------------------------------------
 #
