@@ -61,7 +61,7 @@ if [ "$( id -u )" -ne 0 ]; then
     exit 2
 fi
 
-t_plan 30
+t_plan 31
 
 TAB=$( printf '\t.' )
 TAB=${TAB%.}
@@ -373,6 +373,13 @@ t_is "${CMP}/${CCM}" "none/noauto" \
 t_unlike "${CSRC}" '^(local|received)$' \
     "and carries no mountpoint of its own: the law survived the interruption"
 
+# "ONCE BOTH PAIRS ARE GOOD" is a premise, and it is established rather than
+# assumed: the healing tick above was --peer charlie only, so bravo's replica
+# is whatever age this file has reached since tick 1 -- and the interrupted-
+# stream section above can wait out a TCP timeout, which put bravo 30 minutes
+# past a 180 s staleness_max on one run and failed this row about nothing.
+t_rc 0 "a normal tick for the bravo pair, so that both pairs are good by construction" \
+    -- node_seance alpha repl --guest web01 --peer bravo --now
 t_rc 0 "status on alpha exits 0 again once both pairs are good" \
     -- node_seance alpha status
 
