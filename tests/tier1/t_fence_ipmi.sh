@@ -139,7 +139,7 @@ t_no_secret()
     fi
 }
 
-t_plan 177
+t_plan 181
 
 FIX=$( mkfix )
 
@@ -293,6 +293,35 @@ t_is "$( cat "${RUN_LOG}" )" "" "no credentials file: ipmitool is never called"
 run_fence off-immediately off alpha --config "${FIX}/nope"
 t_is "${RUN_RC}" "2" "missing credentials file: exit 2"
 t_like "${RUN_ERR}" 'does not exist' "missing credentials file: says so"
+
+# --- the mode check, THROUGH A SYMLINK (D-184) ------------------------------
+#
+# The path this driver is handed is a symlink on every correct install:
+# docs/INSTALL.md puts the real file in /usr/local/etc/seance/ and links it into
+# CBSD's ${etcdir}, which is the path promote passes. FreeBSD stat(1) uses
+# lstat(2) by default and reports the LINK's own mode -- lrwxrwxrwx -- so a
+# check without -L calls every correctly installed fleet world-readable. On the
+# real fleet that turned a working fence into rung 4 `notify`, mid-drill, with
+# the node already down. Both directions are asserted, because a check that
+# followed the link but stopped noticing a loose target would be worse than the
+# bug it replaced.
+LINKD=$( t_tmpdir )
+cp "${FIX}/conf" "${LINKD}/real.conf"
+chmod 600 "${LINKD}/real.conf"
+ln -s "${LINKD}/real.conf" "${LINKD}/link.conf"
+
+run_fence off-immediately status alpha --config "${LINKD}/link.conf"
+t_is "${RUN_RC}" "0" \
+    "a 0600 credentials file reached through a symlink is accepted"
+t_unlike "${RUN_ERR}" 'readable beyond its owner' \
+    "and the mode check does not report the symlink's own lrwxrwxrwx"
+
+chmod 644 "${LINKD}/real.conf"
+run_fence off-immediately status alpha --config "${LINKD}/link.conf"
+t_is "${RUN_RC}" "2" \
+    "a 0644 TARGET reached through a symlink is still refused"
+t_like "${RUN_ERR}" 'readable beyond its owner' \
+    "and it is refused for the target's mode, which is the file it will read"
 
 # The environment variable is the path seance's promote will use.
 d=$( t_tmpdir )

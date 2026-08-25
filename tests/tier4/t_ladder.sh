@@ -983,7 +983,7 @@ fi
 # One assertion per row, plus the twenty-five named assertions below. A table
 # with no rows would have produced a green run of nothing, which is why the
 # count is derived from the table rather than written down.
-t_plan $(( NROWS + 115 ))
+t_plan $(( NROWS + 117 ))
 
 SAVED=$( t_tmpdir )
 AUTO_ROWS=""
@@ -1276,11 +1276,21 @@ t_like "$( cat "${SAVED}/mount-platform-disagrees.mock" )" 'adapter_guest_regist
 t_unlike "$( cat "${SAVED}/mount-platform-disagrees.mock" )" 'adapter_guest_start' \
     "and the guest is NOT started"
 
-# And a platform that records no data path at all is not a disagreement: there
-# is nothing to check against, which is said rather than treated as a no.
+# And a platform that can say NOTHING about a guest it has just registered is
+# not being quiet: it is saying the guest is not one of ours (D-184). On the
+# fleet that was a registration still carrying the dead node's nodename -- the
+# row came back as another node's, the enumerator skipped it as "not local to
+# this node", and the start that followed failed with "no such guest" about a
+# guest whose datasets were mounted underneath it. This row used to assert that
+# the promotion STANDS, which is the assertion that let it walk into that.
 t_like "$( cat "${SAVED}/mount-platform-silent.out" )" \
-    'the platform records no data path for it, so there is nothing to check the mount against' \
-    "a platform with nothing to say about the path says so, and the promotion stands"
+    'reports nothing about it -- not even where its data is' \
+    "a platform with nothing to say about a guest it just registered is a STOP"
+t_like "$( cat "${SAVED}/mount-platform-silent.out" )" \
+    'NOTHING HAS BEEN STARTED' \
+    "and the stop says so, with the undo lines above it"
+t_unlike "$( cat "${SAVED}/mount-platform-silent.out" )" '^  started ' \
+    "nothing was started on a guest the platform will not claim"
 
 # ---------------------------------------------------------------------------
 # The configuration mirror (D-82)

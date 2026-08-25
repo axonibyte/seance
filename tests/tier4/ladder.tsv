@@ -142,7 +142,7 @@ mount-travels	data=travels	-	proceed	fence:mock	-	0
 mount-zero	data=zero	-	proceed	fence:mock	-	0
 mount-unusable	data=relative	-	abort	fence:mock	-	1
 mount-platform-disagrees	guest=db01 data=jailshape platform=disagree	-	abort	fence:mock	-	1
-mount-platform-silent	data=travels platform=silent	-	proceed	fence:mock	-	0
+mount-platform-silent	data=travels platform=silent	-	abort	fence:mock	-	1
 # --- the notify contract: never changes a rung's disposition ----------------
 notify-none	fence=unknown notify=none	-	notify	-	4 fence	1
 notify-ok	fence=unknown notify=ok	-	notify	-	4 fence	1

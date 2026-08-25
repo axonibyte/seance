@@ -98,7 +98,7 @@ EOF
 
 SEANCE="${T_ROOT}/bin/seance"
 
-t_plan 46
+t_plan 52
 
 # ---------------------------------------------------------------------------
 # Move the VM onto the fleet's layout, with CBSD's own verbs
@@ -455,6 +455,54 @@ t_stdout_is "${VMDATA}" \
 t_stdout_is "${REPLICA}" \
     "so the platform's own answer now resolves to the REPLICA, promoted in place" \
     -- adapter_guest_datasets "${V}"
+
+# ---------------------------------------------------------------------------
+# RE-HOMED, against real CBSD (D-184)
+# ---------------------------------------------------------------------------
+#
+# The registration a promotion reads is the DEAD node's copy, and it names that
+# node. CBSD believes the field: register 2c's rc.conf on 2b and the guest is
+# filed as 2c's, listed with an empty emulator on a clustered node, and skipped
+# by adapter_guest_list as "not local to this node" -- so seance loses the
+# guest it just promoted. Found on the fleet by drill-guest, 2026-08-24.
+#
+# Registering through the ADAPTER (not through cbsd directly, as the rows above
+# do) must leave the platform calling this guest ours.
+adapter_guest_unregister "${V}" > /dev/null 2>&1
+
+# From ${RCFILE}, not ${DUMP}: jregister MOVED the dump into
+# ${jailsysdir}/<n>/ (jregister:215, asserted above), so ${DUMP} no longer
+# exists by this point in the file. Copying from a path that is not there left
+# the fixture registering CBSD from a one-line file and calling the defaults
+# that came back a product defect -- which they were not.
+FOREIGN=$( t_tmpdir )/rc.conf_foreign
+[ -r "${RCFILE}" ] || t_diag "no landed registration at ${RCFILE}"
+cp "${RCFILE}" "${FOREIGN}" || t_diag "copying the registration failed"
+t_like "$( cat "${FOREIGN}" 2>/dev/null )" '^emulator="bhyve"' \
+    "the fixture's copy really is the guest's whole registration, not a fragment"
+sed -i '' -e "s|^nodename=.*|nodename=\"a-node-that-is-not-this-one\";|" "${FOREIGN}" ||
+    t_diag "editing the nodename failed"
+grep -q '^nodename="a-node-that-is-not-this-one";' "${FOREIGN}" ||
+    printf 'nodename="a-node-that-is-not-this-one";\n' >> "${FOREIGN}"
+
+t_stdout_is "a-node-that-is-not-this-one" \
+    "the fixture really does hand the adapter a registration naming another node" \
+    -- sh -c "awk -F'\"' '/^nodename=/ { print \$2; exit }' '${FOREIGN}'"
+
+t_rc 0 "the adapter registers a guest from a configuration that names another node" \
+    -- adapter_guest_register "${V}" "${FOREIGN}"
+
+t_stdout_is "$( adapter_fact nodename )" \
+    "and CBSD's own record of it now names THIS node, because registering is re-homing" \
+    -- sh -c "awk -F'\"' '/^nodename=/ { print \$2; exit }' \
+        '$( adapter_fact jailsysdir )/${V}/rc.conf_${V}'"
+
+t_stdout_is "bhyve" \
+    "so the platform can still say what it is -- the row that failed on the fleet" \
+    -- adapter_guest_type "${V}"
+t_stdout_is "${VMDATA}" \
+    "and where its data is, which is what promote checks its own work against" \
+    -- adapter_guest_data_path "${V}"
 
 # ---------------------------------------------------------------------------
 # Put it back

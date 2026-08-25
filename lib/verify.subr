@@ -646,7 +646,12 @@ EOF
     command -v stat > /dev/null 2>&1 || return 0
 
     for _f in ${_files}; do
-        _mode=$( stat -f '%Lp' "${_f}" 2>/dev/null ) || continue
+        # -L for the reason drivers/fence_ipmi carries the same flag (D-184):
+        # stat(1) defaults to lstat(2), and a node whose /etc/rc.conf is a
+        # symlink would be told its CARP password is world-readable when it is
+        # not, or -- worse for a check whose whole job is to notice -- the
+        # reverse.
+        _mode=$( stat -L -f '%Lp' "${_f}" 2>/dev/null ) || continue
 
         # The last two octal digits are group and other. Anything but 00 means
         # somebody who is not root can read this fleet's CARP password out of a

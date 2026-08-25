@@ -52,7 +52,7 @@ if [ "$( id -u )" -ne 0 ]; then
     exit 2
 fi
 
-t_plan 68
+t_plan 72
 
 TAB=$( printf '\t.' )
 TAB=${TAB%.}
@@ -346,6 +346,36 @@ t_stdout_is "${VMJ_DATA}" \
     "and bravo's registration of vmj01 carries the data path it was registered with" \
     -- cluster_exec bravo sh -c \
     "awk -F'\t' '\$1 == \"vmj01\" { print \$7 }' /var/db/seance-pseudo/guests.tsv"
+
+# --- re-homed, which is what makes the guest visible at all (D-184) ---------
+#
+# The configuration bravo registered from is ALPHA'S: it travelled with the
+# estate, and it names alpha as the node hosting the guest. A platform that
+# believes that field files the guest as alpha's even here -- and a clustered
+# listing shows another node's guest with an empty emulator, which is the row
+# adapter_guest_list skips as "not local to this node" (D-177). On the real
+# fleet that is exactly what happened: the estate arrived, mounted and
+# registered, and then seance could not see the guest it had just promoted.
+#
+# First the fixture's own honesty: the mirrored configuration must still name
+# alpha, or the rows below prove nothing.
+t_stdout_is "alpha" \
+    "the configuration bravo registered from still names ALPHA as its node" \
+    -- cluster_exec bravo sh -c \
+    "awk -F= '\$1 == \"nodename\" { print \$2; exit }' /seance/web01/sys/rc.conf_web01"
+
+# And then the platform's record here, which must say bravo: the act of
+# registering a guest is the act of taking it on.
+t_stdout_is "bravo" \
+    "but bravo's own registration of web01 names BRAVO, because registering is re-homing" \
+    -- cluster_exec bravo sh -c \
+    "awk -F'\t' '\$1 == \"web01\" { print \$8 }' /var/db/seance-pseudo/guests.tsv"
+
+# The consequence, and the thing the fleet actually lost: the guest is VISIBLE.
+t_like "$( node_seance bravo status --tsv )" "^guest${TAB}web01${TAB}jail${TAB}" \
+    "so web01 appears in bravo's own listing with its real type, not as a foreign row"
+t_unlike "$( cat "${PROMOTE_OUT}" )" 'skipping web01: it is not local to this node' \
+    "and the promotion never skipped the guest it was promoting"
 
 # --- the platform's own account ---------------------------------------------
 
