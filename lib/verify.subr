@@ -16,7 +16,10 @@
 #   7. the CARP vhids this node should carry are in rc.conf and on an
 #      interface, and the devd(8) rules that act on them are installed;
 #   8. the boot gate is installed and enabled, because the estate it withholds
-#      is withheld on a boot nobody is watching.
+#      is withheld on a boot nobody is watching;
+#   9. every peer this node is configured to fence ANSWERS its fence driver --
+#      read-only, and the one check whose failure otherwise waits for an
+#      outage to reveal itself (D-186).
 #
 # VERIFY NEVER WRITES ANYTHING. Not the crontab, not a standby property, not a
 # configuration file. It renders what it expects and says where reality differs
@@ -250,7 +253,7 @@ verify_gate()
 # is the only one entitled to say what its name is.
 verify_replica_identity()
 {
-    local _sroot _peer _base _kids _ds _name _n_ok _n_bad _bad
+    local _sroot _peer _base _kids _ds _name _n_ok _n_bad _bad _w
 
     _sroot=$1
     _peer=$2
@@ -278,6 +281,32 @@ verify_replica_identity()
                 _n_ok=$(( _n_ok + 1 ))
                 ;;
         esac
+
+        # HAS ANYTHING WRITTEN TO THIS REPLICA? (D-185)
+        #
+        # `written` is what the dataset has accumulated since its newest
+        # snapshot, and on a replica the only correct answer is 0: nothing here
+        # is seance's to change between receives. A replica with local writes
+        # cannot receive its next incremental at all -- `zfs recv` refuses with
+        # "destination has been modified" and seance will not -F past it,
+        # because forcing would discard whatever did the writing without ever
+        # naming it.
+        #
+        # It is checked HERE, on a quiet afternoon, because the alternative is
+        # finding out from a failing tick: on the fleet a configuration mirror
+        # sat 744K modified, with mountpoint=none and canmount=noauto, and the
+        # first anybody knew of it was replication to that peer failing.
+        _w=$( zfs_get written "${_ds}" 2>/dev/null ) || _w=""
+        case "${_w}" in
+            ''|0|0B) ;;
+            *)
+                verify_warn "replica: ${_ds} has ${_w} of LOCAL WRITES since its" \
+                    "newest snapshot. A replica is not this node's to write to, and" \
+                    "the next incremental for it will be REFUSED ("destination has" \
+                    "been modified"). Find what wrote to it; then, when you are sure" \
+                    "the source holds the truth, roll it back to its newest snapshot."
+                ;;
+        esac
     done
 
     if [ "${_n_bad}" -gt 0 ]; then
@@ -289,6 +318,93 @@ verify_replica_identity()
 
     [ "${_n_ok}" -gt 0 ] && verify_pass "replica: ${_n_ok} replica(s) of ${_peer} record" \
         "the guest they belong to"
+
+    return 0
+}
+
+# verify_fence
+#
+# CAN THIS NODE ACTUALLY FENCE THE PEERS IT MAY HAVE TO? (D-186)
+#
+# Rung 4 is the rung that makes a promotion safe, and it is the only one whose
+# machinery lives outside seance: a driver, a credentials file, a BMC on a
+# management network. Every part of that can be true in the configuration and
+# false on the wire, and the first time anybody finds out is in the middle of
+# an outage with the other node already down -- which is precisely how this
+# fleet learned that its credentials file check had never worked (D-184) and
+# that its BMCs answered nothing at all.
+#
+# So verify asks, by running the driver's own read-only `status` against every
+# target this node is configured to fence. The driver's contract
+# (drivers/fence_ipmi, "status  0 off, 1 on, 2 unknown"): 0 and 1 are ANSWERS
+# -- the BMC replied and said which way the power is -- and 2 is "a status
+# nobody knows", which is the failure this check exists to surface.
+#
+# WARN when nothing is configured, FAIL when something is configured and does
+# not answer. The asymmetry is the point: a fleet that has not set fencing up
+# yet is incomplete, and every promotion on it will stop at rung 4 and need
+# --force=fence, which is a decision an operator makes. A fleet that HAS set it
+# up and whose BMC does not answer is broken, and it is broken in the one place
+# where the failure only shows up when it is too late to fix.
+#
+# READ-ONLY, always: `status` never changes a power state. verify does not
+# fence, the same way it does not install a crontab.
+verify_fence()
+{
+    local _self _peer _driver _target _exe _out _rc _configured
+
+    _self=$1
+    _configured=0
+
+    for _peer in $( conf_nodes ); do
+        [ "${_peer}" = "${_self}" ] && continue
+
+        _driver=$( conf_get "node_${_peer}_fence_driver" "" ) || _driver=""
+        [ -n "${_driver}" ] || continue
+
+        _configured=$(( _configured + 1 ))
+
+        _target=$( conf_get "node_${_peer}_fence_target" "" ) || _target=""
+        if [ -z "${_target}" ]; then
+            verify_fail "fence: node_${_peer}_fence_driver is ${_driver} but" \
+                "node_${_peer}_fence_target names nothing, so there is no target to" \
+                "fence -- rung 4 aborts on this today"
+            continue
+        fi
+
+        if ! _exe=$( promote_fence_exe "${_driver}" ); then
+            verify_fail "fence: node_${_peer}_fence_driver is ${_driver} and there is no" \
+                "fence_${_driver} in ${SEANCE_ROOT}/drivers or on PATH"
+            continue
+        fi
+
+        promote_fence_env
+
+        _out=$( "${_exe}" status "${_target}" 2>&1 )
+        _rc=$?
+
+        case "${_rc}" in
+            0|1)
+                verify_pass "fence: ${_peer} answers through ${_driver}" \
+                    "($( printf '%s' "${_out}" | head -1 ))"
+                ;;
+            *)
+                verify_fail "fence: ${_peer} is configured to be fenced with ${_driver}" \
+                    "and the driver CANNOT SAY whether it is on or off:" \
+                    "$( printf '%s' "${_out}" | head -1 )." \
+                    "Rung 4 will stop at notify and every promotion of ${_peer} will need" \
+                    "--force=fence, which is an operator swearing to something seance" \
+                    "could not check."
+                ;;
+        esac
+    done
+
+    if [ "${_configured}" -eq 0 ]; then
+        verify_warn "fence: no peer has a node_<peer>_fence_driver, so this node cannot" \
+            "fence anything. Rung 4 will stop at notify on every promotion and wait for" \
+            "an operator to type --force=fence. That is a fleet that is not finished," \
+            "not a fleet that is broken."
+    fi
 
     return 0
 }
@@ -792,7 +908,21 @@ verify_report()
     # When the key is unset the derivation needs a guest to look at, so the
     # first guest the adapter reports stands in for the layout.
     _root=""
-    if adapter_guest_list > "${_tmp}/guests" < /dev/null; then
+    # A NODE THAT CANNOT ENUMERATE ITS OWN GUESTS IS NOT VERIFIABLE (D-185).
+    # It was a silence before: the derivation below simply found no guest to
+    # work from, and verify went on to warn that it could not tell where a
+    # PEER keeps replicas -- true, and two steps removed from the fact that this
+    # node could not see its own estate at all. On the fleet the same silence
+    # let a node replicate nothing for twelve and a half hours.
+    if ! adapter_guest_list > "${_tmp}/guests" < /dev/null; then
+        verify_fail "adapter: this node cannot enumerate its own guests -- the" \
+            "platform's listing could not be read (see the diagnostic above)." \
+            "NOTHING below this line about guests, replicas or standby trees is" \
+            "trustworthy, and replication on this node is not running against a" \
+            "list seance can vouch for."
+    fi
+
+    if [ -s "${_tmp}/guests" ]; then
         _names=$( awk -F "${VERIFY_TAB}" 'NF > 0 { print $1 }' "${_tmp}/guests" )
         for _guest in ${_names}; do
             if adapter_guest_datasets "${_guest}" > "${_tmp}/ds" < /dev/null &&
@@ -921,6 +1051,9 @@ verify_report()
 
     # 8. the boot gate: the half that runs when nobody is watching
     verify_gate
+
+    # 9. and the rung that makes a promotion safe, asked on the wire
+    verify_fence "${_home}"
 
     printf 'verify: renderings available: %s (seance verify --render <subject>)\n' \
         "$( printf '%s' "${VERIFY_RENDERS}" | tr ' ' ',' | sed -e 's/,/, /g' )"

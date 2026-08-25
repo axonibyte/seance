@@ -57,7 +57,7 @@ if [ "$( id -u )" -ne 0 ]; then
     exit 2
 fi
 
-t_plan 39
+t_plan 42
 
 estate_up || { t_diag "estate_up failed"; t_done; }
 
@@ -192,6 +192,20 @@ VERIFY_B=$( t_tmpdir )/verify.bravo
 node_seance bravo verify > "${VERIFY_B}" 2>&1
 t_like "$( cat "${VERIFY_B}" )" '^PASS replica: [1-9][0-9]* replica\(s\) of alpha record the guest they belong to' \
     "and the node HOLDING alpha's replicas can say which guest each one belongs to"
+
+# --- rung 4's machinery, asked on the wire (D-186) ---------------------------
+#
+# The one check whose failure otherwise waits for an outage to reveal itself:
+# every peer this node is configured to fence must ANSWER its fence driver.
+# On the real fleet the credentials check had never worked on a correct
+# install and the BMCs answered nothing at all, and both were discovered
+# mid-drill with a node already down.
+t_like "$( cat "${VERIFY}" )" '^PASS fence: bravo answers through jail' \
+    "verify runs the fence driver read-only against every peer it may have to fence"
+t_like "$( cat "${VERIFY}" )" '^PASS fence: charlie answers through jail' \
+    "and does it for every configured peer, not just the first"
+t_unlike "$( cat "${VERIFY}" )" '^PASS fence: alpha answers' \
+    "and not against itself, because a node does not fence itself"
 
 t_like "$( cat "${VERIFY}" )" '^verify: renderings available: cron, carp, devd' \
     "and the summary names every subject verify can render"

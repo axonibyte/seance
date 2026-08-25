@@ -41,6 +41,9 @@ stage_begin report
 # shellcheck source-path=SCRIPTDIR
 # shellcheck source=../cluster/lib/cluster.subr
 . "${T_ROOT}/tests/cluster/lib/cluster.subr"
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=../cluster/lib/fence.subr
+. "${T_ROOT}/tests/cluster/lib/fence.subr"
 
 export SEANCE_ROOT="${T_ROOT}"
 
@@ -109,6 +112,12 @@ cols()
 
 cluster_up 2 || { t_diag "cluster_up failed"; t_done; }
 
+# The fence driver, because `verify` now asks every peer it may have to fence
+# whether it answers (D-186), and a world without one is an incomplete fleet
+# rather than a passing one -- the same reasoning as the boot gate above.
+fence_install || { t_diag "fence_install failed"; t_done; }
+t_at_exit 'fence_uninstall'
+
 BASE_DS=$( cluster_base_dataset )
 ALPHA_DS=$( cluster_dataset alpha )
 WEB_SRC="${ALPHA_DS}/web01"
@@ -126,10 +135,14 @@ ssh_extra_opts=-i /root/.ssh/id_ed25519 -o StrictHostKeyChecking=no -o UserKnown
 standby_root=${BASE_DS}/%n/standby
 
 node_alpha_nodename=alpha
+node_alpha_fence_driver=jail
+node_alpha_fence_target=alpha
 node_alpha_mgmt=$( cluster_ip alpha )
 node_alpha_heir=bravo
 
 node_bravo_nodename=bravo
+node_bravo_fence_driver=jail
+node_bravo_fence_target=bravo
 node_bravo_mgmt=$( cluster_ip bravo )
 node_bravo_heir=alpha
 EOF
