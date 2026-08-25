@@ -51,7 +51,7 @@ rows()
     RRC=$?
 }
 
-t_plan 93
+t_plan 99
 
 # --- a listing of the shape CBSD prints --------------------------------------
 rows 'web01  jail   1  On
@@ -105,6 +105,34 @@ t_like "$( cat "${DIR}/err" )" 'skipping far02: it is not local to this node' \
     "and jls's spelling of the same empty field is read the same way"
 t_unlike "$( cat "${DIR}/err" )" 'emulator 0 is not supported' \
     "and the old sentence is gone, because it was never true of these rows"
+
+# CBSD'S OWN ERROR TEXT, ON ITS OWN STDOUT (D-185).
+#
+# This is verbatim what a real node printed into the middle of a listing when
+# a guest's ${jailsysdir}/<n>/local.sqlite could not be read. Four fields fall
+# out of it -- Unable/to/fetch/vm -- so every length check passes, and before
+# this row the parser called "to" an unsupported emulator, skipped it, and
+# RETURNED SUCCESS. The listing that line appeared in was also SHORT: the two
+# guests that node hosted were missing from it, seance reported
+# "0 guests, 0 warnings, 0 failures", and their replication stopped for twelve
+# and a half hours with nothing said.
+rows 'Unable  to  fetch  vm  data  from:  /usr/jails/jails-system/crowdeasedev01/local.sqlite
+web01   jail   1  On'
+t_is "${RRC}" "2" \
+    "a line that is not a guest row is a CONTRACT ERROR, not a guest called Unable"
+t_unlike "${ROWS}" 'Unable' \
+    "and no guest is invented from it"
+t_like "$( cat "${DIR}/err" )" 'LISTING CONTAINS A LINE THAT IS NOT A GUEST' \
+    "the diagnostic says what it found"
+t_like "$( cat "${DIR}/err" )" 'may be SHORT' \
+    "and says the consequence that matters: what follows may be missing"
+t_unlike "$( cat "${DIR}/err" )" 'emulator to is not supported' \
+    "and never calls a word of CBSD's prose an emulator"
+
+# A row carrying MORE than the four fields asked for is the same kind of
+# untrustworthy: the listing is not the shape this adapter reads.
+rows 'web01  jail  1  On  extra-field-nobody-asked-for'
+t_is "${RRC}" "2" "a row with a fifth field is a contract error"
 
 # A REAL unsupported emulator still says exactly that: the two cases are
 # different facts and the diagnostic may not blur them.
