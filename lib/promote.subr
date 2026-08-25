@@ -2371,8 +2371,22 @@ promote_guest_promote()
 
     _where=$( adapter_guest_data_path "${_guest}" 2>/dev/null ) || _where=""
     if [ -z "${_where}" ]; then
-        promote_note "${_guest}: the platform records no data path for it, so there is" \
-            "nothing to check the mount against; it was mounted at ${_mp}"
+        # NOT "nothing to check" (D-184). A platform that can say NOTHING about
+        # a guest it has just registered is not being quiet -- it is telling us
+        # it does not consider that guest ours. On the fleet that was a
+        # registration still carrying the dead node's nodename: the row came
+        # back as another node's, the enumerator skipped it as "not local to
+        # this node" (D-177), and the start that followed failed with "no such
+        # guest" about a guest whose datasets were mounted underneath it. This
+        # branch was one line away from saying so, and said "nothing to check"
+        # instead.
+        seance_log err "promote ${_guest}: it was registered here, and the platform" \
+            "reports nothing about it -- not even where its data is. That is a guest" \
+            "this platform does not consider local to this node (a registration that" \
+            "still names another node, or one that did not take). Its replica IS" \
+            "mounted at ${_mp}. NOTHING HAS BEEN STARTED; undo with the lines printed" \
+            "above, and check the platform's own listing for ${_guest} before retrying."
+        return 1
     elif [ "${_where}" != "${_mp}" ]; then
         seance_log err "promote ${_guest}: it is registered here and the platform looks" \
             "for its data at ${_where}, while its replica is mounted at ${_mp}." \

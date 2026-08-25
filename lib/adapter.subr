@@ -891,6 +891,69 @@ adapter_guest_stop()
     _adapter_lifecycle jstop bstop "${1:-}"
 }
 
+# _adapter_rehome_rcconf <src> <dst> <nodename>
+#
+# Copy a guest's registration file with its `nodename` set to THIS node.
+#
+# WHY A PROMOTED GUEST MUST BE RE-HOMED (D-184, found by drill-guest on the
+# fleet). The configuration a promotion registers from is the DEAD node's copy
+# -- that is the whole point of replicating it (D-82) -- and one of the fields
+# in it says which node hosts the guest. CBSD believes that field: registering
+# 2c's rc.conf on 2b files the guest as 2c's, and a clustered node lists
+# another node's guests with an empty emulator, which is exactly the row
+# `adapter_guest_list` skips as "not local to this node" (D-177). The estate
+# arrives, mounts and registers, and then seance's own hardening hides the
+# guest from seance. `adapter_guest_start` says "no such guest on this node"
+# about a guest whose datasets are mounted under it.
+#
+# So the inherited configuration is REHOMED before it is handed to the
+# platform: everything else in it is the guest's own description and is left
+# exactly as it was. This is the read-don't-derive family's sibling -- the
+# configuration travelled, and one field in it describes where it used to
+# live.
+#
+# The rewrite is a line rewrite and not a source-and-re-emit: seance parses
+# this file, it never executes it (handoff §2.2), and a re-emitted file would
+# be seance's opinion of the guest rather than the platform's record of it.
+_adapter_rehome_rcconf()
+{
+    local _src _dst _nn
+
+    _src=$1
+    _dst=$2
+    _nn=$3
+
+    [ -r "${_src}" ] || return 1
+    [ -n "${_nn}" ] || return 1
+
+    # A nodename with a double quote or a newline in it cannot be written back
+    # safely, and a platform that produced one is not one seance guesses about.
+    case "${_nn}" in
+        *'"'*)     return 1 ;;
+        *"\\"*)  return 1 ;;
+    esac
+
+    awk -v nn="${_nn}" '
+        BEGIN { done = 0 }
+        {
+            line = $0
+            sub(/^[ \t]*/, "", line)
+            if (index(line, "nodename=") == 1) {
+                if (done) next
+                printf "nodename=\"%s\";\n", nn
+                done = 1
+                next
+            }
+            print $0
+        }
+        END { if (!done) printf "nodename=\"%s\";\n", nn }
+    ' "${_src}" > "${_dst}" || return 1
+
+    [ -s "${_dst}" ] || return 1
+
+    return 0
+}
+
 # contract: adapter_guest_register(name,rcfile) -> nothing [no output]
 #
 # `cbsd jregister jname=<n> rcfile=<f>` inserts the environment's settings into
@@ -901,7 +964,7 @@ adapter_guest_stop()
 # be part of any path seance takes.
 adapter_guest_register()
 {
-    local _name _rcfile _rc
+    local _name _rcfile _rc _self _tmp _dir _own _mode
 
     _adapter_ready || return 2
 
@@ -923,8 +986,52 @@ adapter_guest_register()
         return 1
     fi
 
-    _adapter_cbsd_act jregister jname="${_name}" rcfile="${_rcfile}"
+    # REGISTERED AS THIS NODE'S, whatever the file says (D-184). An inherited
+    # configuration names the node it came from, and the platform believes it.
+    _self=$( adapter_fact nodename ) || _self=""
+    if [ -z "${_self}" ]; then
+        _adapter_diag "adapter_guest_register: this node cannot say its own CBSD" \
+            "nodename, so it cannot register ${_name} as its own"
+        return 1
+    fi
+
+    # THE COPY IS SHAPED LIKE THE FILE CBSD EXPECTS. The canonical argument is
+    # ${jailsysdir}/<n>/rc.conf_<n> (module notes §5); `jregister` runs
+    # `replacewdir` OVER the file before it reads anything
+    # (sudoexec/jregister:151), rewriting the CBSDROOT token in place, and then
+    # MOVES the file into ${jailsysdir}/<n>/ (jregister:215). So the copy gets a
+    # private directory, the platform's own file name inside it, and the
+    # source's ownership and mode -- as readable as the file it copies, no more,
+    # and writable by the same hands.
+    #
+    # This is faithfulness to a documented interface rather than a fix for an
+    # observed failure: a plain scratch file was not measured to break anything,
+    # and the tier-5 failure that first looked like evidence for it was a broken
+    # fixture copying from a path jregister had already moved.
+    _dir=$( mktemp -d -t seance-rehome 2>/dev/null ) || {
+        _adapter_diag "adapter_guest_register: cannot make a scratch directory to" \
+            "re-home ${_name}'s registration"
+        return 1
+    }
+    _tmp="${_dir}/rc.conf_${_name}"
+
+    if ! _adapter_rehome_rcconf "${_rcfile}" "${_tmp}" "${_self}"; then
+        rm -rf "${_dir}"
+        _adapter_diag "adapter_guest_register: cannot re-home ${_rcfile} onto" \
+            "${_self}; nothing was registered"
+        return 1
+    fi
+
+    # Traversable, and then the file made to match its original exactly.
+    chmod 0755 "${_dir}" 2>/dev/null
+    _own=$( stat -L -f '%u:%g' "${_rcfile}" 2>/dev/null ) || _own=""
+    _mode=$( stat -L -f '%Lp' "${_rcfile}" 2>/dev/null ) || _mode=""
+    [ -n "${_own}" ] && chown "${_own}" "${_tmp}" 2>/dev/null
+    [ -n "${_mode}" ] && chmod "${_mode}" "${_tmp}" 2>/dev/null
+
+    _adapter_cbsd_act jregister jname="${_name}" rcfile="${_tmp}"
     _rc=$?
+    rm -rf "${_dir}"
 
     if [ "${_rc}" -ne 0 ]; then
         _adapter_diag "cbsd jregister ${_name} failed (exit ${_rc})"

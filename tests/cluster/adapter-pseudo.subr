@@ -211,12 +211,26 @@ adapter_fact()
 # 0|1, status is CBSD's status integer (0 master, 2 slave/held). No header. An
 # empty list is a valid answer: rc 0 with no output means "no guests here", and
 # this is one of the functions that does NOT promise output.
+#
+# A ROW THIS NODE DOES NOT HOST IS LISTED WITH AN EMPTY TYPE (D-184), because
+# that is what a clustered platform does: CBSD's listing fills another node's
+# row from replicated SQL that carries no emulator, and prints the field it
+# could not fill as "0" or "-" (bhyvectl/bls:390-393). seance reads exactly
+# that shape as "not local to this node" (D-177) and skips it. Until this
+# fixture could produce such a row, no tier could reach the defect where a
+# promotion registers an inherited configuration, the platform files the guest
+# under the DEAD node's name, and seance then cannot see the guest it just
+# promoted.
 adapter_guest_list()
 {
     [ -r "${PSEUDO_DB}" ] || return 0
 
-    awk -F "${PSEUDO_TAB}" -v OFS="${PSEUDO_TAB}" \
-        'NF >= 6 { print $1, $2, $3, ($6 == "1" ? 2 : 0), $5 }' "${PSEUDO_DB}"
+    awk -F "${PSEUDO_TAB}" -v OFS="${PSEUDO_TAB}" -v self="$( adapter_node_self )" \
+        'NF >= 6 {
+            type = $2
+            if (NF >= 8 && $8 != "" && $8 != self) type = "0"
+            print $1, type, $3, ($6 == "1" ? 2 : 0), $5
+        }' "${PSEUDO_DB}"
 }
 
 # contract: adapter_guest_type(name) -> bhyve|jail [promises output]
@@ -477,7 +491,7 @@ adapter_guest_sysdir()
 # unreadable rcfile.
 adapter_guest_register()
 {
-    local _name _rc _type _astart _home _data
+    local _name _rc _type _astart _home _data _nodename
 
     _name=${1:-}
     _rc=${2:-}
@@ -508,8 +522,16 @@ adapter_guest_register()
     # the node's own layout answers.
     _data=$( adapter_config_data_path "${_rc}" ) || _data=""
 
-    printf '%s\t%s\t%s\t%s\t0\t0\t%s\n' \
-        "${_name}" "${_type}" "${_astart}" "${_home}" "${_data}" >> "${PSEUDO_DB}"
+    # AND IT IS REGISTERED AS THIS NODE'S (D-184). The rcfile names the node it
+    # came from; a platform that files the guest under that name lists it here
+    # as another node's, which is the row adapter_guest_list skips. What the
+    # file says about the guest is kept; what it says about WHERE THE GUEST
+    # LIVES is now, by the act of registering it, here.
+    _nodename=$( adapter_node_self )
+
+    printf '%s\t%s\t%s\t%s\t0\t0\t%s\t%s\n' \
+        "${_name}" "${_type}" "${_astart}" "${_home}" "${_data}" "${_nodename}" \
+        >> "${PSEUDO_DB}"
 }
 
 # contract: adapter_guest_unregister(name) -> nothing [no output]
@@ -697,11 +719,18 @@ pseudo_guest_create()
     zfs create -o "mountpoint=${_data}" "${_ds}" || return 1
     zfs create "${_ds}/sys" || return 1
 
+    # nodename: WHICH NODE HOSTS THIS GUEST, as opposed to `home`, which is
+    # where its succession says it belongs. Real platforms write this at
+    # creation and believe it at registration (CBSD does), so a configuration
+    # that travels to a survivor carries the DEAD node's name in it -- which is
+    # the fleet defect D-184 exists for, and which this fixture could not
+    # express until it recorded the field at all.
     {
         printf 'name=%s\n' "${_name}"
         printf 'type=%s\n' "${_type}"
         printf 'astart=%s\n' "${_astart}"
         printf 'home=%s\n' "${_home}"
+        printf 'nodename=%s\n' "$( adapter_node_self )"
         printf 'data=%s\n' "${_data}"
     } > "${_data}/sys/rc.conf_${_name}" || return 1
 
@@ -709,6 +738,7 @@ pseudo_guest_create()
         ln -sf "${_data}" "${PSEUDO_MOUNT}/${_name}" || return 1
     fi
 
-    printf '%s\t%s\t%s\t%s\t1\t0\t%s\n' \
-        "${_name}" "${_type}" "${_astart}" "${_home}" "${_data}" >> "${PSEUDO_DB}"
+    printf '%s\t%s\t%s\t%s\t1\t0\t%s\t%s\n' \
+        "${_name}" "${_type}" "${_astart}" "${_home}" "${_data}" \
+        "$( adapter_node_self )" >> "${PSEUDO_DB}"
 }
