@@ -204,6 +204,7 @@ good_world()
     {
         printf 'net.inet.carp.allow 1\n'
         printf 'net.inet.carp.preempt 1\n'
+        printf 'net.inet.carp.demotion 0\n'
     } > "${WORK}/sysctls"
 
     {
@@ -240,7 +241,7 @@ fails()
     printf '%s\n' "${CHECK_OUT}" | awk '/^FAIL /{ n++ } END { print n + 0 }'
 }
 
-t_plan 38
+t_plan 42
 
 # ---------------------------------------------------------------------------
 # 1. The rendering is a function of the configuration and nothing else
@@ -426,5 +427,29 @@ check verify_standby_key
 t_like "${CHECK_OUT}" '^PASS standby: standby_root is stated \(pool0/standby\)' \
     "with the key set, verify says so and names it"
 conf_load "${CONF}" || t_diag "reloading the config failed"
+
+# ---------------------------------------------------------------------------
+# The demotion counter, named as a cause (D-189)
+# ---------------------------------------------------------------------------
+
+good_world
+check verify_carp bravo
+t_like "${CHECK_OUT}" '^PASS carp: net\.inet\.carp\.demotion is 0' \
+    "a clean counter is a PASS row of its own"
+
+good_world
+sed -i '' -e 's/^net.inet.carp.demotion 0$/net.inet.carp.demotion 720/' "${WORK}/sysctls"
+check verify_carp bravo
+t_like "${CHECK_OUT}" '^WARN carp: net\.inet\.carp\.demotion is 720' \
+    "an elevated counter is named as the cause, not left to the BACKUP-for-own-identity row"
+t_like "${CHECK_OUT}" 'sysctl net\.inet\.carp\.demotion=-720' \
+    "and the remedy is the relative write that brings it to 0"
+
+good_world
+sed -i '' -e 's/^net.inet.carp.demotion 0$/net.inet.carp.demotion -240/' "${WORK}/sysctls"
+check verify_carp bravo
+t_like "${CHECK_OUT}" '^WARN carp: net\.inet\.carp\.demotion is -240' \
+    "and a NEGATIVE counter is a warning too: it can take vhids that are not its own"
+good_world
 
 t_done
