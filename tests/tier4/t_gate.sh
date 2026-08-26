@@ -203,7 +203,7 @@ holds()
         LC_ALL=C sort | tr '\n' ' '
 }
 
-t_plan 53
+t_plan 61
 
 # ---------------------------------------------------------------------------
 # The placement file
@@ -443,5 +443,63 @@ STATUS_FAIL=0
 t_like "$( status_report 0 2>/dev/null )" \
     '^guest web01 +type jail +home charlie +running yes +held no +here alpha$' \
     "and the human form says where it is actually running"
+
+# ---------------------------------------------------------------------------
+# D-191: the gate retries a transient enumeration failure, and FAILS SAFE
+# ---------------------------------------------------------------------------
+#
+# A node hard-killed with a guest running comes back mid-crash-recovery, and
+# the platform cannot answer "what guests do I have" for a few seconds. The
+# gate must wait that out, and if it truly cannot enumerate, WITHHOLD by name
+# rather than let the estate autostart -- the old code returned "nothing was
+# changed" and the guest autostarted into a split brain.
+
+GATE_ENUM_SLEEP_CMD=:            # no real waiting in the test
+GATE_ENUM_ATTEMPTS=5
+export GATE_ENUM_SLEEP_CMD GATE_ENUM_ATTEMPTS
+
+# A. enumeration fails twice, then succeeds: the gate retries and holds.
+world 'bravo charlie' bravo web01     # bravo claims web01
+_ENUM_TRIES="${WORLD_DIR}/enum.tries"; printf '0
+' > "${_ENUM_TRIES}"
+adapter_guest_list()
+{
+    _n=$( cat "${_ENUM_TRIES}" ); _n=$(( _n + 1 )); printf '%s
+' "${_n}" > "${_ENUM_TRIES}"
+    [ "${_n}" -le 2 ] && return 1
+    printf '%s
+' "${MOCK_GUESTS}"
+}
+gate act
+t_unlike "$( cat "${GATE_OUT}" )" 'could not be enumerated' \
+    "a transient enumeration failure is waited out, not fatal"
+t_like "$( cat "${GATE_OUT}" )" '^gate: HELD web01' \
+    "and once the platform settles the claimed guest is held"
+t_is "$( cat "${_ENUM_TRIES}" )" "3" "it took exactly the retries it needed (2 fail, 1 ok)"
+
+# B. enumeration NEVER succeeds: fail safe -- withhold by raw name, do not proceed.
+world 'bravo charlie' bravo web01
+adapter_guest_list() { return 1; }
+adapter_guest_names_local() { printf 'web01
+'; }
+gate act
+t_like "$( cat "${GATE_OUT}" )" 'withholding the whole estate' \
+    "a gate that cannot read status withholds by name -- it does not fail open"
+t_like "$( holds )" 'web01' \
+    "and web01 is actually held (marked slave), not left to autostart"
+t_unlike "$( cat "${GATE_OUT}" )" 'nothing was changed' \
+    "the old fail-OPEN wording is gone"
+
+# C. cannot enumerate even by name: the last resort is a loud crit and rc 2.
+world 'bravo charlie' - -
+adapter_guest_list() { return 1; }
+adapter_guest_names_local() { return 2; }
+gate act
+t_is "${GATE_RC}" "2" "with no way to name the estate at all, the gate fails 2"
+t_like "$( cat "${GATE_OUT}" )" 'NOTHING could be withheld' \
+    "and says so as loudly as it can -- this is the one case it cannot save"
+
+# Restore the real mocks for anything after this block.
+unset -f adapter_guest_list adapter_guest_names_local 2>/dev/null || true
 
 t_done

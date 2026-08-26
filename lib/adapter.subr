@@ -454,6 +454,17 @@ adapter_kernel_version()
 #
 # rc 1 for "Unregister" (a guest CBSD's database does not know), rc 2 for
 # "Unknown" (a status integer CBSD itself cannot name).
+#
+# A COMPOUND STATUS is the mode with a substate appended, colon-separated:
+# a bhyve guest recovering from a crash reports `Maintenance:Stopping_VM` while
+# the platform tears the dead VM down (D-191, seen when a node was hard-killed
+# with the guest running). conv_status only ever produces the bare mode word;
+# the `:<substate>` is bhyvectl's own decoration. So the mode is read from the
+# part before the colon and the substate is informational -- a guest is not
+# UNREADABLE just because the platform is mid-recovery on it, and reading it as
+# unreadable is what made the boot gate fail OPEN: adapter_guest_list refused
+# the whole listing, the gate could not enumerate, and the estate autostarted
+# ungated. The substate does not change what the guest IS.
 _adapter_status_int()
 {
     case "${1:-}" in
@@ -462,10 +473,40 @@ _adapter_status_int()
         Slave)       printf '2\n' ;;
         Maintenance) printf '3\n' ;;
         Unregister)  return 1 ;;
+        *:*)         _adapter_status_int "${1%%:*}"; return $? ;;
         *)           return 2 ;;
     esac
 
     return 0
+}
+
+# adapter_guest_names_local
+#
+# The jnames of this node's own guests, and NOTHING about their state -- no
+# status parsed, no astart, no running. It exists for one caller (the boot
+# gate's fail-safe, D-191): when the ordinary listing cannot be read because a
+# guest is in a status seance does not recognise, the gate must still be able
+# to name what it has to withhold, because failing to name it is failing OPEN.
+# Foreign rows are dropped the same way adapter_guest_list drops them -- an
+# empty emulator field is another node's guest (D-177) -- and that field does
+# not depend on the status this function is written to survive.
+#
+# contract: adapter_guest_names_local() -> name-per-line [list: may be empty]
+#
+# rc 0 with zero or more names, one per line; 2 if the platform is not ready.
+adapter_guest_names_local()
+{
+    _adapter_ready || return 2
+
+    {
+        _adapter_cbsd jls header=0 display=jname,emulator 2>/dev/null
+        _adapter_cbsd bls header=0 display=jname,emulator 2>/dev/null
+    } | while read -r _name _emu _rest; do
+        [ -n "${_name}" ] || continue
+        case "${_emu}" in
+            jail|bhyve) printf '%s\n' "${_name}" ;;
+        esac
+    done | sort -u
 }
 
 # _adapter_list_rows

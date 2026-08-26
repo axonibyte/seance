@@ -78,6 +78,15 @@ placement_file()
 # enough that a wedged holder is a failure rather than a hang.
 GATE_PLACEMENT_LOCK_WAIT=10
 
+# D-191: a guest that was running when its node crashed comes back mid-recovery
+# (CBSD status Maintenance:Stopping_VM) for a few seconds. The parser now reads
+# that (adapter_guest_names/status), but the gate ALSO retries enumeration, so a
+# transient the platform has not finished settling does not make the gate fail.
+# Injectable sleep so tests do not wait.
+GATE_ENUM_ATTEMPTS=${GATE_ENUM_ATTEMPTS:-12}
+GATE_ENUM_SLEEP_CMD=${GATE_ENUM_SLEEP_CMD:-sleep}
+GATE_ENUM_SLEEP_SECS=${GATE_ENUM_SLEEP_SECS:-5}
+
 # placement_local  -- the records, one per line, "<guest><TAB><home>".
 #
 # An absent file is an empty placement, which is the normal state of a healthy
@@ -401,7 +410,7 @@ gate_home_guests()
 # usage or configuration error.
 gate_run()
 {
-    local _mode _self _peer _addr _live _reached _silent _tmp _g _guests
+    local _mode _self _peer _addr _live _reached _silent _tmp _g _guests _enum_incomplete _attempt
     local _claim _held _rc _guest _why _shout _subject _body
 
     _mode=${1:-act}
@@ -484,10 +493,47 @@ gate_run()
             ;;
     esac
 
-    if ! _guests=$( gate_home_guests ); then
-        seance_log err "gate: this node cannot enumerate its own guests"
-        printf 'gate: FAIL (the estate could not be enumerated; nothing was changed)\n'
-        return 2
+    # ENUMERATE, WITH RETRIES (D-191). A node hard-killed with a guest running
+    # comes back mid-crash-recovery, and for a few seconds the platform reports
+    # that guest in a transient status. The parser reads it now, but the gate
+    # also waits the platform out rather than deciding on an incomplete picture:
+    # an estate that autostarts because the gate could not read it for five
+    # seconds is the split brain this file exists to prevent.
+    _enum_incomplete=0
+    _attempt=1
+    while :; do
+        if _guests=$( gate_home_guests ); then
+            break
+        fi
+        if [ "${_attempt}" -ge "${GATE_ENUM_ATTEMPTS}" ]; then
+            _enum_incomplete=1
+            break
+        fi
+        seance_log warning "gate: cannot enumerate this node's guests yet" \
+            "(attempt ${_attempt}/${GATE_ENUM_ATTEMPTS}); the platform may still be" \
+            "recovering a crashed guest -- waiting"
+        ${GATE_ENUM_SLEEP_CMD} "${GATE_ENUM_SLEEP_SECS}"
+        _attempt=$(( _attempt + 1 ))
+    done
+
+    # STILL BLIND -> FAIL SAFE, not open (D-191). The old code returned here with
+    # "nothing was changed", which let the estate autostart ungated -- the exact
+    # opposite of a gate's job. If the ordinary listing cannot be read, the raw
+    # jname list (no status parsed) still names what this node has, and every one
+    # of those is withheld: a gate that cannot see is a gate that says no.
+    if [ "${_enum_incomplete}" -eq 1 ]; then
+        seance_log err "gate: this node cannot read its guests" \
+            "even after ${GATE_ENUM_ATTEMPTS} attempts; withholding the whole estate" \
+            "by name rather than letting it autostart"
+        if ! _guests=$( adapter_guest_names_local ) || [ -z "${_guests}" ]; then
+            printf 'gate: FAIL (the estate could not be enumerated at all, not even by name; NOTHING could be withheld)\n'
+            printf '%s\n' "This node could not list its own guests even by name. It could not" \
+                "withhold anything, and the platform will autostart the estate ungated." \
+                "Stop cbsdd and investigate before this node hosts anything." |
+                seance_notify crit "seance: ${_self} could not gate its estate at all"
+            return 2
+        fi
+        [ -n "${_silent}" ] || _silent="the platform (this node could not read its own guests)"
     fi
 
     if [ -z "${_guests}" ]; then
