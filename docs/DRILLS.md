@@ -558,7 +558,7 @@ relationship with it and not the estate.
    | Mark | What it looks like | Expected |
    | --- | --- | --- |
    | T1 | `ifconfig` on the heir shows the victim's vhid as MASTER | seconds |
-   | T2 | syslog: `promote-event: CARP MASTER for <victim>` | T1 + <1 s |
+   | T2 | syslog: `seance[…]: promote-event: CARP MASTER for <victim> … running detached` | T1 + <1 s |
    | T3 | syslog: `rung 1 debounce: pass` | T2 + `debounce` (45 s by default) |
    | T4 | syslog: `rung 4 fence: pass` | T3 + fence time |
    | T5 | syslog: `promote: N of N guest(s) promoted` | T4 + mount and start |

@@ -879,6 +879,13 @@ promote_event()
 
         printf 'promote-event: CARP MASTER for %s (vhid %s on %s); this node is armed, and "seance promote %s --auto" is running detached -- its output is in syslog under the tag seance\n' \
             "${_dead}" "${_vhid}" "${_if}" "${_dead}"
+        # And into syslog (D-190): when devd(8) runs this verb, stdout goes
+        # nowhere -- devd does not log an action's output -- so the one line
+        # that says "the automation woke and is running" was invisible on the
+        # only path that matters. The detached ladder's own lines reach syslog
+        # through daemon(8); this is the line before them.
+        seance_log info "promote-event: CARP MASTER for ${_dead} (vhid ${_vhid} on ${_if});" \
+            "armed here; seance promote ${_dead} --auto is running detached"
         return 0
     fi
 
