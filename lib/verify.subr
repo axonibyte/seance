@@ -756,6 +756,33 @@ EOF
         done <<EOF
 $( carp_sysctls )
 EOF
+
+        # THE DEMOTION COUNTER, read directly (D-189). net.inet.carp.demotion
+        # is added to every advertisement this node sends; a node that comes
+        # back from a reboot with it left elevated (720 on every boot of one
+        # fleet's node -- three interfaces' worth) advertises its own identity
+        # so badly that it stays BACKUP for it, and the rows above then say
+        # "OWN identity and it is BACKUP for it" and point at duplicate vhids
+        # and unfinished failbacks -- the wrong first suspects. This row names
+        # the cause. A NEGATIVE counter is the same lie the other way (the node
+        # advertises better than it is and can take vhids that are not its
+        # own), and is named too.
+        _got=$( sysctl -n net.inet.carp.demotion 2>/dev/null ) || _got=""
+        case "${_got}" in
+            '')
+                verify_note "carp: net.inet.carp.demotion is not readable here"
+                ;;
+            0)
+                verify_pass "carp: net.inet.carp.demotion is 0"
+                ;;
+            *)
+                verify_warn "carp: net.inet.carp.demotion is ${_got}: this node's advertisements" \
+                    "carry that much extra skew, so it cannot hold its own identity" \
+                    "(or, if negative, can take others'). The counter is RELATIVE:" \
+                    "sysctl net.inet.carp.demotion=$(( 0 - _got )) brings it to 0 -- re-read" \
+                    "it after the interfaces settle, and never leave it negative."
+                ;;
+        esac
     else
         verify_warn "carp: sysctl(8) is not available, so ${CARP_OID_PREEMPT}" \
             "could not be checked -- and it is not the kernel's default"
