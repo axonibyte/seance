@@ -330,6 +330,21 @@ adapter_guest_list()
     printf '%s\n' "${MOCK_GUESTS}"
 }
 
+# contract: adapter_guest_names_local() -> name-per-line [list: may be empty]
+#
+# The raw jnames, for the gate's D-191 fail-safe. Scriptable like the rest;
+# by default the names out of MOCK_GUESTS, ignoring every other field.
+adapter_guest_names_local()
+{
+    local _rc
+    _mock_log adapter_guest_names_local
+    _mock_scripted adapter_guest_names_local
+    _rc=$?
+    [ "${_rc}" -ne 100 ] && return "${_rc}"
+    [ -n "${MOCK_GUESTS}" ] || return 0
+    printf '%s\n' "${MOCK_GUESTS}" | awk -F'\t' 'NF>0 { print $1 }'
+}
+
 # contract: adapter_guest_type(name) -> bhyve|jail [promises output]
 adapter_guest_type()
 {

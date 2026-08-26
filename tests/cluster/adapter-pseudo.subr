@@ -205,6 +205,19 @@ adapter_fact()
     return 0
 }
 
+# contract: adapter_guest_names_local() -> name-per-line [list: may be empty]
+#
+# The raw jnames of this node's guests, no status parsed -- the gate's D-191
+# fail-safe. In the pseudo-cluster the DB is the tsv, so this is its first
+# column for local guests.
+adapter_guest_names_local()
+{
+    [ -r "${PSEUDO_DB}" ] || return 0
+    awk -F "${PSEUDO_TAB}" -v self="$( adapter_node_self )" \
+        'NF >= 6 { n = (NF >= 8 && $8 != "" && $8 != self) ? "" : $1; if (n != "") print n }' \
+        "${PSEUDO_DB}" | sort -u
+}
+
 # contract: adapter_guest_list() -> name<TAB>type<TAB>astart<TAB>status<TAB>running [list: may be empty]
 #
 # One record per guest on this node. type is bhyve|jail, astart and running are

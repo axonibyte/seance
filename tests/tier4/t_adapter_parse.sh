@@ -51,7 +51,7 @@ rows()
     RRC=$?
 }
 
-t_plan 99
+t_plan 104
 
 # --- a listing of the shape CBSD prints --------------------------------------
 rows 'web01  jail   1  On
@@ -64,6 +64,23 @@ db01	bhyve	1	0
 arc01	jail	0	2
 mnt01	jail	1	3" "the status word is turned back into CBSD's status integer"
 t_is "${RRC}" "0" "a well-formed listing exits 0"
+
+# A CRASHED GUEST comes back mid-recovery, and CBSD decorates its status word
+# with a substate: `Maintenance:Stopping_VM` (D-191). The mode is what the guest
+# IS; the substate is informational. Reading it as UNREADABLE is what made the
+# boot gate fail open -- adapter_guest_list refused the whole listing and the
+# estate autostarted ungated.
+t_is "$( _adapter_status_int Maintenance:Stopping_VM )" "3" \
+    "a compound status reads as its mode -- Maintenance:Stopping_VM is Maintenance (3)"
+t_is "$( _adapter_status_int On:Something )" "1" \
+    "and the rule is the mode, not the substate: On:Something is On (1)"
+t_rc 2 "but a genuinely unknown MODE is still Unknown, substate or not" -- \
+    _adapter_status_int Frobnicate:whatever
+rows 'web01  jail   1  On
+mnt01  bhyve  1  Maintenance:Stopping_VM'
+t_is "${ROWS}" "web01	jail	1	1
+mnt01	bhyve	1	3" "and a listing that carries a mid-recovery guest still parses whole"
+t_is "${RRC}" "0" "so the estate can be enumerated while the platform recovers a crash"
 
 # --- an empty listing is an answer -------------------------------------------
 ROWS=$( printf '' | _adapter_list_rows )
