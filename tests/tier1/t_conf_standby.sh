@@ -46,15 +46,15 @@ t_stdout_is "mypool/standby" \
 # A ROOT ALREADY INSIDE A STANDBY TREE IS REFUSED (D-188): a guest promoted in
 # place lives under <standby_root>/<deadkey>/, and deriving from it answers a
 # standby root nested inside the dead node's estate -- which is where a real
-# fleet shipped a 3.82 GB copy of a promoted guest. The fleet's shape, the
+# fleet shipped a 3.82 GB copy of a promoted guest. A CBSD-layout shape, the
 # pseudo-cluster's shape, and the textbook one that still derives:
-t_rc 1 "a promoted-in-place root (fleet shape) is refused rather than derived from" -- \
-    repl_standby_root_derived zroot/cbsd/jails-data/standby/hyp2c/crowdeasedev01-data
+t_rc 1 "a promoted-in-place root (CBSD-layout shape) is refused rather than derived from" -- \
+    repl_standby_root_derived mypool/cbsd/jails-data/standby/alpha/web01-data
 t_rc 1 "and the pseudo-cluster's shape too" -- \
     repl_standby_root_derived tank/state/seance/bravo/standby/alpha/web01
-t_stdout_is "zroot/cbsd/jails-data/standby" \
-    "while a home guest on the same fleet still derives the real standby root" -- \
-    repl_standby_root_derived zroot/cbsd/jails-data/crowdeasedev01-data
+t_stdout_is "mypool/cbsd/jails-data/standby" \
+    "while a home guest on the same fleet still derives the standby root" -- \
+    repl_standby_root_derived mypool/cbsd/jails-data/web01-data
 
 # --- the fleet setting, verbatim, when no peer owns an override ------------
 

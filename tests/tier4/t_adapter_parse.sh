@@ -133,7 +133,7 @@ t_unlike "$( cat "${DIR}/err" )" 'emulator 0 is not supported' \
 # guests that node hosted were missing from it, seance reported
 # "0 guests, 0 warnings, 0 failures", and their replication stopped for twelve
 # and a half hours with nothing said.
-rows 'Unable  to  fetch  vm  data  from:  /usr/jails/jails-system/crowdeasedev01/local.sqlite
+rows 'Unable  to  fetch  vm  data  from:  /usr/jails/jails-system/db01/local.sqlite
 web01   jail   1  On'
 t_is "${RRC}" "2" \
     "a line that is not a guest row is a CONTRACT ERROR, not a guest called Unable"
