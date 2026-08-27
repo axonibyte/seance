@@ -121,6 +121,9 @@ readonly SEANCE_ROOT
 # shellcheck source=../lib/carp.subr
 . "${SEANCE_ROOT}/lib/carp.subr"
 # shellcheck source-path=SCRIPTDIR
+# shellcheck source=../lib/carp_repair.subr
+. "${SEANCE_ROOT}/lib/carp_repair.subr"
+# shellcheck source-path=SCRIPTDIR
 # shellcheck source=../lib/verify.subr
 . "${SEANCE_ROOT}/lib/verify.subr"
 # shellcheck source-path=SCRIPTDIR
@@ -220,6 +223,12 @@ Verbs:
                      an interactive (bsddialog) or headless editor for the
                      config file. It only ever writes the target file; every
                      screen has a --set equivalent
+  carp-repair [--check | --fix | --boot]
+                     reconcile a STALE CARP demotion so a rebooted node
+                     reclaims its own vhid; refuses a demotion that is TRUE
+                     (a down vhid interface). --boot waits for the network to
+                     settle, then fixes, logging to syslog -- it is what
+                     rc.d/seance_carp_reconcile runs at boot. Needs root
   version            print the seance version
   help, --help, -h   print this usage
 
@@ -786,6 +795,43 @@ seance_config()
     return "${_rc}"
 }
 
+# seance_carp_repair [--check | --fix | --boot]
+#
+# The one verb that touches live CARP state (lib/carp_repair.subr): it resets a
+# STALE demotion so a rebooted node reclaims its own vhid, and refuses a demotion
+# that is TRUE. --boot waits for the network to settle and routes its verdict to
+# syslog, which is what rc.d/seance_carp_reconcile runs. Needs the host and root;
+# needs neither the adapter nor the config.
+seance_carp_repair()
+{
+    local _mode _out _rc _line
+
+    _mode=check
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --check) _mode=check ;;
+            --fix)   _mode=fix ;;
+            --boot)  _mode=boot ;;
+            *) seance_die 2 "carp-repair: unknown argument: $1 (usage: seance carp-repair [--check | --fix | --boot])" ;;
+        esac
+        shift
+    done
+
+    [ "$( id -u )" -eq 0 ] || seance_die 2 "carp-repair: must run as root"
+
+    if [ "${_mode}" = "boot" ]; then
+        _out=$( carp_repair_run boot 2>&1 )
+        _rc=$?
+        printf '%s\n' "${_out}" | while IFS= read -r _line; do
+            [ -n "${_line}" ] && logger -t seance -p daemon.notice "${_line}"
+        done
+        printf '%s\n' "${_out}"
+        return "${_rc}"
+    fi
+
+    carp_repair_run "${_mode}"
+}
+
 if [ $# -eq 0 ]; then
     seance_usage >&2
     exit 2
@@ -837,6 +883,10 @@ case "${_verb}" in
         ;;
     setup)
         seance_setup "$@"
+        exit $?
+        ;;
+    carp-repair)
+        seance_carp_repair "$@"
         exit $?
         ;;
     version)

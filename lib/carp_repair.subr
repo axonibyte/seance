@@ -1,0 +1,327 @@
+# seance -- CARP demotion recovery: the ONE place seance touches live CARP state.
+#
+# Sourced, never executed. lib/carp.subr renders and verifies CARP and writes
+# NOTHING (design §1); this file is its deliberate, narrow complement. seance
+# still never owns the CARP *configuration* -- no rc.conf aliases, no vhid
+# setup, no ifconfig(8). It gains exactly one recovery action: RESETTING A STALE
+# DEMOTION COUNTER so a node that has just rebooted reclaims its own vhid with no
+# hand on the keyboard. It refuses to touch a demotion that is TRUE, so it never
+# advertises a fitness the node does not have.
+#
+# THE FAULT THIS EXISTS FOR (decisions.md D-192, observed in production).
+# On a CARP-over-bridge uplink, each vhid briefly self-elects MASTER at boot
+# before it hears its peers, its first advertisement fails to send while the
+# bridge is still settling (EACCES), and the kernel demotes by
+# net.inet.carp.senderr_demotion_factor per failed send. The node then drops to
+# BACKUP for every vhid -- and a BACKUP never advertises, so there is no
+# successful send to unwind the demotion. It sits elevated, and the node
+# advertising its own identity at skew 0+demotion loses to the heir at 100 and
+# cannot reclaim itself. The primary fix is senderr_demotion_factor=0 in
+# sysctl.conf; this reconciler is the belt to that: at boot, once the links are
+# confirmed up, it converges a stranded counter to 0, and rc.d/seance_carp_reconcile
+# runs it there.
+#
+# WHAT IT WILL NOT DO. It will not clear a demotion that is TRUE. If a
+# vhid-carrying interface is down right now, the counter is telling the truth and
+# clearing it would advertise a fitness this node does not have -- the one thing
+# a CARP fleet must never be lied to about. In that case it says so and stops.
+#
+# TESTABILITY. Every command that talks to the kernel goes through a seam that
+# tier 1 overrides -- CARP_REPAIR_SYSCTL, CARP_REPAIR_IFCONFIG,
+# CARP_REPAIR_KLDSTAT, CARP_REPAIR_SLEEP -- so the whole decision surface runs
+# with no root, no carp and no interfaces, exactly the way lib/carp.subr's
+# rendering does.
+#
+# shellcheck shell=sh
+# shellcheck disable=SC3043
+#   'local' is not in POSIX sh but is implemented by FreeBSD /bin/sh (sh(1),
+#   "local"); seance targets FreeBSD sh and nothing else (handoff §5).
+
+# The kernel seams. A test points these at fixtures; a node leaves them alone.
+: "${CARP_REPAIR_SYSCTL:=sysctl}"
+: "${CARP_REPAIR_IFCONFIG:=ifconfig}"
+: "${CARP_REPAIR_KLDSTAT:=kldstat}"
+: "${CARP_REPAIR_SLEEP:=sleep}"
+
+# How long fix() will chase a settling counter, and how long boot() waits for
+# the network. Overridable so a test spends no wall-clock.
+: "${CARP_REPAIR_FIX_TRIES:=5}"
+: "${CARP_REPAIR_SETTLE:=15}"
+: "${CARP_REPAIR_BOOT_TIMEOUT:=180}"
+: "${CARP_REPAIR_BOOT_STABLE:=6}"
+
+_cr_say() { printf '%s\n' "$*"; }
+_cr_err() { printf 'carp-repair: %s\n' "$*" >&2; }
+
+_cr_sysctl_n()  { ${CARP_REPAIR_SYSCTL} -n "$1" 2>/dev/null; }
+_cr_sysctl_set() { ${CARP_REPAIR_SYSCTL} "$1=$2" >/dev/null 2>&1; }
+_cr_ifconfig()  { ${CARP_REPAIR_IFCONFIG} "$@" 2>/dev/null; }
+_cr_sleep()     { ${CARP_REPAIR_SLEEP} "$1"; }
+
+# carp_repair_loaded  -- rc 0 if carp(4) is available (module or compiled in).
+carp_repair_loaded()
+{
+    ${CARP_REPAIR_KLDSTAT} -q -m carp 2>/dev/null && return 0
+    ${CARP_REPAIR_KLDSTAT} 2>/dev/null | grep -q 'carp\.ko'
+}
+
+# carp_repair_vhid_ifaces  -- the interfaces carrying a vhid, one per line.
+carp_repair_vhid_ifaces()
+{
+    _cr_ifconfig -l | tr ' ' '\n' | while read -r _i; do
+        [ -n "${_i}" ] || continue
+        _cr_ifconfig "${_i}" | grep -q ' vhid ' && printf '%s\n' "${_i}"
+    done
+}
+
+# carp_repair_if_active <if>
+#
+# UP and RUNNING. Believe a status line where there is one; fall back to the
+# interface flags where there is not -- a bridge(4), which is what this fleet
+# carries its vhids on, is a pseudo-interface with no media and prints no status
+# line at all, and a check that read absence as "down" would refuse to repair
+# the exact topology it was written for (observed in production, 2026-08-25).
+carp_repair_if_active()
+{
+    local _o _f
+
+    _o=$( _cr_ifconfig "$1" ) || return 1
+
+    if printf '%s\n' "${_o}" | grep -q '^[[:space:]]*status:'; then
+        printf '%s\n' "${_o}" | grep -q '^[[:space:]]*status: active'
+        return $?
+    fi
+
+    _f=$( printf '%s\n' "${_o}" | head -1 )
+    case "${_f}" in
+        *'<'*UP*'>'*) ;;
+        *) return 1 ;;
+    esac
+    case "${_f}" in
+        *RUNNING*) return 0 ;;
+    esac
+
+    return 1
+}
+
+# carp_repair_down_ifaces  -- vhid interfaces that are NOT active, space-joined.
+carp_repair_down_ifaces()
+{
+    local _down _i
+
+    _down=""
+    for _i in $( carp_repair_vhid_ifaces ); do
+        carp_repair_if_active "${_i}" || _down="${_down} ${_i}"
+    done
+    printf '%s' "${_down}"
+}
+
+# carp_repair_own_identity
+#
+# This node's OWN identity is the vhid it advertises at advskew 0 (design §6,
+# D-27), printed as "<STATE> <vhid>" -- or nothing when it carries none. The
+# awk fields are $2 (state) and $4 (vhid) of a "carp: MASTER vhid N advbase..."
+# line whose last two tokens are "advskew 0".
+carp_repair_own_identity()
+{
+    local _i
+
+    for _i in $( carp_repair_vhid_ifaces ); do
+        _cr_ifconfig "${_i}" |
+            awk '/^[[:space:]]+carp:/ && $NF == "0" && $(NF-1) == "advskew" \
+                 { print $2, $4 }'
+    done
+}
+
+# _carp_repair_is_int <value>  -- rc 0 if a (possibly negative) integer.
+_carp_repair_is_int()
+{
+    case "$1" in
+        ''|*[!0123456789-]*) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+# carp_repair_check
+#
+# Report, and return: 0 healthy, 1 stale demotion (repairable), 2 something else
+# is wrong (and named). Writes nothing. This is the whole diagnosis; fix() calls
+# it too. Preconditions that make the counter's meaning readable at all (carp
+# loaded, allow/preempt set) are a rc-2 stop with the reason on stderr.
+carp_repair_check()
+{
+    local _demotion _ifs _down _own _oid _v
+
+    if ! carp_repair_loaded; then
+        _cr_err "carp(4) is not loaded here: this is not a stale counter, it is a
+     node with no CARP at all. Load it now with 'kldload carp' and arrange the
+     boot with 'sysrc kld_list+=\"carp\"'."
+        return 2
+    fi
+
+    for _oid in net.inet.carp.allow net.inet.carp.preempt; do
+        _v=$( _cr_sysctl_n "${_oid}" )
+        [ "${_v}" = "1" ] || {
+            _cr_err "${_oid} is ${_v:-unreadable}, not 1. Fix that first: a demotion
+     repair on a node that cannot preempt would change nothing, and the model in
+     seance-design.md depends on this sysctl."
+            return 2
+        }
+    done
+
+    _demotion=$( _cr_sysctl_n net.inet.carp.demotion )
+    _carp_repair_is_int "${_demotion}" || {
+        _cr_err "cannot read net.inet.carp.demotion (got [${_demotion}])"
+        return 2
+    }
+
+    _ifs=$( carp_repair_vhid_ifaces | tr '\n' ' ' )
+    _down=$( carp_repair_down_ifaces )
+    _own=$( carp_repair_own_identity )
+
+    _cr_say "carp-repair: demotion=${_demotion} (ifdown factor $( _cr_sysctl_n net.inet.carp.ifdown_demotion_factor ), senderr factor $( _cr_sysctl_n net.inet.carp.senderr_demotion_factor ))"
+    _cr_say "carp-repair: interfaces carrying a vhid: ${_ifs:-(none)}"
+    if [ -n "${_own}" ]; then
+        _cr_say "carp-repair: this node's own identity (advskew 0): ${_own}"
+    fi
+
+    # A demotion that is TRUE has a down vhid interface behind it: refuse.
+    if [ -n "${_down}" ]; then
+        _cr_say "carp-repair: REFUSING: these vhid-carrying interfaces are not active:${_down}"
+        _cr_say "carp-repair: the demotion counter is TELLING THE TRUTH while they are down;"
+        _cr_say "carp-repair: fix the link first -- a cleared counter would advertise a"
+        _cr_say "carp-repair: fitness this node does not have."
+        return 2
+    fi
+
+    if [ "${_demotion}" = "0" ]; then
+        case "${_own}" in
+            ''|MASTER*)
+                _cr_say "carp-repair: nothing to repair (demotion is 0)."
+                return 0
+                ;;
+            *)
+                _cr_say "carp-repair: demotion is 0 but this node is not MASTER for its own"
+                _cr_say "carp-repair: vhid, so the cause is elsewhere: a duplicate vhid on the"
+                _cr_say "carp-repair: segment, a pass mismatch, or an estate not failed back."
+                _cr_say "carp-repair: Do NOT guess here."
+                return 2
+                ;;
+        esac
+    fi
+
+    # A positive counter with every vhid interface active: stale, repairable. A
+    # NEGATIVE counter is also wrong (it advertises a fitness the node lacks) and
+    # is repairable the same way -- fix() converges either sign to 0.
+    _cr_say "carp-repair: demotion of ${_demotion} with every vhid interface active -- repairable."
+    return 1
+}
+
+# carp_repair_fix
+#
+# Converge the demotion counter to 0, then confirm this node is MASTER for its
+# own identity. Returns 0 repaired, 2 refused-or-unsettled.
+#
+# CONVERGE, DO NOT SUBTRACT ONCE. The sysctl is a RELATIVE adjustment and the
+# kernel adjusts it too: an interface that comes back takes its own factor off
+# while this runs, so reading 720 and writing -720 into that can leave the
+# counter negative -- a node advertising BETTER fitness than it has, the same lie
+# in the other direction (observed in production, 2026-08-25). Read, correct by
+# exactly what was read, re-read, and stop at zero or when it will not settle.
+carp_repair_fix()
+{
+    local _rc _cur _n _after _own
+
+    carp_repair_check
+    _rc=$?
+    # Only a stale counter (rc 1) is ours to move; 0 is a no-op, 2 already said why.
+    [ "${_rc}" -eq 1 ] || return "${_rc}"
+
+    _n=0
+    while [ "${_n}" -lt "${CARP_REPAIR_FIX_TRIES}" ]; do
+        _cur=$( _cr_sysctl_n net.inet.carp.demotion )
+        _carp_repair_is_int "${_cur}" || { _cr_err "demotion is [${_cur}], not a number"; return 2; }
+        [ "${_cur}" -eq 0 ] && break
+        _cr_say "carp-repair: counter is ${_cur}; adjusting by $(( 0 - _cur ))"
+        _cr_sysctl_set net.inet.carp.demotion "$(( 0 - _cur ))" || { _cr_err "the sysctl write failed"; return 2; }
+        _cr_sleep 1
+        _n=$(( _n + 1 ))
+    done
+
+    # Settle and correct once more: an interface that comes up AFTER the loop (a
+    # guest's tap on a node that has just booted) takes its own factor off, and a
+    # counter left negative is never acceptable.
+    _cr_sleep "${CARP_REPAIR_SETTLE}"
+    _cur=$( _cr_sysctl_n net.inet.carp.demotion )
+    _carp_repair_is_int "${_cur}" || _cur=0
+    if [ "${_cur}" -ne 0 ]; then
+        _cr_say "carp-repair: counter moved to ${_cur} while settling (interface churn); correcting again"
+        _cr_sysctl_set net.inet.carp.demotion "$(( 0 - _cur ))"
+        _cr_sleep 5
+    fi
+
+    _after=$( _cr_sysctl_n net.inet.carp.demotion )
+    _cr_say "carp-repair: demotion is now ${_after:-?}"
+
+    _own=$( carp_repair_own_identity )
+    case "${_own}" in
+        MASTER*)
+            _cr_say "carp-repair: REPAIRED -- this node is MASTER for its own identity (vhid ${_own#MASTER })."
+            _cr_say "carp-repair: confirm the fleet with: seance verify   (on every node)"
+            [ "${_after}" = "0" ] || return 2
+            return 0
+            ;;
+        '')
+            _cr_say "carp-repair: this node carries no vhid at advskew 0; nothing to confirm here."
+            [ "${_after}" = "0" ] || return 2
+            return 0
+            ;;
+        *)
+            _cr_say "carp-repair: the counter is ${_after} and this node is still ${_own}."
+            _cr_say "carp-repair: the demotion was not the whole story -- look for a duplicate"
+            _cr_say "carp-repair: vhid, a pass mismatch, or a peer that has not released the address."
+            return 2
+            ;;
+    esac
+}
+
+# carp_repair_wait_settled
+#
+# Boot preamble: wait until carp is loaded, every vhid interface is genuinely
+# active, and the demotion counter has held still for CARP_REPAIR_BOOT_STABLE
+# seconds -- so carp has finished its boot churn before we judge it. Prints one
+# settle line and returns; the caller decides what to do with the value.
+carp_repair_wait_settled()
+{
+    local _w _last _held _ready _ifs _demo _state _i
+
+    _w=0; _last=""; _held=0
+    while [ "${_w}" -lt "${CARP_REPAIR_BOOT_TIMEOUT}" ]; do
+        _ready=1
+        carp_repair_loaded || _ready=0
+        _ifs=$( carp_repair_vhid_ifaces | tr '\n' ' ' )
+        [ -n "${_ifs}" ] || _ready=0
+        if [ "${_ready}" -eq 1 ]; then
+            for _i in ${_ifs}; do carp_repair_if_active "${_i}" || _ready=0; done
+        fi
+        _demo=$( _cr_sysctl_n net.inet.carp.demotion )
+        _state="${_ready}|${_ifs}|${_demo}"
+        if [ "${_state}" = "${_last}" ]; then _held=$(( _held + 3 )); else _held=0; _last="${_state}"; fi
+        [ "${_ready}" -eq 1 ] && [ "${_held}" -ge "${CARP_REPAIR_BOOT_STABLE}" ] && break
+        _cr_sleep 3
+        _w=$(( _w + 3 ))
+    done
+
+    _cr_say "carp-repair: settled after ${_w}s: demotion=$( _cr_sysctl_n net.inet.carp.demotion ), vhid-interfaces=[${_ifs}]"
+}
+
+# carp_repair_run <check|fix|boot>  -- the entry the verb calls.
+carp_repair_run()
+{
+    case "${1:-check}" in
+        check) carp_repair_check ;;
+        fix)   carp_repair_fix ;;
+        boot)  carp_repair_wait_settled; carp_repair_fix ;;
+        *)     _cr_err "usage: carp-repair [--check | --fix | --boot]"; return 2 ;;
+    esac
+}

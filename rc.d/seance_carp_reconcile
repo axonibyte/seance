@@ -1,0 +1,96 @@
+#!/bin/sh
+#
+# PROVIDE: seance_carp_reconcile
+# REQUIRE: NETWORKING routing FILESYSTEMS
+# KEYWORD: nojail
+#
+# seance_carp_reconcile_enable="YES"
+# seance_carp_reconcile_program="/path/to/modules/seance"
+#
+# The CARP demotion reconciler (design §1 recovery carve-out, decision D-192).
+# At boot, once the network is up, this detaches `seance carp-repair --boot`,
+# which waits for the vhid interfaces to settle and then converges a STALE
+# demotion counter to 0 -- so a node that has just rebooted reclaims its own
+# vhid with no hand on the keyboard. It refuses a demotion that is TRUE (a vhid
+# interface still down), so it never advertises a fitness the node lacks.
+#
+# WHY THIS EXISTS. On a CARP-over-bridge uplink each vhid briefly self-elects
+# MASTER at boot before it hears its peers, its first advert fails to send while
+# the bridge settles, and the kernel demotes per failed send; the node then goes
+# BACKUP and never re-sends to unwind it (decisions.md D-192). The primary fix is
+# net.inet.carp.senderr_demotion_factor=0 in sysctl.conf; this unit is the belt
+# to that suspenders, and heals any other path that could strand the counter.
+#
+# WHY AFTER NETWORKING, NOT BEFORE cbsdd. Unlike the gate, this has nothing to do
+# with the estate coming up -- it is about the host's own CARP identity, and it
+# must not judge the counter until the interfaces have settled. It detaches with
+# daemon(8) and waits inside `--boot`, so it never delays the rest of the boot.
+#
+# Disabled by default: a unit that wrote to a live CARP counter the moment the
+# module landed would be a surprise, and surprises are what this project reacts
+# against. Enable with:  sysrc seance_carp_reconcile_enable=YES
+#
+# shellcheck shell=sh
+# shellcheck disable=SC2034
+#   name, rcvar, start_cmd and stop_cmd are read by rc.subr, not by this file.
+# shellcheck disable=SC1091,SC1094
+#   /etc/rc.subr is the base system's: there is no fixed source path to follow,
+#   it is not written for -s sh, and it is not ours to check.
+# shellcheck disable=SC2154
+#   ${seance_carp_reconcile_enable}, ${seance_carp_reconcile_program} and
+#   ${cbsd_workdir} are set by load_rc_config out of rc.conf.
+# shellcheck disable=SC3043
+#   'local' is not in POSIX sh but is implemented by FreeBSD /bin/sh (sh(1),
+#   "local"); seance targets FreeBSD sh and nothing else (handoff §5).
+
+. /etc/rc.subr
+
+name=seance_carp_reconcile
+rcvar=seance_carp_reconcile_enable
+
+load_rc_config $name
+
+: "${seance_carp_reconcile_enable:=NO}"
+: "${seance_carp_reconcile_program:=}"
+
+start_cmd="seance_carp_reconcile_start"
+stop_cmd=":"
+
+# seance_carp_reconcile_find_program
+#
+# Where seance is, when rc.conf did not say: the verb symlink the platform's own
+# initialisation plants in ${workdir}/modules/ -- the same place the gate learns
+# it from, and for the same reason (the plain dispatcher would not know which
+# node it is on; the symlink is the module's verb wrapper). carp-repair needs no
+# config or adapter, but running through the verb keeps one install path.
+seance_carp_reconcile_find_program()
+{
+    local _link
+
+    [ -n "${seance_carp_reconcile_program}" ] && return 0
+
+    [ -n "${cbsd_workdir:-}" ] || return 1
+
+    _link="${cbsd_workdir}/modules/seance"
+    [ -x "${_link}" ] || return 1
+
+    seance_carp_reconcile_program="${_link}"
+    return 0
+}
+
+seance_carp_reconcile_start()
+{
+    if ! seance_carp_reconcile_find_program; then
+        warn "${name}: cannot find the seance dispatcher." \
+            "Set seance_carp_reconcile_program in rc.conf. CARP demotion will NOT be reconciled."
+        logger -t seance -p daemon.warning -- \
+            "seance_carp_reconcile: dispatcher not found; a stale CARP demotion will NOT be reconciled"
+        return 0
+    fi
+
+    echo "Reconciling a stale CARP demotion (detached; waits for the network to settle)."
+    /usr/sbin/daemon -f -S -T seance -l daemon \
+        "${seance_carp_reconcile_program}" carp-repair --boot
+}
+
+run_rc_command "$1"

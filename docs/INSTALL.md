@@ -345,6 +345,38 @@ fleet key `auto=1` and the node's own `auto_promote` list
 (`etc/seance.conf.sample` again) — both off by default, both `seance verify`'s
 business to confirm are consistent with what devd can actually fire.
 
+### The boot demotion, if your vhids ride a bridge
+
+A node whose CARP vhids sit on a `bridge(4)` uplink can return from a reboot
+with `net.inet.carp.demotion` stuck elevated: at boot each vhid briefly
+self-elects MASTER before it hears its peers, its first advertisement fails to
+send while the bridge is still settling, and the kernel demotes per failed send
+— then the node goes BACKUP and never re-sends to unwind it, so it advertises
+its own identity at a losing skew and cannot reclaim its vhid until the counter
+is reset (decision D-192). Two independent guards, apply both:
+
+```sh
+# 1. Cure it at the source: a failed send no longer demotes. ifdown demotion
+#    (a real link loss) is untouched, and `seance verify` still names any
+#    demotion it finds.
+sysctl net.inet.carp.senderr_demotion_factor=0
+sysrc -f /etc/sysctl.conf net.inet.carp.senderr_demotion_factor=0   # or edit the file
+
+# 2. Belt to that: heal any stranded counter automatically at boot.
+cp /usr/local/cbsd/modules/seance.d/rc.d/seance_carp_reconcile /usr/local/etc/rc.d/
+sysrc seance_carp_reconcile_enable=YES
+seance carp-repair --check          # what it would do, right now, writing nothing
+```
+
+`rc.d/seance_carp_reconcile` (disabled by default, like the gate) detaches
+`seance carp-repair --boot` after the network is up: it waits for the vhid
+interfaces to settle, then converges a *stale* demotion to 0 — and **refuses** a
+demotion that is *true* (a vhid interface still down), because clearing that
+would advertise a fitness the node does not have. It is the one place seance
+writes live CARP state (design §1). Run `seance carp-repair` by hand any time —
+`--check` reports, `--fix` reconciles — and its verdict lands in syslog
+(`daemon.notice`, tag `seance`) when it runs at boot.
+
 ## 8. Check the whole node
 
 ```sh

@@ -14,7 +14,7 @@ the implementation brief is in `HANDOFF.md`. Installing it is
 `docs/INSTALL.md`, step by step, with the CBSD source citations behind each
 step.
 
-## Status: M5 — v0.5.10
+## Status: M5 — v0.5.11
 
 Everything the design describes is implemented and tested at every tier the
 harness has. Layer 1 is live: `repl` snapshots, sends and prunes; `status` is
@@ -986,6 +986,35 @@ setup: wrote /tmp/seance.conf (PASS)
 Without a terminal, `setup` refuses rather than hanging: a configuration
 management run that forgot `--non-interactive` gets an error and not a process
 waiting for a keystroke nobody will type.
+
+### seance carp-repair
+
+Reconcile a **stale** CARP demotion so a node that has just rebooted reclaims
+its own vhid, and **refuse** a demotion that is *true*. This is the one place
+seance writes live CARP state — everywhere else it only *renders and verifies*
+CARP (design §1); resetting a transient demotion counter is a bounded recovery,
+not owning the configuration.
+
+```sh
+seance carp-repair            # --check: report, write nothing
+seance carp-repair --fix      # converge a stale demotion to 0
+seance carp-repair --boot     # wait for the network to settle, then fix,
+                              #   logging to syslog (what rc.d runs at boot)
+```
+
+**Why it exists (D-192).** On a `bridge(4)` uplink each vhid briefly self-elects
+MASTER at boot before it hears its peers, its first advertisement fails to send
+while the bridge is still settling, and the kernel demotes per failed send — the
+node then goes BACKUP and never re-sends to unwind it, so it advertises its own
+identity at a losing skew and cannot reclaim its vhid. Cure it at the source
+with `net.inet.carp.senderr_demotion_factor=0`; this verb is the belt to that,
+and `rc.d/seance_carp_reconcile` runs `--boot` after the network is up.
+
+**It refuses a demotion that is true.** If a vhid-carrying interface is down
+right now, the counter is telling the truth and clearing it would advertise a
+fitness the node does not have — so it says so and stops. Needs root; needs
+neither the adapter nor the config. `seance verify` still names any demotion it
+finds, so a node that could not be reconciled is not silent.
 
 ### seance version
 
