@@ -1,8 +1,13 @@
 #!/bin/sh
 #
 # PROVIDE: seance_carp_reconcile
-# REQUIRE: NETWORKING routing FILESYSTEMS
+# REQUIRE: NETWORKING routing FILESYSTEMS syslogd
 # KEYWORD: nojail
+#
+# REQUIRE syslogd (decision D-193): rcorder puts NETWORKING far ahead of
+# syslogd, and an earlier version of this unit ran BEFORE syslogd -- so every
+# line it logged at boot went into the void, and its first live boot looked as
+# if it had never run at all. It must not judge the counter until logging works.
 #
 # seance_carp_reconcile_enable="YES"
 # seance_carp_reconcile_program="/path/to/modules/seance"
@@ -89,7 +94,11 @@ seance_carp_reconcile_start()
     fi
 
     echo "Reconciling a stale CARP demotion (detached; waits for the network to settle)."
-    /usr/sbin/daemon -f -S -T seance -l daemon \
+    # -o to a file, not -S to syslog: a boot healer must leave a record even when
+    # syslog is unavailable, and the last boot's verdict is exactly what an
+    # operator wants to read (D-193). The verb ALSO logs each line to syslog
+    # (daemon.notice, tag seance) for the live view; the file is the durable one.
+    /usr/sbin/daemon -f -o /var/log/seance-carp-reconcile.log -T seance -l daemon \
         "${seance_carp_reconcile_program}" carp-repair --boot
 }
 
