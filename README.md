@@ -1307,4 +1307,7 @@ other CBSD 15.0.9 defects worth knowing before relying on any of this.
 
 ## License
 
-BSD-2-Clause. Copyright (c) 2026 Axonibyte Innovations, LLC.
+Blue Oak Model License 1.0.0 for the source code, with the companion grants
+for specifications, documentation and assets named in [LICENSE](LICENSE).
+Logos and trademarks are excluded from every grant.
+Copyright (c) 2026 Axonibyte Innovations, LLC.

@@ -156,7 +156,7 @@ exists and the hello verb runs; the notes then bind M1's structure.
   RC-capture pattern from common.subr wherever a pipeline's verdict matters),
   shellcheck-clean with any directive carrying a stated reason (a narrowing,
   per the rules).
-- License: BSD-2-Clause, Copyright (c) 2026 Axonibyte Innovations, LLC
+- License: Blue Oak Model License 1.0.0 for code, with the companion grants named in LICENSE, Copyright (c) 2026 Axonibyte Innovations, LLC
   (decided).
 
 ## 4. Milestone fences (what each may and may not contain)
@@ -179,7 +179,7 @@ exists and the hello verb runs; the notes then bind M1's structure.
 
 - **Repo**: `bitbucket.org:axonibyte/seance`, public from day 1. Git
   etiquette per the owner's user-level CLAUDE.md.
-- **License**: BSD-2-Clause, `Copyright (c) 2026 Axonibyte Innovations, LLC`.
+- **License**: Blue Oak Model License 1.0.0 for code, with the companion grants named in LICENSE, `Copyright (c) 2026 Axonibyte Innovations, LLC`.
 - **Environment**: development and reaper both run on the owner's FreeBSD
   desktop (Claude Code shells in from there; reaper dispatches to the
   Proxmox provider locally). No Linux compatibility concerns anywhere in the
